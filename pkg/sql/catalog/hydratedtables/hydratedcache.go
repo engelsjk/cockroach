@@ -45,7 +45,7 @@ import (
 // of the referenced types which ensures that user always uses properly leased
 // descriptors. While all of the types will need to be resolved, they should
 // already be cached so, in this way, this cache prevents the need to copy
-// and re-construct the tabledesc.Immutable in most cases.
+// and re-construct the tabledesc.immutable in most cases.
 type Cache struct {
 	settings *cluster.Settings
 	g        singleflight.Group
@@ -97,10 +97,12 @@ var (
 )
 
 // CacheSize controls the size of the LRU cache.
-var CacheSize = settings.RegisterNonNegativeIntSetting(
+var CacheSize = settings.RegisterIntSetting(
 	"sql.catalog.hydrated_tables.cache_size",
 	"number of table descriptor versions retained in the hydratedtables LRU cache",
-	128)
+	128,
+	settings.NonNegativeInt,
+)
 
 // NewCache constructs a new Cache.
 func NewCache(settings *cluster.Settings) *Cache {
@@ -121,7 +123,7 @@ func NewCache(settings *cluster.Settings) *Cache {
 }
 
 type hydratedTableDescriptor struct {
-	tableDesc *tabledesc.Immutable
+	tableDesc catalog.TableDescriptor
 	typeDescs []*cachedType
 }
 
@@ -139,8 +141,8 @@ type cachedType struct {
 // descriptor on their own. If the table descriptor does not contain any
 // user-defined types, it will be returned unchanged.
 func (c *Cache) GetHydratedTableDescriptor(
-	ctx context.Context, table *tabledesc.Immutable, res catalog.TypeDescriptorResolver,
-) (hydrated *tabledesc.Immutable, err error) {
+	ctx context.Context, table catalog.TableDescriptor, res catalog.TypeDescriptorResolver,
+) (hydrated catalog.TableDescriptor, err error) {
 
 	// If the table has an uncommitted version, it cannot be cached. Return nil
 	// forcing the caller to hydrate.
@@ -249,7 +251,7 @@ func (c *Cache) GetHydratedTableDescriptor(
 		if err != nil {
 			return nil, err
 		}
-		return res.(*tabledesc.Immutable), nil
+		return res.(catalog.TableDescriptor), nil
 	}
 }
 

@@ -16,12 +16,18 @@ import (
 	"io"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	enginepb "github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -30,6 +36,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"golang.org/x/time/rate"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -517,7 +524,7 @@ func (s *Store) reserveSnapshot(
 		case s.snapshotApplySem <- struct{}{}:
 		case <-ctx.Done():
 			return nil, "", ctx.Err()
-		case <-s.stopper.ShouldStop():
+		case <-s.stopper.ShouldQuiesce():
 			return nil, "", errors.Errorf("stopped")
 		default:
 			return nil, snapshotApplySemBusyMsg, nil
@@ -527,7 +534,7 @@ func (s *Store) reserveSnapshot(
 		case s.snapshotApplySem <- struct{}{}:
 		case <-ctx.Done():
 			return nil, "", ctx.Err()
-		case <-s.stopper.ShouldStop():
+		case <-s.stopper.ShouldQuiesce():
 			return nil, "", errors.Errorf("stopped")
 		}
 	}
@@ -646,11 +653,11 @@ func (s *Store) checkSnapshotOverlapLocked(
 
 	// TODO(benesch): consider discovering and GC'ing *all* overlapping ranges,
 	// not just the first one that getOverlappingKeyRangeLocked happens to return.
-	if exRange := s.getOverlappingKeyRangeLocked(&desc); exRange != nil {
+	if it := s.getOverlappingKeyRangeLocked(&desc); it.item != nil {
 		// We have a conflicting range, so we must block the snapshot.
 		// When such a conflict exists, it will be resolved by one range
 		// either being split or garbage collected.
-		exReplica, err := s.GetReplica(exRange.Desc().RangeID)
+		exReplica, err := s.GetReplica(it.Desc().RangeID)
 		msg := IntersectingSnapshotMsg
 		if err != nil {
 			log.Warningf(ctx, "unable to look up overlapping replica on %s: %v", exReplica, err)
@@ -659,16 +666,14 @@ func (s *Store) checkSnapshotOverlapLocked(
 				if r.RaftStatus() == nil {
 					return true
 				}
-				// TODO(benesch): this check does detect inactivity on replicas with
-				// epoch-based leases. Since the validity of an epoch-based lease is
-				// tied to the owning node's liveness, the lease can be valid well after
-				// the leader of the range has cut off communication with this replica.
-				// Expiration based leases, by contrast, will expire quickly if the
-				// leader of the range stops sending this replica heartbeats.
-				lease, pendingLease := r.GetLease()
-				now := s.Clock().Now()
-				return !r.IsLeaseValid(ctx, lease, now) &&
-					(pendingLease.Empty() || !r.IsLeaseValid(ctx, pendingLease, now))
+				// TODO(benesch): this check does not detect inactivity on
+				// replicas with epoch-based leases. Since the validity of an
+				// epoch-based lease is tied to the owning node's liveness, the
+				// lease can be valid well after the leader of the range has cut
+				// off communication with this replica. Expiration based leases,
+				// by contrast, will expire quickly if the leader of the range
+				// stops sending this replica heartbeats.
+				return !r.CurrentLeaseStatus(ctx).IsValid()
 			}
 			// We unconditionally send this replica through the GC queue. It's
 			// reasonably likely that the GC queue will do nothing because the replica
@@ -833,12 +838,12 @@ func validatePositive(v int64) error {
 
 // rebalanceSnapshotRate is the rate at which preemptive snapshots can be sent.
 // This includes snapshots generated for upreplication or for rebalancing.
-var rebalanceSnapshotRate = settings.RegisterPublicValidatedByteSizeSetting(
+var rebalanceSnapshotRate = settings.RegisterByteSizeSetting(
 	"kv.snapshot_rebalance.max_rate",
 	"the rate limit (bytes/sec) to use for rebalance and upreplication snapshots",
 	envutil.EnvOrDefaultBytes("COCKROACH_PREEMPTIVE_SNAPSHOT_RATE", 8<<20),
 	validatePositive,
-)
+).WithPublic()
 
 // recoverySnapshotRate is the rate at which Raft-initiated spanshots can be
 // sent. Ideally, one would never see a Raft-initiated snapshot; we'd like all
@@ -846,18 +851,18 @@ var rebalanceSnapshotRate = settings.RegisterPublicValidatedByteSizeSetting(
 // completely get rid of them.
 // TODO(tbg): The existence of this rate, separate from rebalanceSnapshotRate,
 // does not make a whole lot of sense.
-var recoverySnapshotRate = settings.RegisterPublicValidatedByteSizeSetting(
+var recoverySnapshotRate = settings.RegisterByteSizeSetting(
 	"kv.snapshot_recovery.max_rate",
 	"the rate limit (bytes/sec) to use for recovery snapshots",
 	envutil.EnvOrDefaultBytes("COCKROACH_RAFT_SNAPSHOT_RATE", 8<<20),
 	validatePositive,
-)
+).WithPublic()
 
 // snapshotSenderBatchSize is the size that key-value batches are allowed to
 // grow to during Range snapshots before being sent to the receiver. This limit
 // places an upper-bound on the memory footprint of the sender of a Range
 // snapshot. It is also the granularity of rate limiting.
-var snapshotSenderBatchSize = settings.RegisterValidatedByteSizeSetting(
+var snapshotSenderBatchSize = settings.RegisterByteSizeSetting(
 	"kv.snapshot_sender.batch_size",
 	"size of key-value batches sent over the network during snapshots",
 	256<<10, // 256 KB
@@ -867,7 +872,7 @@ var snapshotSenderBatchSize = settings.RegisterValidatedByteSizeSetting(
 // snapshotSSTWriteSyncRate is the size of chunks to write before fsync-ing.
 // The default of 2 MiB was chosen to be in line with the behavior in bulk-io.
 // See sstWriteSyncRate.
-var snapshotSSTWriteSyncRate = settings.RegisterValidatedByteSizeSetting(
+var snapshotSSTWriteSyncRate = settings.RegisterByteSizeSetting(
 	"kv.snapshot_sst.sync_size",
 	"threshold after which snapshot SST writes must fsync",
 	bulkIOWriteBurst,
@@ -897,6 +902,142 @@ func (e *errMustRetrySnapshotDueToTruncation) Error() string {
 		e.index, e.term,
 	)
 }
+
+// SendEmptySnapshot creates an OutgoingSnapshot for the input range
+// descriptor and seeds it with an empty range. Then, it sends this
+// snapshot to the replica specified in the input.
+func SendEmptySnapshot(
+	ctx context.Context,
+	st *cluster.Settings,
+	cc *grpc.ClientConn,
+	now hlc.Timestamp,
+	desc roachpb.RangeDescriptor,
+	to roachpb.ReplicaDescriptor,
+) error {
+	// Create an engine to use as a buffer for the empty snapshot.
+	eng := storage.NewDefaultInMem()
+	defer eng.Close()
+
+	var ms enginepb.MVCCStats
+	// Seed an empty range into the new engine.
+	if err := storage.MVCCPutProto(
+		ctx, eng, &ms, keys.RangeDescriptorKey(desc.StartKey), now, nil /* txn */, &desc,
+	); err != nil {
+		return err
+	}
+
+	var replicaVersion roachpb.Version
+	if st.Version.IsActive(ctx, clusterversion.ReplicaVersions) {
+		replicaVersion = st.Version.ActiveVersionOrEmpty(ctx).Version
+	}
+	ms, err := stateloader.WriteInitialReplicaState(
+		ctx,
+		eng,
+		ms,
+		desc,
+		roachpb.Lease{},
+		hlc.Timestamp{}, // gcThreshold
+		stateloader.TruncatedStateUnreplicated,
+		replicaVersion,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Use stateloader to load state out of memory from the previously created engine.
+	sl := stateloader.Make(desc.RangeID)
+	state, err := sl.Load(ctx, eng, &desc)
+	if err != nil {
+		return err
+	}
+	hs, err := sl.LoadHardState(ctx, eng)
+	if err != nil {
+		return err
+	}
+
+	snapUUID, err := uuid.NewV4()
+	if err != nil {
+		return err
+	}
+
+	// Create an OutgoingSnapshot to send.
+	outgoingSnap, err := snapshot(
+		ctx,
+		snapUUID,
+		sl,
+		// TODO(tbg): We may want a separate SnapshotRequest type
+		// for recovery that always goes through by bypassing all throttling
+		// so they cannot be declined. We don't want our operation to be held
+		// up behind a long running snapshot. We want this to go through
+		// quickly.
+		SnapshotRequest_VIA_SNAPSHOT_QUEUE,
+		eng,
+		desc.RangeID,
+		raftentry.NewCache(1), // cache is not used
+		func(func(SideloadStorage) error) error { return nil }, // this is used for sstables, not needed here as there are no logs
+		desc.StartKey,
+	)
+	if err != nil {
+		return err
+	}
+	defer outgoingSnap.Close()
+
+	// From and to replica descriptors are the same because we have
+	// to send the snapshot from a member of the range descriptor.
+	// Sending it from the current replica ensures that. Otherwise,
+	// it would be a malformed request if it came from a non-member.
+	from := to
+	req := RaftMessageRequest{
+		RangeID:     desc.RangeID,
+		FromReplica: from,
+		ToReplica:   to,
+		Message: raftpb.Message{
+			Type:     raftpb.MsgSnap,
+			To:       uint64(to.ReplicaID),
+			From:     uint64(from.ReplicaID),
+			Term:     hs.Term,
+			Snapshot: outgoingSnap.RaftSnap,
+		},
+	}
+
+	header := SnapshotRequest_Header{
+		State:                      state,
+		RaftMessageRequest:         req,
+		RangeSize:                  ms.Total(),
+		CanDecline:                 false,
+		Priority:                   SnapshotRequest_RECOVERY,
+		Strategy:                   SnapshotRequest_KV_BATCH,
+		Type:                       SnapshotRequest_VIA_SNAPSHOT_QUEUE,
+		UnreplicatedTruncatedState: true,
+	}
+
+	stream, err := NewMultiRaftClient(cc).RaftSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := stream.CloseSend(); err != nil {
+			log.Warningf(ctx, "failed to close snapshot stream: %+v", err)
+		}
+	}()
+
+	return sendSnapshot(
+		ctx,
+		st,
+		stream,
+		noopStorePool{},
+		header,
+		&outgoingSnap,
+		eng.NewBatch,
+		func() {},
+	)
+}
+
+// noopStorePool is a hollowed out StorePool that does not throttle. It's used in recovery scenarios.
+type noopStorePool struct{}
+
+func (n noopStorePool) throttle(throttleReason, string, roachpb.StoreID) {}
 
 // sendSnapshot sends an outgoing snapshot via a pre-opened GRPC stream.
 func sendSnapshot(

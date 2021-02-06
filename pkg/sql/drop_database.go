@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -45,7 +46,8 @@ type dropDatabaseNode struct {
 //          mysql requires the DROP privileges on the database.
 func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"DROP DATABASE",
 	); err != nil {
 		return nil, err
@@ -60,11 +62,12 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 	}
 
 	// Check that the database exists.
-	dbDesc, err := p.ResolveMutableDatabaseDescriptor(ctx, string(n.Name), !n.IfExists)
+	found, dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
+		tree.DatabaseLookupFlags{Required: !n.IfExists})
 	if err != nil {
 		return nil, err
 	}
-	if dbDesc == nil {
+	if !found {
 		// IfExists was specified and database was not found.
 		return newZeroNode(nil /* columns */), nil
 	}
@@ -194,19 +197,12 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 
 	// Log Drop Database event. This is an auditable log event and is recorded
 	// in the same transaction as the table descriptor update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		ctx,
-		p.txn,
-		EventLogDropDatabase,
-		int32(n.dbDesc.GetID()),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			DatabaseName         string
-			Statement            string
-			User                 string
-			DroppedSchemaObjects []string
-		}{n.n.Name.String(), n.n.String(), p.User().Normalized(), n.d.droppedNames},
-	)
+	return p.logEvent(ctx,
+		n.dbDesc.GetID(),
+		&eventpb.DropDatabase{
+			DatabaseName:         n.n.Name.String(),
+			DroppedSchemaObjects: n.d.droppedNames,
+		})
 }
 
 func (*dropDatabaseNode) Next(runParams) (bool, error) { return false, nil }
@@ -275,7 +271,8 @@ func (p *planner) accumulateOwnedSequences(
 				// Special case error swallowing for #50711 and #50781, which can
 				// cause columns to own sequences that have been dropped/do not
 				// exist.
-				if errors.Is(err, catalog.ErrDescriptorNotFound) {
+				if errors.Is(err, catalog.ErrDescriptorDropped) ||
+					pgerror.GetPGCode(err) == pgcode.UndefinedTable {
 					log.Infof(ctx,
 						"swallowing error for owned sequence that was not found %s", err.Error())
 					continue

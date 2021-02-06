@@ -884,6 +884,9 @@ func MakeTransaction(
 	name string, baseKey Key, userPriority UserPriority, now hlc.Timestamp, maxOffsetNs int64,
 ) Transaction {
 	u := uuid.FastMakeV4()
+	// TODO(nvanbenschoten): technically, maxTS should be a synthetic timestamp.
+	// Make this change in v21.2 when all nodes in a cluster are guaranteed to
+	// be aware of synthetic timestamps by addressing the TODO in Timestamp.Add.
 	maxTS := now.Add(maxOffsetNs, 0)
 
 	return Transaction{
@@ -906,7 +909,11 @@ func MakeTransaction(
 // occurred, i.e. the maximum of ReadTimestamp and LastHeartbeat.
 func (t Transaction) LastActive() hlc.Timestamp {
 	ts := t.LastHeartbeat
-	ts.Forward(t.ReadTimestamp)
+	// Only forward by the ReadTimestamp if it is a clock timestamp.
+	// TODO(nvanbenschoten): replace this with look at the Synthetic bool.
+	if readTS, ok := t.ReadTimestamp.TryToClockTimestamp(); ok {
+		ts.Forward(readTS.ToTimestamp())
+	}
 	return ts
 }
 
@@ -1244,7 +1251,7 @@ func (t *Transaction) ResetObservedTimestamps() {
 // UpdateObservedTimestamp stores a timestamp off a node's clock for future
 // operations in the transaction. When multiple calls are made for a single
 // nodeID, the lowest timestamp prevails.
-func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS hlc.Timestamp) {
+func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS hlc.ClockTimestamp) {
 	// Fast path optimization for either no observed timestamps or
 	// exactly one, for the same nodeID as we're updating.
 	if l := len(t.ObservedTimestamps); l == 0 {
@@ -1264,7 +1271,7 @@ func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS hlc.Timestamp
 // given node's clock during the transaction. The returned boolean is false if
 // no observation about the requested node was found. Otherwise, MaxTimestamp
 // can be lowered to the returned timestamp when reading from nodeID.
-func (t *Transaction) GetObservedTimestamp(nodeID NodeID) (hlc.Timestamp, bool) {
+func (t *Transaction) GetObservedTimestamp(nodeID NodeID) (hlc.ClockTimestamp, bool) {
 	s := observedTimestampSlice(t.ObservedTimestamps)
 	return s.get(nodeID)
 }
@@ -1382,14 +1389,14 @@ func PrepareTransactionForRetry(
 		// Start the new transaction at the current time from the local clock.
 		// The local hlc should have been advanced to at least the error's
 		// timestamp already.
-		now := clock.Now()
+		now := clock.NowAsClockTimestamp()
 		txn = MakeTransaction(
 			txn.Name,
 			nil, // baseKey
 			// We have errTxnPri, but this wants a UserPriority. So we're going to
 			// overwrite the priority below.
 			NormalUserPriority,
-			now,
+			now.ToTimestamp(),
 			clock.MaxOffset().Nanoseconds(),
 		)
 		// Use the priority communicated back by the server.
@@ -1471,7 +1478,7 @@ func readWithinUncertaintyIntervalRetryTimestamp(
 	// If the reader encountered a newer write within the uncertainty
 	// interval, we advance the txn's timestamp just past the last observed
 	// timestamp from the node.
-	ts, ok := txn.GetObservedTimestamp(origin)
+	clockTS, ok := txn.GetObservedTimestamp(origin)
 	if !ok {
 		log.Fatalf(ctx,
 			"missing observed timestamp for node %d found on uncertainty restart. "+
@@ -1479,6 +1486,7 @@ func readWithinUncertaintyIntervalRetryTimestamp(
 			origin, err, txn, txn.ObservedTimestamps)
 	}
 	// Also forward by the existing timestamp.
+	ts := clockTS.ToTimestamp()
 	ts.Forward(err.ExistingTimestamp.Next())
 	return ts
 }
@@ -1491,7 +1499,7 @@ func writeTooOldRetryTimestamp(err *WriteTooOldError) hlc.Timestamp {
 // trigger applies.
 func (crt ChangeReplicasTrigger) Replicas() []ReplicaDescriptor {
 	if crt.Desc != nil {
-		return crt.Desc.Replicas().All()
+		return crt.Desc.Replicas().Descriptors()
 	}
 	return crt.DeprecatedUpdatedReplicas
 }
@@ -2047,17 +2055,6 @@ func (s Span) Equal(o Span) bool {
 	return s.Key.Equal(o.Key) && s.EndKey.Equal(o.EndKey)
 }
 
-// Compare returns an integer comparing two Spans lexicographically.
-// The result will be 0 if s==o, -1 if s starts before o or if the starts
-// are equal and s ends before o, and +1 otherwise.
-func (s Span) Compare(o Span) int {
-	cmp := bytes.Compare(s.Key, o.Key)
-	if cmp == 0 {
-		return bytes.Compare(s.EndKey, o.EndKey)
-	}
-	return cmp
-}
-
 // Overlaps returns true WLOG for span A and B iff:
 // 1. Both spans contain one key (just the start key) and they are equal; or
 // 2. The span with only one key is contained inside the other span; or
@@ -2316,18 +2313,18 @@ func (s observedTimestampSlice) index(nodeID NodeID) int {
 
 // get the observed timestamp for the specified node, returning false if no
 // timestamp exists.
-func (s observedTimestampSlice) get(nodeID NodeID) (hlc.Timestamp, bool) {
+func (s observedTimestampSlice) get(nodeID NodeID) (hlc.ClockTimestamp, bool) {
 	i := s.index(nodeID)
 	if i < len(s) && s[i].NodeID == nodeID {
 		return s[i].Timestamp, true
 	}
-	return hlc.Timestamp{}, false
+	return hlc.ClockTimestamp{}, false
 }
 
 // update the timestamp for the specified node, or add a new entry in the
 // correct (sorted) location. The receiver is not mutated.
 func (s observedTimestampSlice) update(
-	nodeID NodeID, timestamp hlc.Timestamp,
+	nodeID NodeID, timestamp hlc.ClockTimestamp,
 ) observedTimestampSlice {
 	i := s.index(nodeID)
 	if i < len(s) && s[i].NodeID == nodeID {
@@ -2394,5 +2391,6 @@ func init() {
 func (ReplicaChangeType) SafeValue() {}
 
 func (ri RangeInfo) String() string {
-	return fmt.Sprintf("desc: %s lease: %s", ri.Desc, ri.Lease)
+	return fmt.Sprintf("desc: %s, lease: %s, closed_timestamp_policy: %s",
+		ri.Desc, ri.Lease, ri.ClosedTimestampPolicy)
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -87,12 +88,12 @@ func (p *planner) AlterRoleNode(
 func (p *planner) checkPasswordOptionConstraints(
 	ctx context.Context, roleOptions roleoption.List, newUser bool,
 ) error {
-	if !p.EvalContext().Settings.Version.IsActive(ctx, clusterversion.VersionCreateLoginPrivilege) {
+	if !p.EvalContext().Settings.Version.IsActive(ctx, clusterversion.CreateLoginPrivilege) {
 		// TODO(knz): Remove this condition in 21.1.
 		if roleOptions.Contains(roleoption.CREATELOGIN) || roleOptions.Contains(roleoption.NOCREATELOGIN) {
 			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 				`granting CREATELOGIN or NOCREATELOGIN requires all nodes to be upgraded to %s`,
-				clusterversion.VersionByKey(clusterversion.VersionCreateLoginPrivilege))
+				clusterversion.ByKey(clusterversion.CreateLoginPrivilege))
 		}
 	}
 
@@ -245,17 +246,17 @@ func (n *alterRoleNode) startExec(params runParams) error {
 		}
 	}
 
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogAlterRole,
+	optStrs := make([]string, len(n.roleOptions))
+	for i := range optStrs {
+		optStrs[i] = n.roleOptions[i].String()
+	}
+
+	return params.p.logEvent(params.ctx,
 		0, /* no target */
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			RoleName string
-			User     string
-		}{normalizedUsername.Normalized(), params.p.User().Normalized()},
-	)
+		&eventpb.AlterRole{
+			RoleName: normalizedUsername.Normalized(),
+			Options:  optStrs,
+		})
 }
 
 func (*alterRoleNode) Next(runParams) (bool, error) { return false, nil }

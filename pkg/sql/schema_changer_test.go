@@ -34,12 +34,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
@@ -68,13 +68,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
-
-// setTestJobsAdoptInterval sets a short job adoption interval for a test
-// and returns a function to reset it after the test. The intention is that
-// the returned function should be deferred.
-func setTestJobsAdoptInterval() (reset func()) {
-	return jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)
-}
 
 // TestSchemaChangeProcess adds mutations manually to a table descriptor and
 // ensures that RunStateMachineBeforeBackfill processes the mutation.
@@ -113,7 +106,7 @@ func TestSchemaChangeProcess(t *testing.T) {
 	jobRegistry := s.JobRegistry().(*jobs.Registry)
 	defer stopper.Stop(context.Background())
 	changer := sql.NewSchemaChangerForTesting(
-		id, 0, instance, *kvDB, leaseMgr, jobRegistry, &execCfg, cluster.MakeTestingClusterSettings())
+		id, 0, instance, kvDB, leaseMgr, jobRegistry, &execCfg, cluster.MakeTestingClusterSettings())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -143,16 +136,16 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	// Check that RunStateMachineBeforeBackfill functions properly.
 	expectedVersion = tableDesc.Version
 	// Make a copy of the index for use in a mutation.
-	index := protoutil.Clone(&tableDesc.Indexes[0]).(*descpb.IndexDescriptor)
+	index := tableDesc.PublicNonPrimaryIndexes()[0].IndexDescDeepCopy()
 	index.Name = "bar"
 	index.ID = tableDesc.NextIndexID
 	tableDesc.NextIndexID++
 	changer = sql.NewSchemaChangerForTesting(
-		id, tableDesc.NextMutationID, instance, *kvDB, leaseMgr, jobRegistry,
+		id, tableDesc.NextMutationID, instance, kvDB, leaseMgr, jobRegistry,
 		&execCfg, cluster.MakeTestingClusterSettings(),
 	)
-	tableDesc.Mutations = append(tableDesc.Mutations, descpb.DescriptorMutation{
-		Descriptor_: &descpb.DescriptorMutation_Index{Index: index},
+	tableDesc.TableDesc().Mutations = append(tableDesc.TableDesc().Mutations, descpb.DescriptorMutation{
+		Descriptor_: &descpb.DescriptorMutation_Index{Index: &index},
 		Direction:   descpb.DescriptorMutation_ADD,
 		State:       descpb.DescriptorMutation_DELETE_ONLY,
 		MutationID:  tableDesc.NextMutationID,
@@ -163,11 +156,11 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	for _, direction := range []descpb.DescriptorMutation_Direction{
 		descpb.DescriptorMutation_ADD, descpb.DescriptorMutation_DROP,
 	} {
-		tableDesc.Mutations[0].Direction = direction
+		tableDesc.GetMutations()[0].Direction = direction
 		expectedVersion++
 		if err := kvDB.Put(
 			ctx,
-			catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID),
+			catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.GetID()),
 			tableDesc.DescriptorProto(),
 		); err != nil {
 			t.Fatal(err)
@@ -189,7 +182,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 			if newVersion != expectedVersion {
 				t.Fatalf("bad version; e = %d, v = %d", expectedVersion, newVersion)
 			}
-			state := tableDesc.Mutations[0].State
+			state := tableDesc.GetMutations()[0].State
 			if state != expectedState {
 				t.Fatalf("bad state; e = %d, v = %d", expectedState, state)
 			}
@@ -198,7 +191,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	// RunStateMachineBeforeBackfill() doesn't complete the schema change.
 	tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(tableDesc.Mutations) == 0 {
+	if len(tableDesc.GetMutations()) == 0 {
 		t.Fatalf("table expected to have an outstanding schema change: %v", tableDesc)
 	}
 }
@@ -251,7 +244,7 @@ CREATE INDEX foo ON t.test (v)
 	for r := retry.Start(retryOpts); r.Next(); {
 		tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 			kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.Indexes) == 1 {
+		if len(tableDesc.PublicNonPrimaryIndexes()) == 1 {
 			break
 		}
 	}
@@ -278,7 +271,7 @@ CREATE INDEX foo ON t.test (v)
 		// Ensure that the version gets incremented.
 		tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 			kvDB, keys.SystemSQLCodec, "t", "test")
-		name := tableDesc.Indexes[0].Name
+		name := tableDesc.PublicNonPrimaryIndexes()[0].GetName()
 		if name != "ufo" {
 			t.Fatalf("bad index name %s", name)
 		}
@@ -298,7 +291,7 @@ CREATE INDEX foo ON t.test (v)
 	for r := retry.Start(retryOpts); r.Next(); {
 		tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 			kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.Indexes) == count+1 {
+		if len(tableDesc.PublicNonPrimaryIndexes()) == count+1 {
 			break
 		}
 	}
@@ -310,29 +303,6 @@ CREATE INDEX foo ON t.test (v)
 	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func getTableKeyCount(ctx context.Context, kvDB *kv.DB) (int, error) {
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	tablePrefix := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.ID))
-	tableEnd := tablePrefix.PrefixEnd()
-	kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0)
-	return len(kvs), err
-}
-
-func checkTableKeyCountExact(ctx context.Context, kvDB *kv.DB, e int) error {
-	if count, err := getTableKeyCount(ctx, kvDB); err != nil {
-		return err
-	} else if count != e {
-		return errors.Errorf("expected %d key value pairs, but got %d", e, count)
-	}
-	return nil
-}
-
-// checkTableKeyCount returns the number of KVs in the DB, the multiple should be the
-// number of columns.
-func checkTableKeyCount(ctx context.Context, kvDB *kv.DB, multiple int, maxValue int) error {
-	return checkTableKeyCountExact(ctx, kvDB, multiple*(maxValue+1))
 }
 
 // Run a particular schema change and run some OLTP operations in parallel, as
@@ -426,7 +396,7 @@ func runSchemaChangeWithOperations(
 	// dropped indexes are expected to be GC'ed immediately after the schema
 	// change completes.
 	testutils.SucceedsSoon(t, func() error {
-		return checkTableKeyCount(ctx, kvDB, keyMultiple, maxValue+numInserts)
+		return sqltestutils.CheckTableKeyCount(ctx, kvDB, keyMultiple, maxValue+numInserts)
 	})
 	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
 		t.Fatal(err)
@@ -438,16 +408,6 @@ func runSchemaChangeWithOperations(
 			t.Error(err)
 		}
 	}
-}
-
-// bulkInsertIntoTable fills up table t.test with (maxValue + 1) rows.
-func bulkInsertIntoTable(sqlDB *gosql.DB, maxValue int) error {
-	inserts := make([]string, maxValue+1)
-	for i := 0; i < maxValue+1; i++ {
-		inserts[i] = fmt.Sprintf(`(%d, %d)`, i, maxValue-i)
-	}
-	_, err := sqlDB.Exec(`INSERT INTO t.test VALUES ` + strings.Join(inserts, ","))
-	return err
 }
 
 func TestRollbackOfAddingTable(t *testing.T) {
@@ -571,7 +531,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	}
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -587,7 +547,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 
 	// number of keys == 2 * number of rows; 1 column family and 1 index entry
 	// for each row.
-	if err := checkTableKeyCount(ctx, kvDB, 2, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 2, maxValue); err != nil {
 		t.Fatal(err)
 	}
 	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
@@ -745,7 +705,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	}
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -761,7 +721,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 
 	// number of keys == 2 * number of rows; 1 column family and 1 index entry
 	// for each row.
-	if err := checkTableKeyCount(ctx, kvDB, 2, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 2, maxValue); err != nil {
 		t.Fatal(err)
 	}
 	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
@@ -791,7 +751,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	wg.Wait()
 
 	// Ensure that the table data hasn't been deleted.
-	tablePrefix := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.ID))
+	tablePrefix := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.GetID()))
 	tableEnd := tablePrefix.PrefixEnd()
 	if kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0); err != nil {
 		t.Fatal(err)
@@ -800,7 +760,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	}
 	// Check that the table descriptor exists so we know the data will
 	// eventually be deleted.
-	tbDescKey := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID)
+	tbDescKey := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.GetID())
 	if gr, err := kvDB.Get(ctx, tbDescKey); err != nil {
 		t.Fatal(err)
 	} else if !gr.Exists() {
@@ -845,7 +805,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -873,13 +833,13 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	ctx := context.Background()
 
-	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := sqlDB.Exec(`
-CREATE UNIQUE INDEX vidx ON t.test (v);
-`); !testutils.IsError(err, `violates unique constraint "vidx"`) {
+	CREATE UNIQUE INDEX vidx ON t.test (v);
+	`); !testutils.IsError(err, `violates unique constraint "vidx"`) {
 		t.Fatalf("got err=%s", err)
 	}
 
@@ -888,18 +848,18 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	// disabled in order to assert the next errors. Therefore we do not check
 	// the keycount from this operation and just check that the next failed
 	// operations do not add more.
-	keyCount, err := getTableKeyCount(ctx, kvDB)
+	keyCount, err := sqltestutils.GetTableKeyCount(ctx, kvDB)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := sqlDB.Exec(`
-	   ALTER TABLE t.test ADD COLUMN p DECIMAL NOT NULL DEFAULT (DECIMAL '1-3');
-	   `); !testutils.IsError(err, `could not parse "1-3" as type decimal`) {
+	  ALTER TABLE t.test ADD COLUMN p DECIMAL NOT NULL DEFAULT (DECIMAL '1-3');
+	  `); !testutils.IsError(err, `could not parse "1-3" as type decimal`) {
 		t.Fatalf("got err=%s", err)
 	}
 
-	if err := checkTableKeyCountExact(ctx, kvDB, keyCount); err != nil {
+	if err := sqltestutils.CheckTableKeyCountExact(ctx, kvDB, keyCount); err != nil {
 		t.Fatal(err)
 	}
 
@@ -909,7 +869,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 		t.Fatalf("got err=%s", err)
 	}
 
-	if err := checkTableKeyCountExact(ctx, kvDB, keyCount); err != nil {
+	if err := sqltestutils.CheckTableKeyCountExact(ctx, kvDB, keyCount); err != nil {
 		t.Fatal(err)
 	}
 	close(blockGC)
@@ -968,6 +928,7 @@ func TestAbortSchemaChangeBackfill(t *testing.T) {
 				// to commit and will abort.
 				<-commandsDone
 			},
+			BulkAdderFlushesEveryBatch: true,
 		},
 		// Disable backfill migrations, we still need the jobs table migration.
 		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
@@ -989,7 +950,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	// Add a zone config for the table.
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1075,7 +1036,7 @@ COMMIT;
 
 			// Verify the number of keys left behind in the table to validate
 			// schema change operations.
-			if err := checkTableKeyCount(
+			if err := sqltestutils.CheckTableKeyCount(
 				ctx, kvDB, testCase.expectedNumKeysPerRow, maxValue,
 			); err != nil {
 				t.Fatal(err)
@@ -1124,7 +1085,7 @@ func addIndexSchemaChange(
 
 	ctx := context.Background()
 
-	if err := checkTableKeyCount(ctx, kvDB, numKeysPerRow, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, numKeysPerRow, maxValue); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1161,7 +1122,7 @@ func addColumnSchemaChange(
 
 	ctx := context.Background()
 
-	if err := checkTableKeyCount(ctx, kvDB, numKeysPerRow, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, numKeysPerRow, maxValue); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1176,7 +1137,7 @@ func dropColumnSchemaChange(
 
 	ctx := context.Background()
 
-	if err := checkTableKeyCount(ctx, kvDB, numKeysPerRow, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, numKeysPerRow, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1190,7 +1151,7 @@ func dropIndexSchemaChange(
 		t.Fatal(err)
 	}
 
-	if err := checkTableKeyCount(context.Background(), kvDB, numKeysPerRow, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(context.Background(), kvDB, numKeysPerRow, maxValue); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1219,8 +1180,8 @@ CREATE TABLE t.test (
 
 	// Read table descriptor.
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(tableDesc.Checks) != 3 {
-		t.Fatalf("Expected 3 checks but got %d ", len(tableDesc.Checks))
+	if len(tableDesc.GetChecks()) != 3 {
+		t.Fatalf("Expected 3 checks but got %d ", len(tableDesc.GetChecks()))
 	}
 
 	if _, err := sqlDB.Exec("ALTER TABLE t.test DROP v"); err != nil {
@@ -1230,16 +1191,16 @@ CREATE TABLE t.test (
 	// Re-read table descriptor.
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	// Only check_ab should remain
-	if len(tableDesc.Checks) != 1 {
+	if len(tableDesc.GetChecks()) != 1 {
 		checkExprs := make([]string, 0)
-		for i := range tableDesc.Checks {
-			checkExprs = append(checkExprs, tableDesc.Checks[i].Expr)
+		for i := range tableDesc.GetChecks() {
+			checkExprs = append(checkExprs, tableDesc.GetChecks()[i].Expr)
 		}
-		t.Fatalf("Expected 1 check but got %d with CHECK expr %s ", len(tableDesc.Checks), strings.Join(checkExprs, ", "))
+		t.Fatalf("Expected 1 check but got %d with CHECK expr %s ", len(tableDesc.GetChecks()), strings.Join(checkExprs, ", "))
 	}
 
-	if tableDesc.Checks[0].Name != "check_ab" {
-		t.Fatalf("Only check_ab should remain, got: %s ", tableDesc.Checks[0].Name)
+	if tableDesc.GetChecks()[0].Name != "check_ab" {
+		t.Fatalf("Only check_ab should remain, got: %s ", tableDesc.GetChecks()[0].Name)
 	}
 
 	// Test that a constraint being added prevents the column from being dropped.
@@ -1267,7 +1228,7 @@ func TestSchemaChangeRetry(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Decrease the adopt loop interval so that retries happen quickly.
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 
 	params, _ := tests.CreateTestServerParams()
 
@@ -1297,11 +1258,18 @@ func TestSchemaChangeRetry(t *testing.T) {
 		return nil
 	}
 
+	const maxValue = 2000
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			WriteCheckpointInterval: time.Nanosecond,
+			WriteCheckpointInterval:          time.Nanosecond,
+			AlwaysUpdateIndexBackfillDetails: true,
+			BackfillChunkSize:                maxValue / 5,
 		},
-		DistSQL: &execinfra.TestingKnobs{RunBeforeBackfillChunk: checkSpan},
+		DistSQL: &execinfra.TestingKnobs{
+			RunBeforeBackfillChunk:                     checkSpan,
+			BulkAdderFlushesEveryBatch:                 true,
+			SerializeIndexBackfillCreationAndIngestion: make(chan struct{}, 1),
+		},
 		// Disable backfill migrations, we still need the jobs table migration.
 		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
 			DisableBackfillMigrations: true,
@@ -1318,8 +1286,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	// Bulk insert.
-	const maxValue = 2000
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1346,7 +1313,7 @@ func TestSchemaChangeRetryOnVersionChange(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Decrease the adopt loop interval so that retries happen quickly.
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 
 	params, _ := tests.CreateTestServerParams()
 	var upTableVersion func()
@@ -1360,8 +1327,9 @@ func TestSchemaChangeRetryOnVersionChange(t *testing.T) {
 				atomic.AddUint32(&numBackfills, 1)
 				return nil
 			},
-			WriteCheckpointInterval: time.Nanosecond,
-			BackfillChunkSize:       maxValue / 10,
+			WriteCheckpointInterval:          time.Nanosecond,
+			BackfillChunkSize:                maxValue / 10,
+			AlwaysUpdateIndexBackfillDetails: true,
 		},
 		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
@@ -1370,6 +1338,15 @@ func TestSchemaChangeRetryOnVersionChange(t *testing.T) {
 				if currChunk == 3 {
 					// Publish a new version of the table.
 					upTableVersion()
+
+					// TODO(adityamaru): Previously, the index backfiller would
+					// periodically redo the DistSQL flow setup after checkpointing its
+					// progress. This would mean that it would notice a changed descriptor
+					// version and retry the backfill. Since, the new index backfiller
+					// does not repeat this DistSQL setup step unless retried, we must
+					// force a retry.
+					errAmbiguous := &roachpb.AmbiguousResultError{}
+					return roachpb.NewError(errAmbiguous).GoError()
 				}
 				if seenSpan.Key != nil {
 					if !seenSpan.EndKey.Equal(sp.EndKey) {
@@ -1379,6 +1356,8 @@ func TestSchemaChangeRetryOnVersionChange(t *testing.T) {
 				seenSpan = sp
 				return nil
 			},
+			BulkAdderFlushesEveryBatch:                 true,
+			SerializeIndexBackfillCreationAndIngestion: make(chan struct{}, 1),
 		},
 		// Disable backfill migrations, we still need the jobs table migration.
 		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
@@ -1396,7 +1375,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	id := tableDesc.ID
+	id := tableDesc.GetID()
 	ctx := context.Background()
 
 	upTableVersion = func() {
@@ -1427,7 +1406,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1484,10 +1463,7 @@ func TestSchemaChangePurgeFailure(t *testing.T) {
 				}
 				return nil
 			},
-			// the backfiller flushes after every batch if RunAfterBackfillChunk is
-			// non-nil so this noop fn means we can observe the partial-backfill that
-			// would otherwise just be buffered.
-			RunAfterBackfillChunk: func() {},
+			BulkAdderFlushesEveryBatch: true,
 		},
 		// Disable backfill migrations, we still need the jobs table migration.
 		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
@@ -1510,7 +1486,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// Bulk insert.
 	const maxValue = chunkSize + 1
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1540,7 +1516,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	atomic.StoreUint32(&enableAsyncSchemaChanges, 1)
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	// deal with schema change knob
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1556,9 +1532,9 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// There is still a DROP INDEX mutation waiting for GC.
-	if e := 1; len(tableDesc.GCMutations) != e {
-		t.Fatalf("the table has %d instead of %d GC mutations", len(tableDesc.GCMutations), e)
-	} else if m := tableDesc.GCMutations[0]; m.IndexID != 2 && m.DropTime == 0 && m.JobID == 0 {
+	if e := 1; len(tableDesc.GetGCMutations()) != e {
+		t.Fatalf("the table has %d instead of %d GC mutations", len(tableDesc.GetGCMutations()), e)
+	} else if m := tableDesc.GetGCMutations()[0]; m.IndexID != 2 && m.DropTime == 0 && m.JobID == 0 {
 		t.Fatalf("unexpected GC mutation %v", m)
 	}
 
@@ -1568,7 +1544,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	ctx := context.Background()
 
-	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue+1+numGarbageValues); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue+1+numGarbageValues); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1582,15 +1558,15 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	testutils.SucceedsSoon(t, func() error {
 		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.GCMutations) > 0 {
-			return errors.Errorf("%d GC mutations remaining", len(tableDesc.GCMutations))
+		if len(tableDesc.GetGCMutations()) > 0 {
+			return errors.Errorf("%d GC mutations remaining", len(tableDesc.GetGCMutations()))
 		}
 		return nil
 	})
 
 	// No garbage left behind.
 	numGarbageValues = 0
-	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue+1+numGarbageValues); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue+1+numGarbageValues); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1613,7 +1589,6 @@ func TestSchemaChangeFailureAfterCheckpointing(t *testing.T) {
 	// attempt 2: writing the third chunk returns a permanent failure
 	// purge the schema change.
 	expectedAttempts := 3
-	blockGC := make(chan struct{})
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			BackfillChunkSize: chunkSize,
@@ -1621,8 +1596,6 @@ func TestSchemaChangeFailureAfterCheckpointing(t *testing.T) {
 			// failure happens after a checkpoint has been written.
 			WriteCheckpointInterval: time.Nanosecond,
 		},
-		// Disable GC job.
-		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { <-blockGC; return nil }},
 		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				attempts++
@@ -1649,14 +1622,22 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 `); err != nil {
 		t.Fatal(err)
 	}
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
-	// Bulk insert.
-	const maxValue = 4*chunkSize + 1
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	// Disable strict GC TTL enforcement because we're going to shove a zero-value
+	// TTL into the system with AddImmediateGCZoneConfig.
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := checkTableKeyCount(context.Background(), kvDB, 1, maxValue); err != nil {
+	// Bulk insert.
+	const maxValue = 4*chunkSize + 1
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := sqltestutils.CheckTableKeyCount(context.Background(), kvDB, 1, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1666,30 +1647,37 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	// No garbage left behind.
-	if err := checkTableKeyCount(context.Background(), kvDB, 1, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(context.Background(), kvDB, 1, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
 	// A schema change that fails after the first mutation has completed. The
 	// column is backfilled and the index backfill fails requiring the column
 	// backfill to be rolled back.
+	//
+	// The schema changer may detect a unique constraint violation in 2 ways.
+	//  1. If a duplicate key is processed in the same BulkAdder batch, a
+	//     duplicate key error is returned.
+	//
+	//  2. If the number of index entries we added does not equal the table
+	//     row count, we detect we've violated the constraint.
 	if _, err := sqlDB.Exec(
 		`ALTER TABLE t.test ADD column e INT DEFAULT 0 UNIQUE CREATE FAMILY F4, ADD CHECK (e >= 0)`,
 	); !testutils.IsError(err, ` violates unique constraint`) {
 		t.Fatalf("err = %s", err)
 	}
 
-	// No garbage left behind.
-	if err := checkTableKeyCount(context.Background(), kvDB, 1, maxValue); err != nil {
-		t.Fatal(err)
-	}
+	// No garbage left behind, after the rollback has been GC'ed.
+	testutils.SucceedsSoon(t, func() error {
+		return sqltestutils.CheckTableKeyCount(context.Background(), kvDB, 1, maxValue)
+	})
 
-	// Check that constraints are cleaned up.
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	// Check that constraints are cleaned up on the latest version of the
+	// descriptor.
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if checks := tableDesc.AllActiveAndInactiveChecks(); len(checks) > 0 {
 		t.Fatalf("found checks %+v", checks)
 	}
-	close(blockGC)
 }
 
 // TestSchemaChangeReverseMutations tests that schema changes get reversed
@@ -1737,7 +1725,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 
 	// Add some data
 	const maxValue = chunkSize + 1
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1756,7 +1744,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 		// eventually not get added. The column aa will also be dropped as
 		// a result.
 		{`ALTER TABLE t.public.test ADD COLUMN aa INT8, ADD CONSTRAINT foo UNIQUE (a)`,
-			"contains unknown column"},
+			"column \"a\" does not exist"},
 
 		// The purge of column 'a' doesn't influence these schema changes.
 
@@ -1778,10 +1766,10 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 		// eventually not get added. The column bb will also be dropped as
 		// a result.
 		{`ALTER TABLE t.public.test ADD COLUMN bb INT8, ADD CONSTRAINT bar UNIQUE (never_existed)`,
-			"contains unknown column"},
+			"column \"never_existed\" does not exist"},
 		// Cascading of purges. column 'c' -> column 'bb' -> constraint 'idx_bb'.
 		{`ALTER TABLE t.public.test ADD CONSTRAINT idx_bb UNIQUE (bb)`,
-			"contains unknown column"},
+			"column \"bb\" does not exist"},
 	}
 
 	for _, tc := range testCases {
@@ -1807,8 +1795,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 	// Wait until all the mutations have been processed.
 	testutils.SucceedsSoon(t, func() error {
 		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.Mutations) > 0 {
-			return errors.Errorf("%d mutations remaining", len(tableDesc.Mutations))
+		if len(tableDesc.GetMutations()) > 0 {
+			return errors.Errorf("%d mutations remaining", len(tableDesc.GetMutations()))
 		}
 		return nil
 	})
@@ -1907,14 +1895,14 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 	}
 
 	// Add immediate GC TTL to allow index creation purge to complete.
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
 	testutils.SucceedsSoon(t, func() error {
 		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.GCMutations) > 0 {
-			return errors.Errorf("%d gc mutations remaining", len(tableDesc.GCMutations))
+		if len(tableDesc.GetGCMutations()) > 0 {
+			return errors.Errorf("%d gc mutations remaining", len(tableDesc.GetGCMutations()))
 		}
 		return nil
 	})
@@ -1922,7 +1910,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 	ctx := context.Background()
 
 	// Check that the number of k-v pairs is accurate.
-	if err := checkTableKeyCount(ctx, kvDB, 3, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 3, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1941,7 +1929,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 			Username:    security.RootUserName(),
 			Description: tc.sql,
 			DescriptorIDs: descpb.IDs{
-				tableDesc.ID,
+				tableDesc.GetID(),
 			},
 		}); err != nil {
 			t.Fatal(err)
@@ -1956,7 +1944,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 		Username:    security.RootUserName(),
 		Description: fmt.Sprintf("ROLL BACK JOB %d: %s", jobID, testCases[jobRolledBack].sql),
 		DescriptorIDs: descpb.IDs{
-			tableDesc.ID,
+			tableDesc.GetID(),
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -1989,7 +1977,7 @@ CREATE TABLE t.test (
 		t.Fatal(err)
 	}
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if tableDesc.Families[0].DefaultColumnID != 0 {
+	if tableDesc.GetFamilies()[0].DefaultColumnID != 0 {
 		t.Fatalf("default column id not set properly: %s", tableDesc)
 	}
 
@@ -2009,7 +1997,7 @@ CREATE TABLE t.test (
 	// values. This is done to make the table appear like it were
 	// written in the past when cockroachdb used to write sentinel
 	// values for each table row.
-	startKey := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.ID))
+	startKey := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.GetID()))
 	kvs, err := kvDB.Scan(
 		ctx,
 		startKey,
@@ -2031,7 +2019,7 @@ CREATE TABLE t.test (
 		t.Fatal(err)
 	}
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if tableDesc.Families[0].DefaultColumnID != 2 {
+	if tableDesc.GetFamilies()[0].DefaultColumnID != 2 {
 		t.Fatalf("default column id not set properly: %s", tableDesc)
 	}
 
@@ -2118,7 +2106,7 @@ CREATE TABLE t.test (
 		t.Fatal(err)
 	}
 
-	if err := bulkInsertIntoTable(sqlDB, 1000); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, 1000); err != nil {
 		t.Fatal(err)
 	}
 	// Run the column schema change in a separate goroutine.
@@ -2203,11 +2191,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT UNIQUE DEFAULT 23 CREATE FAMILY F3
 	}
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := checkTableKeyCount(context.Background(), kvDB, 2, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(context.Background(), kvDB, 2, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2218,8 +2206,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT UNIQUE DEFAULT 23 CREATE FAMILY F3
 
 	// The index is not regenerated.
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(tableDesc.Indexes) > 0 {
-		t.Fatalf("indexes %+v", tableDesc.Indexes)
+	if len(tableDesc.PublicNonPrimaryIndexes()) > 0 {
+		t.Fatalf("indexes %+v", tableDesc.PublicNonPrimaryIndexes())
 	}
 
 	// Unfortunately this is the same failure present when an index drop
@@ -2227,12 +2215,12 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT UNIQUE DEFAULT 23 CREATE FAMILY F3
 	// TODO(erik): Ignore errors or individually drop indexes in
 	// DELETE_AND_WRITE_ONLY which failed during the creation backfill
 	// as a rollback from a drop.
-	if e := 1; e != len(tableDesc.Columns) {
-		t.Fatalf("e = %d, v = %d, columns = %+v", e, len(tableDesc.Columns), tableDesc.Columns)
-	} else if tableDesc.Columns[0].Name != "k" {
-		t.Fatalf("columns %+v", tableDesc.Columns)
-	} else if len(tableDesc.Mutations) != 2 {
-		t.Fatalf("mutations %+v", tableDesc.Mutations)
+	if e := 1; e != len(tableDesc.PublicColumns()) {
+		t.Fatalf("e = %d, v = %d, columns = %+v", e, len(tableDesc.PublicColumns()), tableDesc.PublicColumns())
+	} else if tableDesc.PublicColumns()[0].GetName() != "k" {
+		t.Fatalf("columns %+v", tableDesc.PublicColumns())
+	} else if len(tableDesc.GetMutations()) != 2 {
+		t.Fatalf("mutations %+v", tableDesc.GetMutations())
 	}
 }
 
@@ -2242,7 +2230,7 @@ func TestVisibilityDuringPrimaryKeyChange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 
 	ctx := context.Background()
 	swapNotification := make(chan struct{})
@@ -2326,7 +2314,7 @@ func TestPrimaryKeyChangeWithPrecedingIndexCreation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 
 	ctx := context.Background()
 
@@ -2386,7 +2374,7 @@ func TestPrimaryKeyChangeWithPrecedingIndexCreation(t *testing.T) {
 		if _, err := sqlDB.Exec(`CREATE TABLE t.test (k INT NOT NULL, v INT)`); err != nil {
 			t.Fatal(err)
 		}
-		if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 			t.Fatal(err)
 		}
 
@@ -2416,7 +2404,7 @@ func TestPrimaryKeyChangeWithPrecedingIndexCreation(t *testing.T) {
 		// * the new primary key on k.
 		// * the new index for v with k as the unique column.
 		testutils.SucceedsSoon(t, func() error {
-			return checkTableKeyCount(ctx, kvDB, 4, maxValue)
+			return sqltestutils.CheckTableKeyCount(ctx, kvDB, 4, maxValue)
 		})
 	})
 
@@ -2429,7 +2417,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT, v2 INT NOT NULL)`); err != nil {
 			t.Fatal(err)
 		}
 		backfillNotif, continueNotif := initBackfillNotification()
-		// Can't use bulkInsertIntoTable here because that only works with 2 columns.
+		// Can't use sqltestutils.BulkInsertIntoTable here because that only works with 2 columns.
 		inserts := make([]string, maxValue+1)
 		for i := 0; i < maxValue+1; i++ {
 			inserts[i] = fmt.Sprintf(`(%d, %d, %d)`, i, maxValue-i, i)
@@ -2470,7 +2458,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT, v2 INT NOT NULL)`); err != nil {
 		// * the new primary index on k.
 		// * the rewritten demoted index on v2.
 		testutils.SucceedsSoon(t, func() error {
-			return checkTableKeyCount(ctx, kvDB, 4, maxValue)
+			return sqltestutils.CheckTableKeyCount(ctx, kvDB, 4, maxValue)
 		})
 	})
 }
@@ -2590,12 +2578,12 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 	// GC the old indexes to be dropped after the PK change immediately.
 	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2802,8 +2790,8 @@ COMMIT;
 	// Ensure that t.test doesn't have any pending mutations
 	// after the primary key change.
 	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(desc.Mutations) != 0 {
-		t.Fatalf("expected to find 0 mutations, but found %d", len(desc.Mutations))
+	if len(desc.GetMutations()) != 0 {
+		t.Fatalf("expected to find 0 mutations, but found %d", len(desc.GetMutations()))
 	}
 }
 
@@ -2977,7 +2965,7 @@ func TestPrimaryKeyIndexRewritesGetRemoved(t *testing.T) {
 	ctx := context.Background()
 
 	// Decrease the adopt loop interval so that retries happen quickly.
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 
 	params, _ := tests.CreateTestServerParams()
 
@@ -2999,12 +2987,12 @@ ALTER TABLE t.test ALTER PRIMARY KEY USING COLUMNS (v);
 
 	// Wait for the async schema changer to run.
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 	testutils.SucceedsSoon(t, func() error {
 		// We expect to have 3 (one for each row) * 3 (new primary key, old primary key and i rewritten).
-		return checkTableKeyCountExact(ctx, kvDB, 9)
+		return sqltestutils.CheckTableKeyCountExact(ctx, kvDB, 9)
 	})
 }
 
@@ -3013,7 +3001,7 @@ func TestPrimaryKeyChangeWithCancel(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Decrease the adopt loop interval so that retries happen quickly.
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 
 	var chunkSize int64 = 100
 	var maxValue = 4000
@@ -3064,7 +3052,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 		t.Fatal(err)
 	}
 
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3075,10 +3063,10 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 	// that the job did not succeed even though it was canceled.
 	testutils.SucceedsSoon(t, func() error {
 		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.Mutations) != 0 {
-			return errors.Errorf("expected 0 mutations after cancellation, found %d", len(tableDesc.Mutations))
+		if len(tableDesc.GetMutations()) != 0 {
+			return errors.Errorf("expected 0 mutations after cancellation, found %d", len(tableDesc.GetMutations()))
 		}
-		if len(tableDesc.PrimaryIndex.ColumnNames) != 1 || tableDesc.PrimaryIndex.ColumnNames[0] != "rowid" {
+		if tableDesc.GetPrimaryIndex().NumColumns() != 1 || tableDesc.GetPrimaryIndex().GetColumnName(0) != "rowid" {
 			return errors.Errorf("expected primary key change to not succeed after cancellation")
 		}
 		return nil
@@ -3087,12 +3075,12 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 	// Stop any further attempts at cancellation, so the GC jobs don't fail.
 	shouldCancel = false
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(db, tableDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(db, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 	// Ensure that the writes from the partial new indexes are cleaned up.
 	testutils.SucceedsSoon(t, func() error {
-		return checkTableKeyCount(ctx, kvDB, 1, maxValue)
+		return sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue)
 	})
 }
 
@@ -3144,7 +3132,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 		return jobutils.VerifySystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 			Description:   "CLEANUP JOB for 'ALTER TABLE t.public.test ALTER PRIMARY KEY USING COLUMNS (k)'",
 			Username:      security.RootUserName(),
-			DescriptorIDs: descpb.IDs{tableDesc.ID},
+			DescriptorIDs: descpb.IDs{tableDesc.GetID()},
 		})
 	})
 }
@@ -3160,7 +3148,7 @@ func TestMultiplePrimaryKeyChanges(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Decrease the adopt loop interval so that retries happen quickly.
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
@@ -3197,13 +3185,106 @@ INSERT INTO t.test VALUES (1, 1, 1, 1), (2, 2, 2, 2), (3, 3, 3, 3);
 	}
 }
 
+func TestGrantRevokeWhileIndexBackfill(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	defer sqltestutils.SetTestJobsAdoptInterval()()
+	backfillNotification := make(chan bool)
+
+	backfillCompleteNotification := make(chan bool)
+	continueSchemaChangeNotification := make(chan bool)
+
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				if backfillNotification != nil {
+					// Close channel to notify that the schema change has
+					// been queued and the backfill has started.
+					close(backfillNotification)
+					backfillNotification = nil
+					<-continueSchemaChangeNotification
+				}
+				return nil
+			},
+			RunAfterBackfillChunk: func() {
+				if backfillCompleteNotification != nil {
+					// Close channel to notify that the schema change
+					// backfill is complete and not finalized.
+					close(backfillCompleteNotification)
+					backfillCompleteNotification = nil
+					<-continueSchemaChangeNotification
+				}
+			},
+			BulkAdderFlushesEveryBatch: true,
+		},
+		// Disable backfill migrations, we still need the jobs table migration.
+		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
+			DisableBackfillMigrations: true,
+		},
+	}
+	server, db, _ := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(context.Background())
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `
+CREATE USER foo;
+CREATE DATABASE t;
+CREATE TABLE t.test (
+    k INT8 NOT NULL,
+    v INT8,
+    length INT8 NOT NULL,
+    CONSTRAINT "primary" PRIMARY KEY (k),
+    FAMILY "primary" (k, v, length)
+);
+INSERT INTO t.test (k, v, length) VALUES (0, 1, 1);
+INSERT INTO t.test (k, v, length) VALUES (1, 2, 1);
+INSERT INTO t.test (k, v, length) VALUES (2, 3, 1);
+`)
+
+	// Run the index backfill schema change in a separate goroutine.
+	notification := backfillNotification
+	doneNotification := backfillCompleteNotification
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		sqlDB.Exec(t, `CREATE UNIQUE INDEX v_idx ON t.test (v)`)
+		wg.Done()
+	}()
+
+	// Wait until the first mutation has processed through the state machine
+	// and has started backfilling.
+	<-notification
+
+	sqlDB.Exec(t, `GRANT ALL ON TABLE t.test TO foo`)
+	sqlDB.CheckQueryResults(t, fmt.Sprintf(`SELECT privilege_type FROM [SHOW GRANTS ON TABLE t.test] WHERE grantee='%s'`, "foo"), [][]string{{"ALL"}})
+	sqlDB.Exec(t, `REVOKE ALL ON TABLE t.test FROM foo`)
+	sqlDB.CheckQueryResults(t, fmt.Sprintf(`SELECT count(*) FROM [SHOW GRANTS ON TABLE t.test] WHERE grantee='%s'`, "foo"), [][]string{{"0"}})
+
+	continueSchemaChangeNotification <- true
+
+	<-doneNotification
+
+	// The index should have been backfilled at this point.
+	expectedErr := "duplicate key value violates unique constraint \"v_idx\""
+	sqlDB.ExpectErr(t, expectedErr, `INSERT INTO t.test(k, v, length) VALUES (5, 1, 8)`)
+
+	close(continueSchemaChangeNotification)
+	wg.Wait()
+
+	// Verify that the grants on the table are still as expected after the
+	// backfill has completed.
+	sqlDB.CheckQueryResults(t, fmt.Sprintf(`SELECT count(*) FROM [SHOW GRANTS ON TABLE t.test] WHERE grantee='%s'`, "foo"), [][]string{{"0"}})
+}
+
 // Test CRUD operations can read NULL values for NOT NULL columns
 // in the middle of a column backfill.
 func TestCRUDWhileColumnBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 	backfillNotification := make(chan bool)
 
 	backfillCompleteNotification := make(chan bool)
@@ -3284,7 +3365,7 @@ INSERT INTO t.test (k, v, length) VALUES (2, 3, 1);
 	// Wait until both mutations are queued up.
 	testutils.SucceedsSoon(t, func() error {
 		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if l := len(tableDesc.Mutations); l != 3 {
+		if l := len(tableDesc.GetMutations()); l != 3 {
 			return errors.Errorf("number of mutations = %d", l)
 		}
 		return nil
@@ -3382,7 +3463,7 @@ INSERT INTO t.test (k, v, length) VALUES (2, 3, 1);
 	}
 
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if l := len(tableDesc.Mutations); l != 3 {
+	if l := len(tableDesc.GetMutations()); l != 3 {
 		t.Fatalf("number of mutations = %d", l)
 	}
 
@@ -3480,7 +3561,7 @@ func TestBackfillCompletesOnChunkBoundary(t *testing.T) {
 	}
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3514,7 +3595,7 @@ func TestBackfillCompletesOnChunkBoundary(t *testing.T) {
 
 			// Verify the number of keys left behind in the table to
 			// validate schema change operations.
-			if err := checkTableKeyCount(ctx, kvDB, tc.numKeysPerRow, maxValue); err != nil {
+			if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, tc.numKeysPerRow, maxValue); err != nil {
 				t.Fatal(err)
 			}
 
@@ -3579,7 +3660,7 @@ INSERT INTO t.kv VALUES ('a', 'b');
 			name:        `insert-create`,
 			firstStmt:   `INSERT INTO t.kv VALUES ('e', 'f')`,
 			secondStmt:  `CREATE INDEX foo2 ON t.kv (v)`,
-			expectedErr: `schema change statement cannot follow a statement that has written in the same transaction`,
+			expectedErr: `the first schema change statement in a transaction must precede any writes`,
 		},
 		// schema change at the end of a read only transaction.
 		{
@@ -3663,16 +3744,17 @@ CREATE TABLE d.t (
 		kvDB, keys.SystemSQLCodec, "d", "t")
 	// Verify that this descriptor uses the new STORING encoding. Overwrite it
 	// with one that uses the old encoding.
-	for i, index := range tableDesc.Indexes {
-		if len(index.ExtraColumnIDs) != 1 {
+	for _, index := range tableDesc.PublicNonPrimaryIndexes() {
+		if index.NumExtraColumns() != 1 {
 			t.Fatalf("ExtraColumnIDs not set properly: %s", tableDesc)
 		}
-		if len(index.StoreColumnIDs) != 1 {
+		if index.NumStoredColumns() != 1 {
 			t.Fatalf("StoreColumnIDs not set properly: %s", tableDesc)
 		}
-		index.ExtraColumnIDs = append(index.ExtraColumnIDs, index.StoreColumnIDs...)
-		index.StoreColumnIDs = nil
-		tableDesc.Indexes[i] = index
+		newIndexDesc := *index.IndexDesc()
+		newIndexDesc.ExtraColumnIDs = append(newIndexDesc.ExtraColumnIDs, newIndexDesc.StoreColumnIDs...)
+		newIndexDesc.StoreColumnIDs = nil
+		tableDesc.SetPublicNonPrimaryIndex(index.Ordinal(), newIndexDesc)
 	}
 	if err := kvDB.Put(
 		context.Background(),
@@ -3788,7 +3870,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3863,10 +3945,10 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// Add some data
 	const maxValue = 200
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
 		t.Fatal(err)
 	}
 	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
@@ -3909,7 +3991,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// Check that both schema changes have completed.
 	wg.Wait()
-	if err := checkTableKeyCount(ctx, kvDB, 3, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 3, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3947,11 +4029,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14
 	}
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
 		t.Fatal(err)
 	}
 	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
@@ -3966,11 +4048,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sqlDB.Exec(`INSERT INTO system.zones VALUES ($1, $2)`, tableDesc.ID, buf); err != nil {
+	if _, err := sqlDB.Exec(`INSERT INTO system.zones VALUES ($1, $2)`, tableDesc.GetID(), buf); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := zoneExists(sqlDB, &cfg, tableDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, &cfg, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3986,14 +4068,14 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14
 
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if tableDesc.Adding() {
-		t.Fatalf("bad state = %s", tableDesc.State)
+		t.Fatalf("bad state = %s", tableDesc.GetState())
 	}
-	if err := zoneExists(sqlDB, &cfg, tableDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, &cfg, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
 	// Ensure that the table data hasn't been deleted.
-	tablePrefix := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.ID))
+	tablePrefix := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.GetID()))
 	tableEnd := tablePrefix.PrefixEnd()
 	if kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0); err != nil {
 		t.Fatal(err)
@@ -4008,7 +4090,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14
 		return jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StatusRunning, jobs.Record{
 			Description:   "GC for TRUNCATE TABLE t.public.test",
 			Username:      security.RootUserName(),
-			DescriptorIDs: descpb.IDs{tableDesc.ID},
+			DescriptorIDs: descpb.IDs{tableDesc.GetID()},
 		})
 	})
 }
@@ -4019,7 +4101,7 @@ func TestTruncateCompletion(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	const maxValue = 2000
 
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 	defer gcjob.SetSmallMaxGCIntervalForTest()()
 
 	params, _ := tests.CreateTestServerParams()
@@ -4045,11 +4127,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 	}
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
 		t.Fatal(err)
 	}
 	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
@@ -4060,12 +4142,12 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 
 	// Add a zone config.
 	var cfg zonepb.ZoneConfig
-	cfg, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.ID)
+	cfg, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := zoneExists(sqlDB, &cfg, tableDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, &cfg, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4080,7 +4162,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 	require.Equal(t, 0, count)
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4102,14 +4184,14 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 	// Get the table descriptor after the truncation.
 	newTableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if newTableDesc.Adding() {
-		t.Fatalf("bad state = %s", newTableDesc.State)
+		t.Fatalf("bad state = %s", newTableDesc.GetState())
 	}
-	if err := zoneExists(sqlDB, &cfg, newTableDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, &cfg, newTableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
 	// Ensure that the table data has been deleted.
-	tablePrefix := keys.SystemSQLCodec.IndexPrefix(uint32(tableDesc.ID), uint32(tableDesc.PrimaryIndex.ID))
+	tablePrefix := keys.SystemSQLCodec.IndexPrefix(uint32(tableDesc.GetID()), uint32(tableDesc.GetPrimaryIndexID()))
 	tableEnd := tablePrefix.PrefixEnd()
 	testutils.SucceedsSoon(t, func() error {
 		if kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0); err != nil {
@@ -4121,7 +4203,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 	})
 
 	fkTableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "pi")
-	tablePrefix = keys.SystemSQLCodec.TablePrefix(uint32(fkTableDesc.ID))
+	tablePrefix = keys.SystemSQLCodec.TablePrefix(uint32(fkTableDesc.GetID()))
 	tableEnd = tablePrefix.PrefixEnd()
 	if kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0); err != nil {
 		t.Fatal(err)
@@ -4139,7 +4221,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 		Username:    security.RootUserName(),
 		Description: "TRUNCATE TABLE t.public.test",
 		DescriptorIDs: descpb.IDs{
-			tableDesc.ID,
+			tableDesc.GetID(),
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -4150,7 +4232,7 @@ func TestTruncateInterleavedTables(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 	defer gcjob.SetSmallMaxGCIntervalForTest()()
 
 	params, _ := tests.CreateTestServerParams()
@@ -4177,9 +4259,9 @@ INSERT INTO t.child VALUES (1, 2), (2, 3), (3, 4);
 	child := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "child")
 
 	// Add zone configs for the parent and child tables.
-	_, err := sqltestutils.AddImmediateGCZoneConfig(sqlDBRaw, parent.ID)
+	_, err := sqltestutils.AddImmediateGCZoneConfig(sqlDBRaw, parent.GetID())
 	require.NoError(t, err)
-	_, err = sqltestutils.AddImmediateGCZoneConfig(sqlDBRaw, child.ID)
+	_, err = sqltestutils.AddImmediateGCZoneConfig(sqlDBRaw, child.GetID())
 	require.NoError(t, err)
 
 	// Truncate the parent now, which should cascade truncate the child.
@@ -4193,7 +4275,7 @@ INSERT INTO t.child VALUES (1, 2), (2, 3), (3, 4);
 	testutils.SucceedsSoon(t, func() error {
 		// We only need to scan the parent's table span to verify that
 		// the index data is deleted, since child is interleaved in it.
-		start := keys.SystemSQLCodec.TablePrefix(uint32(parent.ID))
+		start := keys.SystemSQLCodec.TablePrefix(uint32(parent.GetID()))
 		end := start.PrefixEnd()
 		kvs, err := kvDB.Scan(ctx, start, end, 0)
 		require.NoError(t, err)
@@ -4250,7 +4332,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// Bulk insert.
 	const maxValue = 5000
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4268,8 +4350,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// Check that an outstanding schema change exists.
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	oldID := tableDesc.ID
-	if lenMutations := len(tableDesc.Mutations); lenMutations != 3 {
+	oldID := tableDesc.GetID()
+	if lenMutations := len(tableDesc.GetMutations()); lenMutations != 3 {
 		t.Fatalf("%d outstanding schema change", lenMutations)
 	}
 
@@ -4287,7 +4369,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// The new table is truncated.
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	tablePrefix := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.ID))
+	tablePrefix := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.GetID()))
 	tableEnd := tablePrefix.PrefixEnd()
 	if kvs, err := kvDB.Scan(context.Background(), tablePrefix, tableEnd, 0); err != nil {
 		t.Fatal(err)
@@ -4296,13 +4378,13 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	// Col "x" is public and col "v" is dropped.
-	if num := len(tableDesc.Mutations); num > 0 {
+	if num := len(tableDesc.GetMutations()); num > 0 {
 		t.Fatalf("%d outstanding mutation", num)
 	}
-	if lenCols := len(tableDesc.Columns); lenCols != 2 {
+	if lenCols := len(tableDesc.PublicColumns()); lenCols != 2 {
 		t.Fatalf("%d columns", lenCols)
 	}
-	if k, x := tableDesc.Columns[0].Name, tableDesc.Columns[1].Name; k != "k" && x != "x" {
+	if k, x := tableDesc.PublicColumns()[0].GetName(), tableDesc.PublicColumns()[1].GetName(); k != "k" && x != "x" {
 		t.Fatalf("columns %q, %q in descriptor", k, x)
 	}
 	if checks := tableDesc.AllActiveAndInactiveChecks(); len(checks) != 1 {
@@ -4359,9 +4441,9 @@ INSERT INTO t.test (k, v) VALUES (1, 99), (2, 99);
 	}
 
 	if err := tx.Commit(); !testutils.IsError(
-		err, `duplicate key value`,
+		err, `unique constraint "v_unique"`,
 	) {
-		t.Fatal(err)
+		t.Fatalf(`expected 'unique constraint "v_unique"', got %+v`, err)
 	}
 }
 
@@ -4372,7 +4454,7 @@ func TestIndexBackfillAfterGC(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Decrease the adopt loop interval so that retries happen quickly.
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 
 	var tc serverutils.TestClusterInterface
 	ctx := context.Background()
@@ -4417,7 +4499,7 @@ func TestIndexBackfillAfterGC(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := checkTableKeyCount(context.Background(), kvDB, 2, 0); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(context.Background(), kvDB, 2, 0); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -4459,6 +4541,44 @@ func TestAddComputedColumn(t *testing.T) {
 	sqlDB.Exec(t, `INSERT INTO t.test VALUES (1)`)
 	sqlDB.Exec(t, `ALTER TABLE t.test ADD COLUMN b INT AS (a + 5) STORED`)
 	sqlDB.CheckQueryResults(t, `SELECT * FROM t.test ORDER BY a`, [][]string{{"2", "7"}, {"10", "15"}})
+}
+
+// TestNoBackfillForVirtualColumn verifies that adding or dropping a virtual
+// column does not involve a backfill.
+func TestNoBackfillForVirtualColumn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	sawBackfill := false
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				sawBackfill = true
+				return nil
+			},
+		},
+	}
+	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{ServerArgs: params})
+	defer tc.Stopper().Stop(context.Background())
+	db := tc.ServerConn(0)
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `CREATE DATABASE t`)
+	sqlDB.Exec(t, `CREATE TABLE t.test (a INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `INSERT INTO t.test VALUES (1), (2), (3)`)
+	sqlDB.Exec(t, `SET experimental_enable_virtual_columns = true`)
+
+	sawBackfill = false
+	sqlDB.Exec(t, `ALTER TABLE t.test ADD COLUMN b INT AS (a + 5) VIRTUAL`)
+	if sawBackfill {
+		t.Fatal("saw backfill when adding virtual column")
+	}
+
+	sqlDB.Exec(t, `ALTER TABLE t.test DROP COLUMN b`)
+	if sawBackfill {
+		t.Fatal("saw backfill when dropping virtual column")
+	}
 }
 
 func TestSchemaChangeAfterCreateInTxn(t *testing.T) {
@@ -4531,7 +4651,7 @@ ALTER TABLE t.test ADD COLUMN c INT AS (v + 4) STORED, ADD COLUMN d INT DEFAULT 
 		t.Fatal(err)
 	}
 
-	if err := checkTableKeyCount(context.Background(), kvDB, 2, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(context.Background(), kvDB, 2, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4582,8 +4702,8 @@ ALTER TABLE t.test ADD COLUMN c INT AS (v + 4) STORED, ADD COLUMN d INT DEFAULT 
 
 	// The descriptor version hasn't changed.
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if tableDesc.Version != 1 {
-		t.Fatalf("invalid version = %d", tableDesc.Version)
+	if tableDesc.GetVersion() != 1 {
+		t.Fatalf("invalid version = %d", tableDesc.GetVersion())
 	}
 }
 
@@ -4647,7 +4767,7 @@ func TestCancelSchemaChange(t *testing.T) {
 	`)
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(db, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(db, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4661,7 +4781,7 @@ func TestCancelSchemaChange(t *testing.T) {
 	sql.SplitTable(t, tc, tableDesc, sps)
 
 	ctx := context.Background()
-	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4693,7 +4813,7 @@ func TestCancelSchemaChange(t *testing.T) {
 				Username:    security.RootUserName(),
 				Description: tc.sql,
 				DescriptorIDs: descpb.IDs{
-					tableDesc.ID,
+					tableDesc.GetID(),
 				},
 			}); err != nil {
 				t.Fatal(err)
@@ -4704,7 +4824,7 @@ func TestCancelSchemaChange(t *testing.T) {
 				Username:    security.RootUserName(),
 				Description: fmt.Sprintf("ROLL BACK JOB %d: %s", jobID, tc.sql),
 				DescriptorIDs: descpb.IDs{
-					tableDesc.ID,
+					tableDesc.GetID(),
 				},
 			}
 			var err error
@@ -4722,7 +4842,7 @@ func TestCancelSchemaChange(t *testing.T) {
 				Username:    security.RootUserName(),
 				Description: tc.sql,
 				DescriptorIDs: descpb.IDs{
-					tableDesc.ID,
+					tableDesc.GetID(),
 				},
 			}); err != nil {
 				t.Fatal(err)
@@ -4765,11 +4885,11 @@ func TestCancelSchemaChange(t *testing.T) {
 	// Verify that the data from the canceled CREATE INDEX is cleaned up.
 	atomic.StoreUint32(&enableAsyncSchemaChanges, 1)
 	// TODO (lucy): when this test is no longer canceled, have it correctly handle doing GC immediately
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(db, tableDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(db, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 	testutils.SucceedsSoon(t, func() error {
-		return checkTableKeyCount(ctx, kvDB, 3, maxValue)
+		return sqltestutils.CheckTableKeyCount(ctx, kvDB, 3, maxValue)
 	})
 
 	// Check that constraints are cleaned up.
@@ -4781,7 +4901,7 @@ func TestCancelSchemaChange(t *testing.T) {
 
 // This test checks that when a transaction containing schema changes
 // needs to be retried it gets retried internal to cockroach. This test
-// currently fails because a schema changeg transaction is not retried.
+// currently fails because a schema change transaction is not retried.
 func TestSchemaChangeRetryError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -4879,12 +4999,12 @@ func TestCancelSchemaChangeContext(t *testing.T) {
 	`)
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(db, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(db, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
 	ctx := context.Background()
-	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4928,7 +5048,7 @@ func TestSchemaChangeGRPCError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 
 	const maxValue = 100
 	params, _ := tests.CreateTestServerParams()
@@ -4954,12 +5074,12 @@ func TestSchemaChangeGRPCError(t *testing.T) {
 	`)
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(db, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(db, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
 	ctx := context.Background()
-	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4967,7 +5087,7 @@ func TestSchemaChangeGRPCError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := checkTableKeyCount(ctx, kvDB, 2, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 2, maxValue); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -5007,12 +5127,12 @@ func TestBlockedSchemaChange(t *testing.T) {
 	`)
 
 	// Bulk insert.
-	if err := bulkInsertIntoTable(db, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(db, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
 	ctx := context.Background()
-	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -5052,7 +5172,7 @@ func TestIndexBackfillValidation(t *testing.T) {
 	const maxValue = 1000
 	backfillCount := int64(0)
 	var db *kv.DB
-	var tableDesc *tabledesc.Immutable
+	var tableDesc catalog.TableDescriptor
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			BackfillChunkSize: maxValue / 5,
@@ -5062,7 +5182,7 @@ func TestIndexBackfillValidation(t *testing.T) {
 				count := atomic.AddInt64(&backfillCount, 1)
 				if count == 2 {
 					// drop an index value before validation.
-					key := keys.SystemSQLCodec.IndexPrefix(uint32(tableDesc.ID), uint32(tableDesc.NextIndexID))
+					key := keys.SystemSQLCodec.IndexPrefix(uint32(tableDesc.GetID()), uint32(tableDesc.GetNextIndexID()))
 					kv, err := db.Scan(context.Background(), key, key.PrefixEnd(), 1)
 					if err != nil {
 						t.Error(err)
@@ -5072,6 +5192,7 @@ func TestIndexBackfillValidation(t *testing.T) {
 					}
 				}
 			},
+			BulkAdderFlushesEveryBatch: true,
 		},
 		// Disable backfill migrations, we still need the jobs table migration.
 		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
@@ -5108,8 +5229,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(tableDesc.Indexes) > 0 || len(tableDesc.Mutations) > 0 {
-		t.Fatalf("descriptor broken %d, %d", len(tableDesc.Indexes), len(tableDesc.Mutations))
+	if len(tableDesc.PublicNonPrimaryIndexes()) > 0 || len(tableDesc.GetMutations()) > 0 {
+		t.Fatalf("descriptor broken %d, %d", len(tableDesc.PublicNonPrimaryIndexes()), len(tableDesc.GetMutations()))
 	}
 }
 
@@ -5122,7 +5243,7 @@ func TestInvertedIndexBackfillValidation(t *testing.T) {
 	const maxValue = 1000
 	backfillCount := int64(0)
 	var db *kv.DB
-	var tableDesc *tabledesc.Immutable
+	var tableDesc catalog.TableDescriptor
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			BackfillChunkSize: maxValue / 5,
@@ -5132,7 +5253,7 @@ func TestInvertedIndexBackfillValidation(t *testing.T) {
 				count := atomic.AddInt64(&backfillCount, 1)
 				if count == 2 {
 					// drop an index value before validation.
-					key := keys.SystemSQLCodec.IndexPrefix(uint32(tableDesc.ID), uint32(tableDesc.NextIndexID))
+					key := keys.SystemSQLCodec.IndexPrefix(uint32(tableDesc.GetID()), uint32(tableDesc.GetNextIndexID()))
 					kv, err := db.Scan(context.Background(), key, key.PrefixEnd(), 1)
 					if err != nil {
 						t.Error(err)
@@ -5142,6 +5263,7 @@ func TestInvertedIndexBackfillValidation(t *testing.T) {
 					}
 				}
 			},
+			BulkAdderFlushesEveryBatch: true,
 		},
 		// Disable backfill migrations, we still need the jobs table migration.
 		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
@@ -5181,8 +5303,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v JSON);
 	}
 
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(tableDesc.Indexes) > 0 || len(tableDesc.Mutations) > 0 {
-		t.Fatalf("descriptor broken %d, %d", len(tableDesc.Indexes), len(tableDesc.Mutations))
+	if len(tableDesc.PublicNonPrimaryIndexes()) > 0 || len(tableDesc.GetMutations()) > 0 {
+		t.Fatalf("descriptor broken %d, %d", len(tableDesc.PublicNonPrimaryIndexes()), len(tableDesc.GetMutations()))
 	}
 }
 
@@ -5392,6 +5514,87 @@ CREATE TABLE t.parent (a INT PRIMARY KEY);
 	}
 }
 
+func TestTableValidityWhileAddingUniqueConstraint(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	params, _ := tests.CreateTestServerParams()
+
+	publishWriteNotification := make(chan struct{})
+	continuePublishWriteNotification := make(chan struct{})
+
+	backfillNotification := make(chan struct{})
+	continueBackfillNotification := make(chan struct{})
+
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforePublishWriteAndDelete: func() {
+				if publishWriteNotification != nil {
+					// Notify before the delete and write only state is published.
+					close(publishWriteNotification)
+					publishWriteNotification = nil
+					<-continuePublishWriteNotification
+				}
+			},
+			RunBeforeBackfill: func() error {
+				if backfillNotification != nil {
+					// Notify before the backfill begins.
+					close(backfillNotification)
+					backfillNotification = nil
+					<-continueBackfillNotification
+				}
+				return nil
+			},
+		},
+		// Disable backfill migrations, we still need the jobs table migration.
+		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
+			DisableBackfillMigrations: true,
+		},
+	}
+
+	server, sqlDB, _ := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(context.Background())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.tab (a INT PRIMARY KEY, b INT, c INT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqlDB.Exec(`SET experimental_enable_unique_without_index_constraints = true`); err != nil {
+		t.Fatal(err)
+	}
+
+	n1 := publishWriteNotification
+	n2 := backfillNotification
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		if _, err := sqlDB.Exec(`ALTER TABLE t.tab ADD UNIQUE WITHOUT INDEX (b), ADD UNIQUE WITHOUT INDEX (b, c)`); err != nil {
+			t.Error(err)
+		}
+		wg.Done()
+	}()
+
+	<-n1
+	if _, err := sqlDB.Query(`SHOW CONSTRAINTS FROM t.tab`); err != nil {
+		t.Fatal(err)
+	}
+	close(continuePublishWriteNotification)
+
+	<-n2
+	if _, err := sqlDB.Query(`SHOW CONSTRAINTS FROM t.tab`); err != nil {
+		t.Fatal(err)
+	}
+	close(continueBackfillNotification)
+
+	wg.Wait()
+
+	if err := sqlutils.RunScrub(sqlDB, "t", "tab"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestWritesWithChecksBeforeDefaultColumnBackfill tests that when a check on a
 // column being added references a different public column, writes to the public
 // column ignore the constraint before the backfill for the non-public column
@@ -5446,7 +5649,7 @@ CREATE TABLE t.test (
 		t.Fatal(err)
 	}
 
-	if err := bulkInsertIntoTable(sqlDB, 1000); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, 1000); err != nil {
 		t.Fatal(err)
 	}
 
@@ -5545,7 +5748,7 @@ CREATE TABLE t.test (
 		t.Fatal(err)
 	}
 
-	if err := bulkInsertIntoTable(sqlDB, 1000); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, 1000); err != nil {
 		t.Fatal(err)
 	}
 
@@ -5623,6 +5826,7 @@ func TestIntentRaceWithIndexBackfill(t *testing.T) {
 					close(backfillProgressing)
 				}
 			},
+			BulkAdderFlushesEveryBatch: true,
 		},
 	}
 
@@ -5649,7 +5853,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -5765,7 +5969,7 @@ INSERT INTO t.test (k, v) VALUES (1, 99), (2, 100);
 			Username:    security.RootUserName(),
 			Description: "ALTER TABLE t.public.test ADD COLUMN a INT8 AS (v - 1) STORED, ADD CHECK ((a < v) AND (a IS NOT NULL))",
 			DescriptorIDs: descpb.IDs{
-				tableDesc.ID,
+				tableDesc.GetID(),
 			},
 		})
 	}
@@ -5784,7 +5988,7 @@ func TestFKReferencesAddedOnlyOnceOnRetry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 	params, _ := tests.CreateTestServerParams()
 	var runBeforeConstraintValidation func() error
 	errorReturned := false
@@ -5880,7 +6084,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 
 	// Add some data.
 	const maxValue = chunkSize + 1
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
@@ -5888,7 +6092,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 	// Wait until indexes are created.
 	for r := retry.Start(retryOpts); r.Next(); {
 		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.Indexes) == 1 {
+		if len(tableDesc.PublicNonPrimaryIndexes()) == 1 {
 			break
 		}
 	}
@@ -5898,27 +6102,27 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 	}
 
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if e := 1; e != len(tableDesc.GCMutations) {
-		t.Fatalf("e = %d, v = %d", e, len(tableDesc.GCMutations))
+	if e := 1; e != len(tableDesc.GetGCMutations()) {
+		t.Fatalf("e = %d, v = %d", e, len(tableDesc.GetGCMutations()))
 	}
 
 	// Delete the associated job.
-	jobID := tableDesc.GCMutations[0].JobID
+	jobID := tableDesc.GetGCMutations()[0].JobID
 	if _, err := sqlDB.Exec(fmt.Sprintf("DELETE FROM system.jobs WHERE id=%d", jobID)); err != nil {
 		t.Fatal(err)
 	}
 
 	// Ensure the GCMutations has not yet been completed.
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if e := 1; e != len(tableDesc.GCMutations) {
-		t.Fatalf("e = %d, v = %d", e, len(tableDesc.GCMutations))
+	if e := 1; e != len(tableDesc.GetGCMutations()) {
+		t.Fatalf("e = %d, v = %d", e, len(tableDesc.GetGCMutations()))
 	}
 
 	// Enable async schema change processing for purged schema changes.
 	atomic.StoreUint32(&enableAsyncSchemaChanges, 1)
 
 	// Add immediate GC TTL to allow index creation purge to complete.
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -5926,8 +6130,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 	// cleared.
 	testutils.SucceedsSoon(t, func() error {
 		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.GCMutations) > 0 {
-			return errors.Errorf("%d gc mutations remaining", len(tableDesc.GCMutations))
+		if len(tableDesc.GetGCMutations()) > 0 {
+			return errors.Errorf("%d gc mutations remaining", len(tableDesc.GetGCMutations()))
 		}
 		return nil
 	})
@@ -6023,7 +6227,7 @@ ALTER TABLE t.public.test DROP COLUMN v;
 func TestRetriableErrorDuringRollback(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 	ctx := context.Background()
 
 	runTest := func(params base.TestServerArgs) {
@@ -6042,17 +6246,17 @@ INSERT INTO t.test VALUES (1, 2), (2, 2);
 		require.NoError(t, err)
 		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 		// Add a zone config for the table.
-		_, err = sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.ID)
+		_, err = sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID())
 		require.NoError(t, err)
 
 		// Try to create a unique index which won't be valid and will need a rollback.
 		_, err = sqlDB.Exec(`
 CREATE UNIQUE INDEX i ON t.test(v);
 `)
-		require.Regexp(t, "violates unique constraint", err.Error())
+		require.Regexp(t, `violates unique constraint "i"`, err.Error())
 		// Verify that the index was cleaned up.
 		testutils.SucceedsSoon(t, func() error {
-			return checkTableKeyCountExact(ctx, kvDB, 2)
+			return sqltestutils.CheckTableKeyCountExact(ctx, kvDB, 2)
 		})
 		var permanentErrors int
 		require.NoError(t, sqlDB.QueryRow(`
@@ -6114,16 +6318,77 @@ SELECT value
 	})
 }
 
+// TestDropTableWhileSchemaChangeReverting tests that schema changes in the
+// reverting state end up as failed when the table is dropped.
+func TestDropTableWhileSchemaChangeReverting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	defer sqltestutils.SetTestJobsAdoptInterval()()
+	ctx := context.Background()
+
+	// Closed when we enter the RunBeforeOnFailOrCancel knob, at which point the
+	// job is in the reverting state.
+	beforeOnFailOrCancelNotification := make(chan struct{})
+	// Closed when we're ready to continue with the schema change (rollback).
+	continueNotification := make(chan struct{})
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforeOnFailOrCancel: func(_ int64) error {
+				close(beforeOnFailOrCancelNotification)
+				<-continueNotification
+				// Return a retry error, so that we can be sure to test the path where
+				// the job is marked as failed by the DROP TABLE instead of running to
+				// completion and ending up in the failed state on its own.
+				return jobs.NewRetryJobError("injected retry error")
+			},
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	_, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
+INSERT INTO t.test VALUES (1, 2), (2, 2);
+`)
+	require.NoError(t, err)
+
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		// Try to create a unique index which won't be valid and will need a rollback.
+		_, err := sqlDB.Exec(`CREATE UNIQUE INDEX i ON t.test(v);`)
+		assert.Regexp(t, "violates unique constraint", err)
+		return nil
+	})
+
+	<-beforeOnFailOrCancelNotification
+
+	_, err = sqlDB.Exec(`DROP TABLE t.test;`)
+	require.NoError(t, err)
+
+	close(continueNotification)
+	require.NoError(t, g.Wait())
+
+	var status jobs.Status
+	var jobError string
+	require.NoError(t, sqlDB.QueryRow(`
+SELECT status, error FROM crdb_internal.jobs WHERE description LIKE '%CREATE UNIQUE INDEX%'
+`).Scan(&status, &jobError))
+	require.Equal(t, jobs.StatusFailed, status)
+	require.Regexp(t, "violates unique constraint", jobError)
+}
+
 // TestPermanentErrorDuringRollback tests that a permanent error while rolling
 // back a schema change causes the job to fail, and that the appropriate error
 // is displayed in the jobs table.
 func TestPermanentErrorDuringRollback(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 	ctx := context.Background()
 
-	runTest := func(params base.TestServerArgs) {
+	runTest := func(t *testing.T, params base.TestServerArgs, gcJobRecord bool) {
 		s, sqlDB, _ := serverutils.StartServer(t, params)
 		defer s.Stopper().Stop(ctx)
 
@@ -6138,12 +6403,22 @@ INSERT INTO t.test VALUES (1, 2), (2, 2);
 		_, err = sqlDB.Exec(`
 CREATE UNIQUE INDEX i ON t.test(v);
 `)
-		require.Regexp(t, "violates unique constraint", err.Error())
+		require.Regexp(t, `violates unique constraint "i"`, err.Error())
 
+		var jobID int64
 		var jobErr string
-		row := sqlDB.QueryRow("SELECT error FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE'")
-		require.NoError(t, row.Scan(&jobErr))
+		row := sqlDB.QueryRow("SELECT job_id, error FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE'")
+		require.NoError(t, row.Scan(&jobID, &jobErr))
 		require.Regexp(t, "cannot be reverted, manual cleanup may be required: permanent error", jobErr)
+
+		if gcJobRecord {
+			_, err := sqlDB.Exec(`DELETE FROM system.jobs WHERE id = $1`, jobID)
+			require.NoError(t, err)
+		}
+
+		// Test that dropping the table is still possible.
+		_, err = sqlDB.Exec(`DROP TABLE t.test`)
+		require.NoError(t, err)
 	}
 
 	t.Run("error-before-backfill", func(t *testing.T) {
@@ -6168,7 +6443,9 @@ CREATE UNIQUE INDEX i ON t.test(v);
 				},
 			},
 		}
-		runTest(params)
+		// Don't GC the job record after the schema change, so we can test dropping
+		// the table with a failed mutation job.
+		runTest(t, params, false /* gcJobRecord */)
 	})
 
 	t.Run("error-before-reversing-mutations", func(t *testing.T) {
@@ -6193,7 +6470,9 @@ CREATE UNIQUE INDEX i ON t.test(v);
 				},
 			},
 		}
-		runTest(params)
+		// GC the job record after the schema change, so we can test dropping the
+		// table with a nonexistent mutation job.
+		runTest(t, params, true /* gcJobRecord */)
 	})
 }
 
@@ -6218,13 +6497,13 @@ CREATE INDEX i ON t.test (a) WHERE b > 2
 	}
 
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	indexDesc, _, err := tableDesc.FindIndexByName("i")
+	index, err := tableDesc.FindIndexWithName("i")
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
 
 	// Collect all the keys in the partial index.
-	span := tableDesc.IndexSpan(keys.SystemSQLCodec, indexDesc.ID)
+	span := tableDesc.IndexSpan(keys.SystemSQLCodec, index.GetID())
 	keys, err := kvDB.Scan(ctx, span.Key, span.EndKey, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
@@ -6315,10 +6594,10 @@ func TestAddingTableResolution(t *testing.T) {
 	// In this test it gets stuck in the adding state.
 	sqlRun.Exec(t, `CREATE MATERIALIZED VIEW foo AS SELECT random(), generate_series FROM generate_series(1, 10);`)
 
-	sqlRun.ExpectErr(t, `pq: table is being added`, `SELECT * FROM foo`)
-	sqlRun.ExpectErr(t, `pq: relation "foo" does not exist`, `ALTER MATERIALIZED VIEW foo RENAME TO bar`)
+	sqlRun.ExpectErr(t, `pq: materialized view "foo" is being added`, `SELECT * FROM foo`)
+	sqlRun.ExpectErr(t, `pq: materialized view "foo" is being added`, `ALTER MATERIALIZED VIEW foo RENAME TO bar`)
 	// Regression test for #52829.
-	sqlRun.ExpectErr(t, `pq: relation "foo" does not exist`, `SHOW CREATE foo`)
+	sqlRun.ExpectErr(t, `pq: materialized view "foo" is being added`, `SHOW CREATE foo`)
 }
 
 // TestFailureToMarkCanceledReversalLeadsToCanceledStatus is a regression test
@@ -6329,7 +6608,7 @@ func TestAddingTableResolution(t *testing.T) {
 // descriptor.
 func TestFailureToMarkCanceledReversalLeadsToCanceledStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 	ctx := context.Background()
 
 	canProceed := make(chan struct{})
@@ -6349,14 +6628,12 @@ func TestFailureToMarkCanceledReversalLeadsToCanceledStatus(t *testing.T) {
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			RunBeforeBackfill: func() error {
 				<-canProceed
-				log.Infof(context.Background(), "went")
 				return nil
 			},
 		},
 		JobsTestingKnobs: &jobs.TestingKnobs{
 			BeforeUpdate: func(orig, updated jobs.JobMetadata) (err error) {
 				withJobsToFail(func(m map[int64]struct{}) {
-					log.Infof(context.Background(), "here %v %v", orig, m)
 					if _, ok := m[orig.ID]; ok && updated.Status == jobs.StatusCanceled {
 						delete(m, orig.ID)
 						err = errors.Errorf("boom")
@@ -6424,7 +6701,7 @@ SELECT job_id FROM crdb_internal.jobs
 // multiple queued schema changes works as expected.
 func TestCancelMultipleQueued(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 	ctx := context.Background()
 
 	canProceed := make(chan struct{})
@@ -6502,4 +6779,71 @@ SELECT job_id FROM crdb_internal.jobs
 			tdb.Exec(t, "CANCEL JOB $1", id)
 		}
 	}
+}
+
+// TestRollbackForeignKeyAddition tests that rolling back a schema change to add
+// a foreign key before the backreference on the other table has been installed
+// works correctly (#57596).
+func TestRollbackForeignKeyAddition(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
+	ctx := context.Background()
+
+	// Track whether we've attempted the backfill already, since there's a second
+	// backfill during the schema change rollback.
+	attemptedBackfill := false
+	// Closed when we enter the RunBeforeBackfill knob (which is before
+	// backreferences for foreign keys are added).
+	beforeBackfillNotification := make(chan struct{})
+	// Closed when we're ready to continue with the schema change.
+	continueNotification := make(chan struct{})
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforeBackfill: func() error {
+				if !attemptedBackfill {
+					attemptedBackfill = true
+					close(beforeBackfillNotification)
+					<-continueNotification
+				}
+				return nil
+			},
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
+	tdb.Exec(t, `CREATE DATABASE db`)
+	tdb.Exec(t, `CREATE TABLE db.t (a INT PRIMARY KEY)`)
+	tdb.Exec(t, `CREATE TABLE db.t2 (a INT)`)
+
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		_, err := sqlDB.ExecContext(ctx, `ALTER TABLE db.t2 ADD FOREIGN KEY (a) REFERENCES db.t`)
+		require.Regexp(t, "job canceled by user", err)
+		return nil
+	})
+
+	<-beforeBackfillNotification
+
+	var jobID int64
+
+	// We filter by descriptor_ids because there's a bug where we create an extra
+	// no-op job for the referenced table (#57624).
+	require.NoError(t, sqlDB.QueryRow(`
+SELECT job_id FROM crdb_internal.jobs WHERE description LIKE '%ALTER TABLE%'
+AND descriptor_ids[1] = 'db.t2'::regclass::int`,
+	).Scan(&jobID))
+	tdb.Exec(t, "CANCEL JOB $1", jobID)
+
+	close(continueNotification)
+	require.NoError(t, g.Wait())
+
+	var status jobs.Status
+	var error string
+	tdb.QueryRow(t, "SELECT status, error FROM crdb_internal.jobs WHERE job_id = $1", jobID).
+		Scan(&status, &error)
+	require.Equal(t, status, jobs.StatusCanceled)
+	require.Equal(t, error, "job canceled by user")
 }

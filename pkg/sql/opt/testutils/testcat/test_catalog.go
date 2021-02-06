@@ -732,7 +732,7 @@ func (tt *Table) UniqueCount() int {
 }
 
 // Unique is part of the cat.Table interface.
-func (tt *Table) Unique(i int) cat.UniqueConstraint {
+func (tt *Table) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
 	return &tt.uniqueConstraints[i]
 }
 
@@ -944,6 +944,11 @@ func (ti *Index) PartitionByListPrefixes() []tree.Datums {
 	return res
 }
 
+// ImplicitPartitioningColumnCount is part of the cat.Index interface.
+func (ti *Index) ImplicitPartitioningColumnCount() int {
+	return 0
+}
+
 // InterleaveAncestorCount is part of the cat.Index interface.
 func (ti *Index) InterleaveAncestorCount() int {
 	return 0
@@ -1022,7 +1027,7 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 	if ts.js.HistogramColumnType == "" || ts.js.HistogramBuckets == nil {
 		return nil
 	}
-	colTypeRef, err := parser.ParseType(ts.js.HistogramColumnType)
+	colTypeRef, err := parser.GetTypeFromValidSQLSyntax(ts.js.HistogramColumnType)
 	if err != nil {
 		panic(err)
 	}

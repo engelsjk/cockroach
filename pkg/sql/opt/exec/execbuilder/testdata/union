@@ -47,7 +47,7 @@ query T
 EXPLAIN SELECT node_id FROM crdb_internal.node_build_info UNION VALUES(123)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • union
 │
@@ -81,7 +81,7 @@ vectorized: true
     │   │
     │   └── • scan
     │         columns: (a, b)
-    │         estimated row count: 1000 (missing stats)
+    │         estimated row count: 1,000 (missing stats)
     │         table: abc@primary
     │         spans: FULL SCAN
     │
@@ -90,7 +90,7 @@ vectorized: true
         │
         └── • scan
               columns: (a, c)
-              estimated row count: 1000 (missing stats)
+              estimated row count: 1,000 (missing stats)
               table: abc@primary
               spans: FULL SCAN
 
@@ -99,7 +99,7 @@ query T
 EXPLAIN (VERBOSE) SELECT a FROM ((SELECT '' AS a , '') EXCEPT ALL (SELECT '', ''))
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • project
 │ columns: (a)
@@ -129,14 +129,14 @@ EXPLAIN (VERBOSE) ((SELECT '', '', 'x' WHERE false))
 UNION ALL ((SELECT '', '', 'x') EXCEPT (VALUES ('', '', 'x')))
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • render
 │ columns: ("?column?", "?column?", "?column?")
 │ estimated row count: 1
-│ render 0: "?column?"
-│ render 1: "?column?"
-│ render 2: "?column?"
+│ render ?column?: "?column?"
+│ render ?column?: "?column?"
+│ render ?column?: "?column?"
 │
 └── • except
     │ columns: ("?column?", "?column?", "?column?")
@@ -167,12 +167,12 @@ vectorized: true
 ·
 • render
 │ columns: ("?column?")
-│ estimated row count: 1333 (missing stats)
-│ render 0: 1
+│ estimated row count: 1,333 (missing stats)
+│ render ?column?: 1
 │
 └── • union all
     │ columns: ()
-    │ estimated row count: 1333 (missing stats)
+    │ estimated row count: 1,333 (missing stats)
     │
     ├── • project
     │   │ columns: ()
@@ -185,13 +185,13 @@ vectorized: true
     │       │
     │       └── • scan
     │             columns: (k)
-    │             estimated row count: 1000 (missing stats)
+    │             estimated row count: 1,000 (missing stats)
     │             table: uniontest@primary
     │             spans: FULL SCAN
     │
     └── • scan
           columns: ()
-          estimated row count: 1000 (missing stats)
+          estimated row count: 1,000 (missing stats)
           table: uniontest@primary
           spans: FULL SCAN
 

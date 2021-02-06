@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catformat"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -84,19 +83,17 @@ func ShowCreateTable(
 	f.FormatNode(tn)
 	f.WriteString(" (")
 	primaryKeyIsOnVisibleColumn := false
-	visibleCols := desc.VisibleColumns()
-	for i := range visibleCols {
-		col := &visibleCols[i]
+	for i, col := range desc.VisibleColumns() {
 		if i != 0 {
 			f.WriteString(",")
 		}
 		f.WriteString("\n\t")
-		colstr, err := schemaexpr.FormatColumnForDisplay(ctx, desc, col, &p.RunParams(ctx).p.semaCtx)
+		colstr, err := schemaexpr.FormatColumnForDisplay(ctx, desc, col.ColumnDesc(), &p.RunParams(ctx).p.semaCtx)
 		if err != nil {
 			return "", err
 		}
 		f.WriteString(colstr)
-		if desc.IsPhysicalTable() && desc.GetPrimaryIndex().ColumnIDs[0] == col.ID {
+		if desc.IsPhysicalTable() && desc.GetPrimaryIndex().GetColumnID(0) == col.GetID() {
 			// Only set primaryKeyIsOnVisibleColumn to true if the primary key
 			// is on a visible column (not rowid).
 			primaryKeyIsOnVisibleColumn = true
@@ -105,7 +102,7 @@ func ShowCreateTable(
 	if primaryKeyIsOnVisibleColumn ||
 		(desc.IsPhysicalTable() && desc.GetPrimaryIndex().IsSharded()) {
 		f.WriteString(",\n\tCONSTRAINT ")
-		formatQuoteNames(&f.Buffer, desc.GetPrimaryIndex().Name)
+		formatQuoteNames(&f.Buffer, desc.GetPrimaryIndex().GetName())
 		f.WriteString(" ")
 		f.WriteString(desc.PrimaryKeyString())
 	}
@@ -141,16 +138,15 @@ func ShowCreateTable(
 		}
 	}
 	allIdx := append(
-		append([]descpb.IndexDescriptor{}, desc.GetPublicNonPrimaryIndexes()...),
-		*desc.GetPrimaryIndex())
-	for i := range allIdx {
-		idx := &allIdx[i]
+		append([]catalog.Index{}, desc.PublicNonPrimaryIndexes()...),
+		desc.GetPrimaryIndex())
+	for _, idx := range allIdx {
 		// Only add indexes to the create_statement column, and not to the
 		// create_nofks column if they are not associated with an INTERLEAVE
 		// statement.
 		// Initialize to false if Interleave has no ancestors, indicating that the
 		// index is not interleaved at all.
-		includeInterleaveClause := len(idx.Interleave.Ancestors) == 0
+		includeInterleaveClause := idx.NumInterleaveAncestors() == 0
 		if displayOptions.FKDisplayMode != OmitFKClausesFromCreate {
 			// The caller is instructing us to not omit FK clauses from inside the CREATE.
 			// (i.e. the caller does not want them as separate DDL.)
@@ -158,10 +154,10 @@ func ShowCreateTable(
 			// clauses as well.
 			includeInterleaveClause = true
 		}
-		if idx.ID != desc.GetPrimaryIndex().ID && includeInterleaveClause {
+		if !idx.Primary() && includeInterleaveClause {
 			// Showing the primary index is handled above.
 			f.WriteString(",\n\t")
-			idxStr, err := catformat.IndexForDisplay(ctx, desc, &descpb.AnonymousTable, idx, &p.RunParams(ctx).p.semaCtx)
+			idxStr, err := catformat.IndexForDisplay(ctx, desc, &descpb.AnonymousTable, idx.IndexDesc(), &p.RunParams(ctx).p.semaCtx)
 			if err != nil {
 				return "", err
 			}
@@ -172,12 +168,12 @@ func ShowCreateTable(
 			// Add interleave or Foreign Key indexes only to the create_table columns,
 			// and not the create_nofks column.
 			if includeInterleaveClause {
-				if err := showCreateInterleave(idx, &f.Buffer, dbPrefix, lCtx); err != nil {
+				if err := showCreateInterleave(idx.IndexDesc(), &f.Buffer, dbPrefix, lCtx); err != nil {
 					return "", err
 				}
 			}
 			if err := ShowCreatePartitioning(
-				a, p.ExecCfg().Codec, desc, idx, &idx.Partitioning, &f.Buffer, 1 /* indent */, 0, /* colOffset */
+				a, p.ExecCfg().Codec, desc, idx.IndexDesc(), &idx.IndexDesc().Partitioning, &f.Buffer, 1 /* indent */, 0, /* colOffset */
 			); err != nil {
 				return "", err
 			}
@@ -190,12 +186,16 @@ func ShowCreateTable(
 		return "", err
 	}
 
-	if err := showCreateInterleave(desc.GetPrimaryIndex(), &f.Buffer, dbPrefix, lCtx); err != nil {
+	if err := showCreateInterleave(desc.GetPrimaryIndex().IndexDesc(), &f.Buffer, dbPrefix, lCtx); err != nil {
 		return "", err
 	}
 	if err := ShowCreatePartitioning(
-		a, p.ExecCfg().Codec, desc, desc.GetPrimaryIndex(), &desc.GetPrimaryIndex().Partitioning, &f.Buffer, 0 /* indent */, 0, /* colOffset */
+		a, p.ExecCfg().Codec, desc, desc.GetPrimaryIndex().IndexDesc(), &desc.GetPrimaryIndex().IndexDesc().Partitioning, &f.Buffer, 0 /* indent */, 0, /* colOffset */
 	); err != nil {
+		return "", err
+	}
+
+	if err := showCreateLocality(desc, f); err != nil {
 		return "", err
 	}
 
@@ -232,12 +232,12 @@ func (p *planner) ShowCreate(
 	ctx context.Context,
 	dbPrefix string,
 	allDescs []descpb.Descriptor,
-	desc *tabledesc.Immutable,
+	desc catalog.TableDescriptor,
 	displayOptions ShowCreateDisplayOptions,
 ) (string, error) {
 	var stmt string
 	var err error
-	tn := tree.MakeUnqualifiedTableName(tree.Name(desc.Name))
+	tn := tree.MakeUnqualifiedTableName(tree.Name(desc.GetName()))
 	if desc.IsView() {
 		stmt, err = ShowCreateView(ctx, &tn, desc)
 	} else if desc.IsSequence() {

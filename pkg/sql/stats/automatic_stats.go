@@ -37,25 +37,25 @@ const AutoStatsClusterSettingName = "sql.stats.automatic_collection.enabled"
 
 // AutomaticStatisticsClusterMode controls the cluster setting for enabling
 // automatic table statistics collection.
-var AutomaticStatisticsClusterMode = settings.RegisterPublicBoolSetting(
+var AutomaticStatisticsClusterMode = settings.RegisterBoolSetting(
 	AutoStatsClusterSettingName,
 	"automatic statistics collection mode",
 	true,
-)
+).WithPublic()
 
 // MultiColumnStatisticsClusterMode controls the cluster setting for enabling
 // automatic collection of multi-column statistics.
-var MultiColumnStatisticsClusterMode = settings.RegisterPublicBoolSetting(
+var MultiColumnStatisticsClusterMode = settings.RegisterBoolSetting(
 	"sql.stats.multi_column_collection.enabled",
 	"multi-column statistics collection mode",
 	true,
-)
+).WithPublic()
 
 // AutomaticStatisticsMaxIdleTime controls the maximum fraction of time that
 // the sampler processors will be idle when scanning large tables for automatic
 // statistics (in high load scenarios). This value can be tuned to trade off
 // the runtime vs performance impact of automatic stats.
-var AutomaticStatisticsMaxIdleTime = settings.RegisterValidatedFloatSetting(
+var AutomaticStatisticsMaxIdleTime = settings.RegisterFloatSetting(
 	"sql.stats.automatic_collection.max_fraction_idle",
 	"maximum fraction of time that automatic statistics sampler processors are idle",
 	0.9,
@@ -73,10 +73,11 @@ var AutomaticStatisticsMaxIdleTime = settings.RegisterValidatedFloatSetting(
 // statistics on that table are refreshed, in addition to the constant value
 // AutomaticStatisticsMinStaleRows.
 var AutomaticStatisticsFractionStaleRows = func() *settings.FloatSetting {
-	s := settings.RegisterNonNegativeFloatSetting(
+	s := settings.RegisterFloatSetting(
 		"sql.stats.automatic_collection.fraction_stale_rows",
 		"target fraction of stale rows per table that will trigger a statistics refresh",
 		0.2,
+		settings.NonNegativeFloat,
 	)
 	s.SetVisibility(settings.Public)
 	return s
@@ -86,10 +87,11 @@ var AutomaticStatisticsFractionStaleRows = func() *settings.FloatSetting {
 // number of rows that should be updated before a table is refreshed, in
 // addition to the fraction AutomaticStatisticsFractionStaleRows.
 var AutomaticStatisticsMinStaleRows = func() *settings.IntSetting {
-	s := settings.RegisterNonNegativeIntSetting(
+	s := settings.RegisterIntSetting(
 		"sql.stats.automatic_collection.min_stale_rows",
 		"target minimum number of stale rows per table that will trigger a statistics refresh",
 		500,
+		settings.NonNegativeInt,
 	)
 	s.SetVisibility(settings.Public)
 	return s
@@ -242,7 +244,7 @@ func MakeRefresher(
 func (r *Refresher) Start(
 	ctx context.Context, stopper *stop.Stopper, refreshInterval time.Duration,
 ) error {
-	stopper.RunWorker(context.Background(), func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(context.Background(), "refresher", func(ctx context.Context) {
 		// We always sleep for r.asOfTime at the beginning of each refresh, so
 		// subtract it from the refreshInterval.
 		refreshInterval -= r.asOfTime
@@ -304,7 +306,7 @@ func (r *Refresher) Start(
 			case mut := <-r.mutations:
 				r.mutationCounts[mut.tableID] += int64(mut.rowsAffected)
 
-			case <-stopper.ShouldStop():
+			case <-stopper.ShouldQuiesce():
 				return
 			}
 		}

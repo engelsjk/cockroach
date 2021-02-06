@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -160,7 +161,7 @@ func TestVisibilityDuringAlterColumnType(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 
 	ctx := context.Background()
 	swapNotification := make(chan struct{})
@@ -244,7 +245,7 @@ ALTER TABLE t.test ALTER COLUMN x TYPE INT;
 	// Ensure that the add column and column swap mutations are cleaned up.
 	testutils.SucceedsSoon(t, func() error {
 		desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(desc.Mutations) != 0 {
+		if len(desc.GetMutations()) != 0 {
 			return errors.New("expected no mutations on TableDescriptor")
 		}
 		return nil
@@ -256,7 +257,7 @@ ALTER TABLE t.test ALTER COLUMN x TYPE INT;
 func TestQueryIntToString(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer setTestJobsAdoptInterval()()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
 
 	params, _ := tests.CreateTestServerParams()
 

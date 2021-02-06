@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -85,7 +86,7 @@ func testReplicateQueueRebalanceInner(t *testing.T, atomic bool) {
 		// queue is already hard at work.
 		testutils.SucceedsSoon(t, func() error {
 			desc := tc.LookupRangeOrFatal(t, splitKey)
-			if i > 0 && len(desc.Replicas().Voters()) > 3 {
+			if i > 0 && len(desc.Replicas().VoterDescriptors()) > 3 {
 				// Some system ranges have five replicas but user ranges only three,
 				// so we'll see downreplications early in the startup process which
 				// we want to ignore. Delay the splits so that we don't create
@@ -146,7 +147,7 @@ func testReplicateQueueRebalanceInner(t *testing.T, atomic bool) {
 	infos, err := queryRangeLog(tc.Conns[0], `SELECT info FROM system.rangelog ORDER BY timestamp DESC`)
 	require.NoError(t, err)
 	for _, info := range infos {
-		if _, ok := trackedRanges[info.UpdatedDesc.RangeID]; !ok || len(info.UpdatedDesc.Replicas().Voters()) <= 3 {
+		if _, ok := trackedRanges[info.UpdatedDesc.RangeID]; !ok || len(info.UpdatedDesc.Replicas().VoterDescriptors()) <= 3 {
 			continue
 		}
 		// If we have atomic changes enabled, we expect to never see four replicas
@@ -166,6 +167,7 @@ func testReplicateQueueRebalanceInner(t *testing.T, atomic bool) {
 // allow a subsequent up-replication to an odd number.
 func TestReplicateQueueUpReplicate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderRaceWithIssue(t, 57144, "flaky under race")
 	defer log.Scope(t).Close(t)
 	const replicaCount = 3
 
@@ -214,18 +216,18 @@ func TestReplicateQueueUpReplicate(t *testing.T) {
 	// Now wait until the replicas have been up-replicated to the
 	// desired number.
 	testutils.SucceedsSoon(t, func() error {
-		desc, err := tc.LookupRange(testKey)
+		descriptor, err := tc.LookupRange(testKey)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(desc.InternalReplicas) != replicaCount {
+		if len(descriptor.InternalReplicas) != replicaCount {
 			return errors.Errorf("replica count, want %d, current %d", replicaCount, len(desc.InternalReplicas))
 		}
 		return nil
 	})
 
 	infos, err := filterRangeLog(
-		tc.Conns[0], kvserverpb.RangeLogEventType_add_voter, kvserverpb.ReasonRangeUnderReplicated,
+		tc.Conns[0], desc.RangeID, kvserverpb.RangeLogEventType_add_voter, kvserverpb.ReasonRangeUnderReplicated,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -270,25 +272,25 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 	// starts up with 5 replicas. Since it's not a system range, its default zone
 	// config asks for 3x replication, and the replication queue will
 	// down-replicate it.
-	require.Len(t, desc.Replicas().All(), 5)
+	require.Len(t, desc.Replicas().Descriptors(), 5)
 	// Re-enable the replication queue.
 	tc.ToggleReplicateQueues(true)
 
 	// Now wait until the replicas have been down-replicated back to the
 	// desired number.
 	testutils.SucceedsSoon(t, func() error {
-		desc, err := tc.LookupRange(testKey)
+		descriptor, err := tc.LookupRange(testKey)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(desc.InternalReplicas) != replicaCount {
+		if len(descriptor.InternalReplicas) != replicaCount {
 			return errors.Errorf("replica count, want %d, current %d", replicaCount, len(desc.InternalReplicas))
 		}
 		return nil
 	})
 
 	infos, err := filterRangeLog(
-		tc.Conns[0], kvserverpb.RangeLogEventType_remove_voter, kvserverpb.ReasonRangeOverReplicated,
+		tc.Conns[0], desc.RangeID, kvserverpb.RangeLogEventType_remove_voter, kvserverpb.ReasonRangeOverReplicated,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -303,36 +305,48 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 func queryRangeLog(
 	conn *gosql.DB, query string, args ...interface{},
 ) ([]kvserverpb.RangeLogEvent_Info, error) {
-	rows, err := conn.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
 
-	var sl []kvserverpb.RangeLogEvent_Info
-	defer rows.Close()
-	var numEntries int
-	for rows.Next() {
-		numEntries++
-		var infoStr string
-		if err := rows.Scan(&infoStr); err != nil {
-			return nil, err
+	// The range log can get large and sees unpredictable writes, so run this in a
+	// proper txn to avoid spurious retries.
+	var events []kvserverpb.RangeLogEvent_Info
+	err := crdb.ExecuteTx(context.Background(), conn, nil, func(conn *gosql.Tx) error {
+		events = nil // reset in case of a retry
+
+		rows, err := conn.Query(query, args...)
+		if err != nil {
+			return err
 		}
-		var info kvserverpb.RangeLogEvent_Info
-		if err := json.Unmarshal([]byte(infoStr), &info); err != nil {
-			return nil, errors.Errorf("error unmarshaling info string %q: %s", infoStr, err)
+
+		defer rows.Close()
+		var numEntries int
+		for rows.Next() {
+			numEntries++
+			var infoStr string
+			if err := rows.Scan(&infoStr); err != nil {
+				return err
+			}
+			var info kvserverpb.RangeLogEvent_Info
+			if err := json.Unmarshal([]byte(infoStr), &info); err != nil {
+				return errors.Errorf("error unmarshaling info string %q: %s", infoStr, err)
+			}
+			events = append(events, info)
 		}
-		sl = append(sl, info)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return sl, nil
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return nil
+	})
+	return events, err
+
 }
 
 func filterRangeLog(
-	conn *gosql.DB, eventType kvserverpb.RangeLogEventType, reason kvserverpb.RangeLogEventReason,
+	conn *gosql.DB,
+	rangeID roachpb.RangeID,
+	eventType kvserverpb.RangeLogEventType,
+	reason kvserverpb.RangeLogEventReason,
 ) ([]kvserverpb.RangeLogEvent_Info, error) {
-	return queryRangeLog(conn, `SELECT info FROM system.rangelog WHERE "eventType" = $1 AND info LIKE concat('%', $2, '%');`, eventType.String(), reason)
+	return queryRangeLog(conn, `SELECT info FROM system.rangelog WHERE "rangeID" = $1 AND "eventType" = $2 AND info LIKE concat('%', $3, '%');`, rangeID, eventType.String(), reason)
 }
 
 func toggleReplicationQueues(tc *testcluster.TestCluster, active bool) {
@@ -568,7 +582,7 @@ func TestTransferLeaseToLaggingNode(t *testing.T) {
 
 	workerReady := make(chan bool)
 	// Create persistent range load.
-	tc.Stopper().RunWorker(ctx, func(ctx context.Context) {
+	require.NoError(t, tc.Stopper().RunAsyncTask(ctx, "load", func(ctx context.Context) {
 		s = sqlutils.MakeSQLRunner(tc.Conns[remoteNodeID-1])
 		workerReady <- true
 		for {
@@ -583,7 +597,7 @@ func TestTransferLeaseToLaggingNode(t *testing.T) {
 			case <-time.After(queryInterval):
 			}
 		}
-	})
+	}))
 	<-workerReady
 	// Wait until we see remote making progress
 	leaseHolderRepl, err := leaseHolderStore.GetReplica(rangeID)

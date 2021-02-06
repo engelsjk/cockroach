@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
@@ -68,7 +69,7 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 	// suitable storage.
 	serverCfg.Stores.Specs = nil
 
-	stopper, err := setupAndInitializeLoggingAndProfiling(ctx, cmd)
+	stopper, err := setupAndInitializeLoggingAndProfiling(ctx, cmd, false /* isServerCmd */)
 	if err != nil {
 		return err
 	}
@@ -97,7 +98,9 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 		tempStorageMaxSizeBytes,
 	)
 
-	addr, httpAddr, err := server.StartTenant(
+	initGEOS(ctx)
+
+	sqlServer, addr, httpAddr, err := server.StartTenant(
 		ctx,
 		stopper,
 		clusterName,
@@ -107,6 +110,14 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Start up the diagnostics reporting loop.
+	// We don't do this in (*server.SQLServer).preStart() because we don't
+	// want this overhead and possible interference in tests.
+	if !cluster.TelemetryOptOut() {
+		sqlServer.StartDiagnostics(ctx)
+	}
+
 	log.Infof(ctx, "SQL server for tenant %s listening at %s, http at %s", serverCfg.SQLConfig.TenantID, addr, httpAddr)
 
 	// TODO(tbg): make the other goodies in `./cockroach start` reusable, such as

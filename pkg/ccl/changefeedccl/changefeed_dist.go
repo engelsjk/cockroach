@@ -107,18 +107,15 @@ func distChangefeedFlow(
 
 	// Changefeed flows handle transactional consistency themselves.
 	var noTxn *kv.Txn
-	gatewayNodeID, err := execCfg.NodeID.OptionalNodeIDErr(48274)
-	if err != nil {
-		return err
-	}
+
 	dsp := execCtx.DistSQLPlanner()
 	evalCtx := execCtx.ExtendedEvalContext()
-	planCtx := dsp.NewPlanningCtx(ctx, evalCtx, nil /* planner */, noTxn, true /* distribute */)
+	planCtx := dsp.NewPlanningCtx(ctx, evalCtx, nil /* planner */, noTxn, execCfg.Codec.ForSystemTenant() /* distribute */)
 
 	var spanPartitions []sql.SpanPartition
 	if details.SinkURI == `` {
 		// Sinkless feeds get one ChangeAggregator on the gateway.
-		spanPartitions = []sql.SpanPartition{{Node: gatewayNodeID, Spans: trackedSpans}}
+		spanPartitions = []sql.SpanPartition{{Node: dsp.GatewayID(), Spans: trackedSpans}}
 	} else {
 		// All other feeds get a ChangeAggregator local on the leaseholder.
 		spanPartitions, err = dsp.PartitionSpans(planCtx, trackedSpans)
@@ -160,7 +157,7 @@ func distChangefeedFlow(
 	p := planCtx.NewPhysicalPlan()
 	p.AddNoInputStage(corePlacement, execinfrapb.PostProcessSpec{}, changefeedResultTypes, execinfrapb.Ordering{})
 	p.AddSingleGroupStage(
-		gatewayNodeID,
+		dsp.GatewayID(),
 		execinfrapb.ProcessorCoreUnion{ChangeFrontier: &changeFrontierSpec},
 		execinfrapb.PostProcessSpec{},
 		changefeedResultTypes,
@@ -176,8 +173,9 @@ func distChangefeedFlow(
 		tree.Rows,
 		execCfg.RangeDescriptorCache,
 		noTxn,
-		func(ts hlc.Timestamp) {},
+		nil, /* clockUpdater */
 		evalCtx.Tracing,
+		execCfg.ContentionRegistry,
 	)
 	defer recv.Release()
 

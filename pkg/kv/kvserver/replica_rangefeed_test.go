@@ -158,7 +158,7 @@ func TestReplicaRangefeed(t *testing.T) {
 
 	checkForExpEvents := func(expEvents []*roachpb.RangeFeedEvent) {
 		t.Helper()
-		for i, stream := range streams {
+		for _, stream := range streams {
 			var events []*roachpb.RangeFeedEvent
 			testutils.SucceedsSoon(t, func() error {
 				if len(streamErrC) > 0 {
@@ -167,6 +167,14 @@ func TestReplicaRangefeed(t *testing.T) {
 				}
 
 				events = stream.Events()
+				var filteredEvents []*roachpb.RangeFeedEvent
+				for _, e := range events {
+					if e.Checkpoint != nil {
+						continue
+					}
+					filteredEvents = append(filteredEvents, e)
+				}
+				events = filteredEvents
 				if len(events) < len(expEvents) {
 					return errors.Errorf("too few events: %v", events)
 				}
@@ -176,9 +184,7 @@ func TestReplicaRangefeed(t *testing.T) {
 			if len(streamErrC) > 0 {
 				t.Fatalf("unexpected error from stream: %v", <-streamErrC)
 			}
-			if !reflect.DeepEqual(events, expEvents) {
-				t.Fatalf("incorrect events on stream %d, found %v, want %v", i, events, expEvents)
-			}
+			require.Equal(t, expEvents, events)
 		}
 	}
 
@@ -189,10 +195,6 @@ func TestReplicaRangefeed(t *testing.T) {
 	expEvents := []*roachpb.RangeFeedEvent{
 		{Val: &roachpb.RangeFeedValue{
 			Key: roachpb.Key("b"), Value: expVal1,
-		}},
-		{Checkpoint: &roachpb.RangeFeedCheckpoint{
-			Span:       rangefeedSpan,
-			ResolvedTS: hlc.Timestamp{},
 		}},
 	}
 	checkForExpEvents(expEvents)
@@ -772,8 +774,10 @@ func TestReplicaRangefeedPushesTransactions(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc, db, _, repls := setupClusterForClosedTimestampTesting(ctx, t, testingTargetDuration, testingCloseFraction, aggressiveResolvedTimestampClusterArgs)
+	tc, db, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,
+		testingCloseFraction, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
@@ -884,8 +888,10 @@ func TestReplicaRangefeedNudgeSlowClosedTimestamp(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc, db, desc, repls := setupClusterForClosedTimestampTesting(ctx, t, testingTargetDuration, testingCloseFraction, aggressiveResolvedTimestampClusterArgs)
+	tc, db, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,
+		testingCloseFraction, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)

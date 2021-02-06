@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/vtable"
 	"github.com/cockroachdb/errors"
+	"golang.org/x/text/collate"
 )
 
 const (
@@ -123,30 +124,33 @@ var informationSchema = virtualSchema{
 		"views",
 	),
 	tableDefs: map[descpb.ID]virtualSchemaDef{
-		catconstants.InformationSchemaAdministrableRoleAuthorizationsID: informationSchemaAdministrableRoleAuthorizations,
-		catconstants.InformationSchemaApplicableRolesID:                 informationSchemaApplicableRoles,
-		catconstants.InformationSchemaCharacterSets:                     informationSchemaCharacterSets,
-		catconstants.InformationSchemaCheckConstraints:                  informationSchemaCheckConstraints,
-		catconstants.InformationSchemaColumnPrivilegesID:                informationSchemaColumnPrivileges,
-		catconstants.InformationSchemaColumnsTableID:                    informationSchemaColumnsTable,
-		catconstants.InformationSchemaColumnUDTUsageID:                  informationSchemaColumnUDTUsage,
-		catconstants.InformationSchemaConstraintColumnUsageTableID:      informationSchemaConstraintColumnUsageTable,
-		catconstants.InformationSchemaTypePrivilegesID:                  informationSchemaTypePrivilegesTable,
-		catconstants.InformationSchemaEnabledRolesID:                    informationSchemaEnabledRoles,
-		catconstants.InformationSchemaKeyColumnUsageTableID:             informationSchemaKeyColumnUsageTable,
-		catconstants.InformationSchemaParametersTableID:                 informationSchemaParametersTable,
-		catconstants.InformationSchemaReferentialConstraintsTableID:     informationSchemaReferentialConstraintsTable,
-		catconstants.InformationSchemaRoleTableGrantsID:                 informationSchemaRoleTableGrants,
-		catconstants.InformationSchemaRoutineTableID:                    informationSchemaRoutineTable,
-		catconstants.InformationSchemaSchemataTableID:                   informationSchemaSchemataTable,
-		catconstants.InformationSchemaSchemataTablePrivilegesID:         informationSchemaSchemataTablePrivileges,
-		catconstants.InformationSchemaSequencesID:                       informationSchemaSequences,
-		catconstants.InformationSchemaStatisticsTableID:                 informationSchemaStatisticsTable,
-		catconstants.InformationSchemaTableConstraintTableID:            informationSchemaTableConstraintTable,
-		catconstants.InformationSchemaTablePrivilegesID:                 informationSchemaTablePrivileges,
-		catconstants.InformationSchemaTablesTableID:                     informationSchemaTablesTable,
-		catconstants.InformationSchemaViewsTableID:                      informationSchemaViewsTable,
-		catconstants.InformationSchemaUserPrivilegesID:                  informationSchemaUserPrivileges,
+		catconstants.InformationSchemaAdministrableRoleAuthorizationsID:  informationSchemaAdministrableRoleAuthorizations,
+		catconstants.InformationSchemaApplicableRolesID:                  informationSchemaApplicableRoles,
+		catconstants.InformationSchemaCharacterSets:                      informationSchemaCharacterSets,
+		catconstants.InformationSchemaCheckConstraints:                   informationSchemaCheckConstraints,
+		catconstants.InformationSchemaCollationCharacterSetApplicability: informationSchemaCollationCharacterSetApplicability,
+		catconstants.InformationSchemaCollations:                         informationSchemaCollations,
+		catconstants.InformationSchemaColumnPrivilegesID:                 informationSchemaColumnPrivileges,
+		catconstants.InformationSchemaColumnsTableID:                     informationSchemaColumnsTable,
+		catconstants.InformationSchemaColumnUDTUsageID:                   informationSchemaColumnUDTUsage,
+		catconstants.InformationSchemaConstraintColumnUsageTableID:       informationSchemaConstraintColumnUsageTable,
+		catconstants.InformationSchemaTypePrivilegesID:                   informationSchemaTypePrivilegesTable,
+		catconstants.InformationSchemaEnabledRolesID:                     informationSchemaEnabledRoles,
+		catconstants.InformationSchemaKeyColumnUsageTableID:              informationSchemaKeyColumnUsageTable,
+		catconstants.InformationSchemaParametersTableID:                  informationSchemaParametersTable,
+		catconstants.InformationSchemaReferentialConstraintsTableID:      informationSchemaReferentialConstraintsTable,
+		catconstants.InformationSchemaRoleTableGrantsID:                  informationSchemaRoleTableGrants,
+		catconstants.InformationSchemaRoutineTableID:                     informationSchemaRoutineTable,
+		catconstants.InformationSchemaSchemataTableID:                    informationSchemaSchemataTable,
+		catconstants.InformationSchemaSchemataTablePrivilegesID:          informationSchemaSchemataTablePrivileges,
+		catconstants.InformationSchemaSessionVariables:                   informationSchemaSessionVariables,
+		catconstants.InformationSchemaSequencesID:                        informationSchemaSequences,
+		catconstants.InformationSchemaStatisticsTableID:                  informationSchemaStatisticsTable,
+		catconstants.InformationSchemaTableConstraintTableID:             informationSchemaTableConstraintTable,
+		catconstants.InformationSchemaTablePrivilegesID:                  informationSchemaTablePrivileges,
+		catconstants.InformationSchemaTablesTableID:                      informationSchemaTablesTable,
+		catconstants.InformationSchemaViewsTableID:                       informationSchemaViewsTable,
+		catconstants.InformationSchemaUserPrivilegesID:                   informationSchemaUserPrivileges,
 	},
 	tableValidator:             validateInformationSchemaTable,
 	validWithNoDatabaseContext: true,
@@ -327,29 +331,30 @@ https://www.postgresql.org/docs/9.5/infoschema-check-constraints.html`,
 			// NULL column constraints in information_schema.check_constraints.
 			// Cockroach doesn't track these constraints as check constraints,
 			// but we can pull them off of the table's column descriptors.
-			colNum := 0
-			return table.ForeachPublicColumn(func(column *descpb.ColumnDescriptor) error {
-				colNum++
+			for _, column := range table.PublicColumns() {
 				// Only visible, non-nullable columns are included.
-				if column.Hidden || column.Nullable {
-					return nil
+				if column.IsHidden() || column.IsNullable() {
+					continue
 				}
 				// Generate a unique name for each NOT NULL constraint. Postgres
 				// uses the format <namespace_oid>_<table_oid>_<col_idx>_not_null.
 				// We might as well do the same.
 				conNameStr := tree.NewDString(fmt.Sprintf(
-					"%s_%s_%d_not_null", h.NamespaceOid(db.GetID(), scName), tableOid(table.GetID()), colNum,
+					"%s_%s_%d_not_null", h.NamespaceOid(db.GetID(), scName), tableOid(table.GetID()), column.Ordinal()+1,
 				))
 				chkExprStr := tree.NewDString(fmt.Sprintf(
-					"%s IS NOT NULL", column.Name,
+					"%s IS NOT NULL", column.GetName(),
 				))
-				return addRow(
+				if err := addRow(
 					dbNameStr,  // constraint_catalog
 					scNameStr,  // constraint_schema
 					conNameStr, // constraint_name
 					chkExprStr, // check_clause
-				)
-			})
+				); err != nil {
+					return err
+				}
+			}
+			return nil
 		})
 	},
 }
@@ -369,16 +374,14 @@ https://www.postgresql.org/docs/9.5/infoschema-column-privileges.html`,
 			for _, u := range table.GetPrivileges().Users {
 				for _, priv := range columndata {
 					if priv.Mask()&u.Privileges != 0 {
-						columns := table.GetPublicColumns()
-						for i := range columns {
-							cd := &columns[i]
+						for _, cd := range table.PublicColumns() {
 							if err := addRow(
 								tree.DNull,                             // grantor
 								tree.NewDString(u.User().Normalized()), // grantee
 								dbNameStr,                              // table_catalog
 								scNameStr,                              // table_schema
 								tree.NewDString(table.GetName()),       // table_name
-								tree.NewDString(cd.Name),               // column_name
+								tree.NewDString(cd.GetName()),          // column_name
 								tree.NewDString(priv.String()),         // privilege_type
 								tree.DNull,                             // is_grantable
 							); err != nil {
@@ -399,88 +402,119 @@ var informationSchemaColumnsTable = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 	schema: vtable.InformationSchemaColumns,
 	populate: func(ctx context.Context, p *planner, dbContext *dbdesc.Immutable, addRow func(...tree.Datum) error) error {
+		// Get the collations for all comments of current database.
+		comments, err := getComments(ctx, p)
+		if err != nil {
+			return err
+		}
+		// Push all comments of columns into map.
+		commentMap := make(map[tree.DInt]map[tree.DInt]string)
+		for _, comment := range comments {
+			objID := tree.MustBeDInt(comment[0])
+			objSubID := tree.MustBeDInt(comment[1])
+			description := comment[2].String()
+			commentType := tree.MustBeDInt(comment[3])
+			if commentType == 2 {
+				if commentMap[objID] == nil {
+					commentMap[objID] = make(map[tree.DInt]string)
+				}
+				commentMap[objID][objSubID] = description
+			}
+		}
+
 		return forEachTableDesc(ctx, p, dbContext, virtualMany, func(
 			db *dbdesc.Immutable, scName string, table catalog.TableDescriptor,
 		) error {
 			dbNameStr := tree.NewDString(db.GetName())
 			scNameStr := tree.NewDString(scName)
-			return table.ForeachPublicColumn(func(column *descpb.ColumnDescriptor) error {
+			for _, column := range table.PublicColumns() {
 				collationCatalog := tree.DNull
 				collationSchema := tree.DNull
 				collationName := tree.DNull
-				if locale := column.Type.Locale(); locale != "" {
+				if locale := column.GetType().Locale(); locale != "" {
 					collationCatalog = dbNameStr
 					collationSchema = pgCatalogNameDString
 					collationName = tree.NewDString(locale)
 				}
 				colDefault := tree.DNull
-				if column.DefaultExpr != nil {
-					colExpr, err := schemaexpr.FormatExprForDisplay(ctx, table, *column.DefaultExpr, &p.semaCtx, tree.FmtParsable)
+				if column.HasDefault() {
+					colExpr, err := schemaexpr.FormatExprForDisplay(ctx, table, column.GetDefaultExpr(), &p.semaCtx, tree.FmtParsable)
 					if err != nil {
 						return err
 					}
 					colDefault = tree.NewDString(colExpr)
 				}
 				colComputed := emptyString
-				if column.ComputeExpr != nil {
-					colExpr, err := schemaexpr.FormatExprForDisplay(ctx, table, *column.ComputeExpr, &p.semaCtx, tree.FmtSimple)
+				if column.IsComputed() {
+					colExpr, err := schemaexpr.FormatExprForDisplay(ctx, table, column.GetComputeExpr(), &p.semaCtx, tree.FmtSimple)
 					if err != nil {
 						return err
 					}
 					colComputed = tree.NewDString(colExpr)
 				}
-				return addRow(
-					dbNameStr,                        // table_catalog
-					scNameStr,                        // table_schema
-					tree.NewDString(table.GetName()), // table_name
-					tree.NewDString(column.Name),     // column_name
+
+				// Match the comment belonging to current column from map,using table id and column id
+				tableID := tree.DInt(table.GetID())
+				columnID := tree.DInt(column.GetID())
+				description := commentMap[tableID][columnID]
+
+				err := addRow(
+					dbNameStr,                         // table_catalog
+					scNameStr,                         // table_schema
+					tree.NewDString(table.GetName()),  // table_name
+					tree.NewDString(column.GetName()), // column_name
+					tree.NewDString(description),      // column_comment
 					tree.NewDInt(tree.DInt(column.GetPGAttributeNum())), // ordinal_position
-					colDefault,                    // column_default
-					yesOrNoDatum(column.Nullable), // is_nullable
-					tree.NewDString(column.Type.InformationSchemaName()), // data_type
-					characterMaximumLength(column.Type),                  // character_maximum_length
-					characterOctetLength(column.Type),                    // character_octet_length
-					numericPrecision(column.Type),                        // numeric_precision
-					numericPrecisionRadix(column.Type),                   // numeric_precision_radix
-					numericScale(column.Type),                            // numeric_scale
-					datetimePrecision(column.Type),                       // datetime_precision
-					tree.DNull,                                           // interval_type
-					tree.DNull,                                           // interval_precision
-					tree.DNull,                                           // character_set_catalog
-					tree.DNull,                                           // character_set_schema
-					tree.DNull,                                           // character_set_name
-					collationCatalog,                                     // collation_catalog
-					collationSchema,                                      // collation_schema
-					collationName,                                        // collation_name
-					tree.DNull,                                           // domain_catalog
-					tree.DNull,                                           // domain_schema
-					tree.DNull,                                           // domain_name
-					dbNameStr,                                            // udt_catalog
-					pgCatalogNameDString,                                 // udt_schema
-					tree.NewDString(column.Type.PGName()),                // udt_name
-					tree.DNull,                                           // scope_catalog
-					tree.DNull,                                           // scope_schema
-					tree.DNull,                                           // scope_name
-					tree.DNull,                                           // maximum_cardinality
-					tree.DNull,                                           // dtd_identifier
-					tree.DNull,                                           // is_self_referencing
-					tree.DNull,                                           // is_identity
-					tree.DNull,                                           // identity_generation
-					tree.DNull,                                           // identity_start
-					tree.DNull,                                           // identity_increment
-					tree.DNull,                                           // identity_maximum
-					tree.DNull,                                           // identity_minimum
-					tree.DNull,                                           // identity_cycle
-					yesOrNoDatum(column.IsComputed()),                    // is_generated
-					colComputed,                                          // generation_expression
+					colDefault,                        // column_default
+					yesOrNoDatum(column.IsNullable()), // is_nullable
+					tree.NewDString(column.GetType().InformationSchemaName()), // data_type
+					characterMaximumLength(column.GetType()),                  // character_maximum_length
+					characterOctetLength(column.GetType()),                    // character_octet_length
+					numericPrecision(column.GetType()),                        // numeric_precision
+					numericPrecisionRadix(column.GetType()),                   // numeric_precision_radix
+					numericScale(column.GetType()),                            // numeric_scale
+					datetimePrecision(column.GetType()),                       // datetime_precision
+					tree.DNull,                                                // interval_type
+					tree.DNull,                                                // interval_precision
+					tree.DNull,                                                // character_set_catalog
+					tree.DNull,                                                // character_set_schema
+					tree.DNull,                                                // character_set_name
+					collationCatalog,                                          // collation_catalog
+					collationSchema,                                           // collation_schema
+					collationName,                                             // collation_name
+					tree.DNull,                                                // domain_catalog
+					tree.DNull,                                                // domain_schema
+					tree.DNull,                                                // domain_name
+					dbNameStr,                                                 // udt_catalog
+					pgCatalogNameDString,                                      // udt_schema
+					tree.NewDString(column.GetType().PGName()),                // udt_name
+					tree.DNull,                                                // scope_catalog
+					tree.DNull,                                                // scope_schema
+					tree.DNull,                                                // scope_name
+					tree.DNull,                                                // maximum_cardinality
+					tree.DNull,                                                // dtd_identifier
+					tree.DNull,                                                // is_self_referencing
+					tree.DNull,                                                // is_identity
+					tree.DNull,                                                // identity_generation
+					tree.DNull,                                                // identity_start
+					tree.DNull,                                                // identity_increment
+					tree.DNull,                                                // identity_maximum
+					tree.DNull,                                                // identity_minimum
+					tree.DNull,                                                // identity_cycle
+					yesOrNoDatum(column.IsComputed()),                         // is_generated
+					colComputed,                                               // generation_expression
 					yesOrNoDatum(table.IsTable() &&
 						!table.IsVirtualTable() &&
 						!column.IsComputed(),
 					), // is_updatable
-					yesOrNoDatum(column.Hidden),              // is_hidden
-					tree.NewDString(column.Type.SQLString()), // crdb_sql_type
+					yesOrNoDatum(column.IsHidden()),               // is_hidden
+					tree.NewDString(column.GetType().SQLString()), // crdb_sql_type
 				)
-			})
+				if err != nil {
+					return err
+				}
+			}
+			return nil
 		})
 	},
 }
@@ -496,20 +530,23 @@ https://www.postgresql.org/docs/current/infoschema-column-udt-usage.html`,
 				dbNameStr := tree.NewDString(db.GetName())
 				scNameStr := tree.NewDString(scName)
 				tbNameStr := tree.NewDString(table.GetName())
-				return table.ForeachPublicColumn(func(col *descpb.ColumnDescriptor) error {
-					if !col.Type.UserDefined() {
-						return nil
+				for _, col := range table.PublicColumns() {
+					if !col.GetType().UserDefined() {
+						continue
 					}
-					return addRow(
-						tree.NewDString(col.Type.TypeMeta.Name.Catalog), // UDT_CATALOG
-						tree.NewDString(col.Type.TypeMeta.Name.Schema),  // UDT_SCHEMA
-						tree.NewDString(col.Type.TypeMeta.Name.Name),    // UDT_NAME
-						dbNameStr,                 // TABLE_CATALOG
-						scNameStr,                 // TABLE_SCHEMA
-						tbNameStr,                 // TABLE_NAME
-						tree.NewDString(col.Name), // COLUMN_NAME
-					)
-				})
+					if err := addRow(
+						tree.NewDString(col.GetType().TypeMeta.Name.Catalog), // UDT_CATALOG
+						tree.NewDString(col.GetType().TypeMeta.Name.Schema),  // UDT_SCHEMA
+						tree.NewDString(col.GetType().TypeMeta.Name.Name),    // UDT_NAME
+						dbNameStr,                      // TABLE_CATALOG
+						scNameStr,                      // TABLE_SCHEMA
+						tbNameStr,                      // TABLE_NAME
+						tree.NewDString(col.GetName()), // COLUMN_NAME
+					); err != nil {
+						return err
+					}
+				}
+				return nil
 			},
 		)
 	},
@@ -896,22 +933,24 @@ CREATE TABLE information_schema.referential_constraints (
 				if r, ok := matchOptionMap[fk.Match]; ok {
 					matchType = r
 				}
-				referencedIdx, err := tabledesc.FindFKReferencedIndex(refTable, fk.ReferencedColumnIDs)
+				refConstraint, err := tabledesc.FindFKReferencedUniqueConstraint(
+					refTable, fk.ReferencedColumnIDs,
+				)
 				if err != nil {
 					return err
 				}
 				return addRow(
-					dbNameStr,                           // constraint_catalog
-					scNameStr,                           // constraint_schema
-					tree.NewDString(fk.Name),            // constraint_name
-					dbNameStr,                           // unique_constraint_catalog
-					scNameStr,                           // unique_constraint_schema
-					tree.NewDString(referencedIdx.Name), // unique_constraint_name
-					matchType,                           // match_option
-					dStringForFKAction(fk.OnUpdate),     // update_rule
-					dStringForFKAction(fk.OnDelete),     // delete_rule
-					tbNameStr,                           // table_name
-					tree.NewDString(refTable.GetName()), // referenced_table_name
+					dbNameStr,                                // constraint_catalog
+					scNameStr,                                // constraint_schema
+					tree.NewDString(fk.Name),                 // constraint_name
+					dbNameStr,                                // unique_constraint_catalog
+					scNameStr,                                // unique_constraint_schema
+					tree.NewDString(refConstraint.GetName()), // unique_constraint_name
+					matchType,                                // match_option
+					dStringForFKAction(fk.OnUpdate),          // update_rule
+					dStringForFKAction(fk.OnDelete),          // delete_rule
+					tbNameStr,                                // table_name
+					tree.NewDString(refTable.GetName()),      // referenced_table_name
 				)
 			})
 		})
@@ -1148,7 +1187,7 @@ CREATE TABLE information_schema.schema_privileges (
 						privs = sc.Desc.GetPrivileges().Show(privilege.Schema)
 					} else {
 						// Other schemas inherit from the parent database.
-						privs = db.Privileges.Show(privilege.Schema)
+						privs = db.Privileges.Show(privilege.Database)
 					}
 					dbNameStr := tree.NewDString(db.GetName())
 					scNameStr := tree.NewDString(sc.Name)
@@ -1157,6 +1196,18 @@ CREATE TABLE information_schema.schema_privileges (
 					for _, u := range privs {
 						userNameStr := tree.NewDString(u.User.Normalized())
 						for _, priv := range u.Privileges {
+							privKind := privilege.ByName[priv]
+							// Non-user defined schemas inherit privileges from the database,
+							// but the USAGE privilege is conferred by having SELECT privilege
+							// on the database. (There is no SELECT privilege on schemas.)
+							if sc.Kind != catalog.SchemaUserDefined {
+								if privKind == privilege.SELECT {
+									priv = privilege.USAGE.String()
+								} else if !privilege.SchemaPrivileges.Contains(privKind) {
+									continue
+								}
+							}
+
 							if err := addRow(
 								userNameStr,           // grantee
 								dbNameStr,             // table_catalog
@@ -1281,7 +1332,7 @@ CREATE TABLE information_schema.statistics (
 					)
 				}
 
-				return table.ForeachIndex(catalog.IndexOpts{}, func(index *descpb.IndexDescriptor, _ bool) error {
+				return catalog.ForEachIndex(table, catalog.IndexOpts{}, func(index catalog.Index) error {
 					// Columns in the primary key that aren't in index.ColumnNames or
 					// index.StoreColumnNames are implicit columns in the index.
 					var implicitCols map[string]struct{}
@@ -1289,44 +1340,58 @@ CREATE TABLE information_schema.statistics (
 					if index.HasOldStoredColumns() {
 						// Old STORING format: implicit columns are extra columns minus stored
 						// columns.
-						hasImplicitCols = len(index.ExtraColumnIDs) > len(index.StoreColumnNames)
+						hasImplicitCols = index.NumExtraColumns() > index.NumStoredColumns()
 					} else {
 						// New STORING format: implicit columns are extra columns.
-						hasImplicitCols = len(index.ExtraColumnIDs) > 0
+						hasImplicitCols = index.NumExtraColumns() > 0
 					}
 					if hasImplicitCols {
 						implicitCols = make(map[string]struct{})
-						for _, col := range table.GetPrimaryIndex().ColumnNames {
+						for i := 0; i < table.GetPrimaryIndex().NumColumns(); i++ {
+							col := table.GetPrimaryIndex().GetColumnName(i)
 							implicitCols[col] = struct{}{}
 						}
 					}
 
 					sequence := 1
-					for i, col := range index.ColumnNames {
+					for i := 0; i < index.NumColumns(); i++ {
+						col := index.GetColumnName(i)
 						// We add a row for each column of index.
-						dir := dStringForIndexDirection(index.ColumnDirections[i])
-						if err := appendRow(index, col, sequence, dir, false, false); err != nil {
+						dir := dStringForIndexDirection(index.GetColumnDirection(i))
+						if err := appendRow(index.IndexDesc(), col, sequence, dir, false, false); err != nil {
 							return err
 						}
 						sequence++
 						delete(implicitCols, col)
 					}
-					for _, col := range index.StoreColumnNames {
+					for i := 0; i < index.NumStoredColumns(); i++ {
+						col := index.GetStoredColumnName(i)
 						// We add a row for each stored column of index.
-						if err := appendRow(index, col, sequence,
+						if err := appendRow(index.IndexDesc(), col, sequence,
 							indexDirectionNA, true, false); err != nil {
 							return err
 						}
 						sequence++
 						delete(implicitCols, col)
 					}
-					for col := range implicitCols {
-						// We add a row for each implicit column of index.
-						if err := appendRow(index, col, sequence,
-							indexDirectionAsc, false, true); err != nil {
-							return err
+					if len(implicitCols) > 0 {
+						// In order to have the implicit columns reported in a
+						// deterministic order, we will add all of them in the
+						// same order as they are mentioned in the primary key.
+						//
+						// Note that simply iterating over implicitCols map
+						// produces non-deterministic output.
+						for i := 0; i < table.GetPrimaryIndex().NumColumns(); i++ {
+							col := table.GetPrimaryIndex().GetColumnName(i)
+							if _, isImplicit := implicitCols[col]; isImplicit {
+								// We add a row for each implicit column of index.
+								if err := appendRow(index.IndexDesc(), col, sequence,
+									indexDirectionAsc, false, true); err != nil {
+									return err
+								}
+								sequence++
+							}
 						}
-						sequence++
 					}
 					return nil
 				})
@@ -1389,30 +1454,29 @@ CREATE TABLE information_schema.table_constraints (
 				// NULL column constraints in information_schema.check_constraints.
 				// Cockroach doesn't track these constraints as check constraints,
 				// but we can pull them off of the table's column descriptors.
-				colNum := 0
-				return table.ForeachPublicColumn(func(col *descpb.ColumnDescriptor) error {
-					colNum++
+				for _, col := range table.PublicColumns() {
+					if col.IsNullable() {
+						continue
+					}
 					// NOT NULL column constraints are implemented as a CHECK in postgres.
 					conNameStr := tree.NewDString(fmt.Sprintf(
-						"%s_%s_%d_not_null", h.NamespaceOid(db.GetID(), scName), tableOid(table.GetID()), colNum,
+						"%s_%s_%d_not_null", h.NamespaceOid(db.GetID(), scName), tableOid(table.GetID()), col.Ordinal()+1,
 					))
-					if !col.Nullable {
-						if err := addRow(
-							dbNameStr,                // constraint_catalog
-							scNameStr,                // constraint_schema
-							conNameStr,               // constraint_name
-							dbNameStr,                // table_catalog
-							scNameStr,                // table_schema
-							tbNameStr,                // table_name
-							tree.NewDString("CHECK"), // constraint_type
-							yesOrNoDatum(false),      // is_deferrable
-							yesOrNoDatum(false),      // initially_deferred
-						); err != nil {
-							return err
-						}
+					if err := addRow(
+						dbNameStr,                // constraint_catalog
+						scNameStr,                // constraint_schema
+						conNameStr,               // constraint_name
+						dbNameStr,                // table_catalog
+						scNameStr,                // table_schema
+						tbNameStr,                // table_name
+						tree.NewDString("CHECK"), // constraint_type
+						yesOrNoDatum(false),      // is_deferrable
+						yesOrNoDatum(false),      // initially_deferred
+					); err != nil {
+						return err
 					}
-					return nil
-				})
+				}
+				return nil
 			})
 	},
 }
@@ -1603,11 +1667,92 @@ CREATE TABLE information_schema.views (
 	},
 }
 
+// Postgres: https://www.postgresql.org/docs/current/infoschema-collations.html
+// MySQL:    https://dev.mysql.com/doc/refman/8.0/en/information-schema-collations-table.html
+var informationSchemaCollations = virtualSchemaTable{
+	comment: `shows the collations available in the current database
+https://www.postgresql.org/docs/current/infoschema-collations.html`,
+	schema: vtable.InformationSchemaCollations,
+	populate: func(ctx context.Context, p *planner, dbContext *dbdesc.Immutable, addRow func(...tree.Datum) error) error {
+		dbNameStr := tree.NewDString(p.CurrentDatabase())
+		add := func(collName string) error {
+			return addRow(
+				dbNameStr,
+				pgCatalogNameDString,
+				tree.NewDString(collName),
+				// Always NO PAD (The alternative PAD SPACE is not supported.)
+				tree.NewDString("NO PAD"),
+			)
+		}
+		if err := add(tree.DefaultCollationTag); err != nil {
+			return err
+		}
+		for _, tag := range collate.Supported() {
+			collName := tag.String()
+			if err := add(collName); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+}
+
+// Postgres: https://www.postgresql.org/docs/current/infoschema-collation-character-set-applicab.html
+// MySQL:    https://dev.mysql.com/doc/refman/8.0/en/information-schema-collation-character-set-applicability-table.html
+var informationSchemaCollationCharacterSetApplicability = virtualSchemaTable{
+	comment: `identifies which character set the available collations are 
+applicable to. As UTF-8 is the only available encoding this table does not
+provide much useful information.
+https://www.postgresql.org/docs/current/infoschema-collation-character-set-applicab.html`,
+	schema: vtable.InformationSchemaCollationCharacterSetApplicability,
+	populate: func(ctx context.Context, p *planner, dbContext *dbdesc.Immutable, addRow func(...tree.Datum) error) error {
+		dbNameStr := tree.NewDString(p.CurrentDatabase())
+		add := func(collName string) error {
+			return addRow(
+				dbNameStr,                 // collation_catalog
+				pgCatalogNameDString,      // collation_schema
+				tree.NewDString(collName), // collation_name
+				tree.DNull,                // character_set_catalog
+				tree.DNull,                // character_set_schema
+				tree.NewDString("UTF8"),   // character_set_name: UTF8 is the only available encoding
+			)
+		}
+		if err := add(tree.DefaultCollationTag); err != nil {
+			return err
+		}
+		for _, tag := range collate.Supported() {
+			collName := tag.String()
+			if err := add(collName); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+}
+
+var informationSchemaSessionVariables = virtualSchemaTable{
+	comment: `exposes the session variables.`,
+	schema:  vtable.InformationSchemaSessionVariables,
+	populate: func(ctx context.Context, p *planner, _ *dbdesc.Immutable, addRow func(...tree.Datum) error) error {
+		for _, vName := range varNames {
+			gen := varGen[vName]
+			value := gen.Get(&p.extendedEvalCtx)
+			if err := addRow(
+				tree.NewDString(vName),
+				tree.NewDString(value),
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+}
+
 // forEachSchema iterates over the physical and virtual schemas.
 func forEachSchema(
 	ctx context.Context, p *planner, db *dbdesc.Immutable, fn func(sc catalog.ResolvedSchema) error,
 ) error {
-	schemaNames, err := getSchemaNames(ctx, p, db, false /* allowMissingDesc */)
+	schemaNames, err := getSchemaNames(ctx, p, db)
 	if err != nil {
 		return err
 	}
@@ -1686,9 +1831,7 @@ func forEachDatabaseDesc(
 ) error {
 	var dbDescs []*dbdesc.Immutable
 	if dbContext == nil {
-		allDbDescs, err := p.Descriptors().GetAllDatabaseDescriptors(
-			ctx, p.txn, false, /* allowMissingDesc */
-		)
+		allDbDescs, err := p.Descriptors().GetAllDatabaseDescriptors(ctx, p.txn)
 		if err != nil {
 			return err
 		}
@@ -1697,7 +1840,7 @@ func forEachDatabaseDesc(
 		// We can't just use dbContext here because we need to fetch the descriptor
 		// with privileges from kv.
 		fetchedDbDesc, err := catalogkv.GetDatabaseDescriptorsFromIDs(
-			ctx, p.txn, p.ExecCfg().Codec, []descpb.ID{dbContext.GetID()}, false, /* allowMissingDesc */
+			ctx, p.txn, p.ExecCfg().Codec, []descpb.ID{dbContext.GetID()},
 		)
 		if err != nil {
 			if errors.Is(err, catalog.ErrDescriptorNotFound) {
@@ -1729,11 +1872,11 @@ func forEachTypeDesc(
 	dbContext *dbdesc.Immutable,
 	fn func(db *dbdesc.Immutable, sc string, typ *typedesc.Immutable) error,
 ) error {
-	descs, err := p.Descriptors().GetAllDescriptors(ctx, p.txn, true /* validate */)
+	descs, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
 	if err != nil {
 		return err
 	}
-	schemaNames, err := getSchemaNames(ctx, p, dbContext, false /* allowMissingDesc */)
+	schemaNames, err := getSchemaNames(ctx, p, dbContext)
 	if err != nil {
 		return err
 	}
@@ -1808,16 +1951,14 @@ func forEachTableDescAll(
 	virtualOpts virtualOpts,
 	fn func(*dbdesc.Immutable, string, catalog.TableDescriptor) error,
 ) error {
-	return forEachTableDescAllWithTableLookup(ctx,
-		p, dbContext, virtualOpts, true, /* validate */
-		func(
-			db *dbdesc.Immutable,
-			scName string,
-			table catalog.TableDescriptor,
-			_ tableLookupFn,
-		) error {
-			return fn(db, scName, table)
-		})
+	return forEachTableDescAllWithTableLookup(ctx, p, dbContext, virtualOpts, func(
+		db *dbdesc.Immutable,
+		scName string,
+		table catalog.TableDescriptor,
+		_ tableLookupFn,
+	) error {
+		return fn(db, scName, table)
+	})
 }
 
 // forEachTableDescAllWithTableLookup is like forEachTableDescAll, but it also
@@ -1829,11 +1970,11 @@ func forEachTableDescAllWithTableLookup(
 	p *planner,
 	dbContext *dbdesc.Immutable,
 	virtualOpts virtualOpts,
-	validate bool,
 	fn func(*dbdesc.Immutable, string, catalog.TableDescriptor, tableLookupFn) error,
 ) error {
-	return forEachTableDescWithTableLookupInternal(ctx,
-		p, dbContext, virtualOpts, true /* allowAdding */, validate, fn)
+	return forEachTableDescWithTableLookupInternal(
+		ctx, p, dbContext, virtualOpts, true /* allowAdding */, fn,
+	)
 }
 
 // forEachTableDescWithTableLookup acts like forEachTableDesc, except it also provides a
@@ -1853,26 +1994,23 @@ func forEachTableDescWithTableLookup(
 	fn func(*dbdesc.Immutable, string, catalog.TableDescriptor, tableLookupFn) error,
 ) error {
 	return forEachTableDescWithTableLookupInternal(
-		ctx, p, dbContext, virtualOpts, false /* allowAdding */, true, fn,
+		ctx, p, dbContext, virtualOpts, false /* allowAdding */, fn,
 	)
 }
 
 func getSchemaNames(
-	ctx context.Context, p *planner, dbContext *dbdesc.Immutable, allowMissingDesc bool,
+	ctx context.Context, p *planner, dbContext *dbdesc.Immutable,
 ) (map[descpb.ID]string, error) {
 	if dbContext != nil {
 		return p.Descriptors().GetSchemasForDatabase(ctx, p.txn, dbContext.GetID())
 	}
 	ret := make(map[descpb.ID]string)
-	dbs, err := p.Descriptors().GetAllDatabaseDescriptors(ctx, p.txn, allowMissingDesc)
+	dbs, err := p.Descriptors().GetAllDatabaseDescriptors(ctx, p.txn)
 	if err != nil {
 		return nil, err
 	}
 	for _, db := range dbs {
 		if db == nil {
-			if allowMissingDesc {
-				continue
-			}
 			return nil, catalog.ErrDescriptorNotFound
 		}
 		schemas, err := p.Descriptors().GetSchemasForDatabase(ctx, p.txn, db.GetID())
@@ -1899,13 +2037,25 @@ func forEachTableDescWithTableLookupInternal(
 	dbContext *dbdesc.Immutable,
 	virtualOpts virtualOpts,
 	allowAdding bool,
-	validate bool,
 	fn func(*dbdesc.Immutable, string, catalog.TableDescriptor, tableLookupFn) error,
 ) error {
-	descs, err := p.Descriptors().GetAllDescriptors(ctx, p.txn, validate)
+	descs, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
 	if err != nil {
 		return err
 	}
+	return forEachTableDescWithTableLookupInternalFromDescriptors(
+		ctx, p, dbContext, virtualOpts, allowAdding, descs, fn)
+}
+
+func forEachTableDescWithTableLookupInternalFromDescriptors(
+	ctx context.Context,
+	p *planner,
+	dbContext *dbdesc.Immutable,
+	virtualOpts virtualOpts,
+	allowAdding bool,
+	descs []catalog.Descriptor,
+	fn func(*dbdesc.Immutable, string, catalog.TableDescriptor, tableLookupFn) error,
+) error {
 	lCtx := newInternalLookupCtx(ctx, descs, dbContext,
 		catalogkv.NewOneLevelUncachedDescGetter(p.txn, p.execCfg.Codec))
 
@@ -1942,12 +2092,6 @@ func forEachTableDescWithTableLookupInternal(
 		}
 	}
 
-	// Generate all schema names, and keep a mapping.
-	schemaNames, err := getSchemaNames(ctx, p, dbContext, !validate)
-	if err != nil {
-		return err
-	}
-
 	// Physical descriptors next.
 	for _, tbID := range lCtx.tbIDs {
 		table := lCtx.tbDescs[tbID]
@@ -1958,9 +2102,30 @@ func forEachTableDescWithTableLookupInternal(
 		dbDesc, parentExists := lCtx.dbDescs[table.GetParentID()]
 		if parentExists {
 			var ok bool
-			scName, ok = schemaNames[table.GetParentSchemaID()]
-			if !ok && validate {
+			scName, ok = lCtx.schemaNames[table.GetParentSchemaID()]
+			// Look up the schemas for this database if we discover that there is a
+			// missing temporary schema name. The only schemas which do not have
+			// descriptors are the public schema and temporary schemas. The public
+			// schema does not have a descriptor but will appear in the map. Temporary
+			// schemas do, however, have namespace entries. The below code will go
+			// and lookup schema names from the namespace table if needed to qualify
+			// the name of a temporary table.
+			if !ok && !table.IsTemporary() {
 				return errors.AssertionFailedf("schema id %d not found", table.GetParentSchemaID())
+			}
+			if !ok { // && table.IsTemporary()
+				namesForSchema, err := getSchemaNames(ctx, p, dbDesc)
+				if err != nil {
+					return errors.Wrapf(err, "failed to look up schema id %d",
+						table.GetParentSchemaID())
+				}
+				for id, n := range namesForSchema {
+					if _, exists := lCtx.schemaNames[id]; exists {
+						continue
+					}
+					lCtx.schemaNames[id] = n
+					scName = lCtx.schemaNames[table.GetParentSchemaID()]
+				}
 			}
 		}
 		if err := fn(dbDesc, scName, table, lCtx); err != nil {

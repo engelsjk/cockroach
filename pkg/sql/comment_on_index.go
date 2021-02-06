@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type commentOnIndexNode struct {
@@ -32,7 +33,8 @@ type commentOnIndexNode struct {
 // Privileges: CREATE on table.
 func (p *planner) CommentOnIndex(ctx context.Context, n *tree.CommentOnIndex) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"COMMENT ON INDEX",
 	); err != nil {
 		return nil, err
@@ -63,25 +65,24 @@ func (n *commentOnIndexNode) startExec(params runParams) error {
 		}
 	}
 
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogCommentOnIndex,
-		int32(n.tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			TableName string
-			IndexName string
-			Statement string
-			User      string
-			Comment   *string
-		}{
-			n.tableDesc.Name,
-			string(n.n.Index.Index),
-			n.n.String(),
-			params.p.User().Normalized(),
-			n.n.Comment},
-	)
+	comment := ""
+	if n.n.Comment != nil {
+		comment = *n.n.Comment
+	}
+
+	tn, err := params.p.getQualifiedTableName(params.ctx, n.tableDesc)
+	if err != nil {
+		return err
+	}
+
+	return params.p.logEvent(params.ctx,
+		n.tableDesc.ID,
+		&eventpb.CommentOnIndex{
+			TableName:   tn.FQString(),
+			IndexName:   string(n.n.Index.Index),
+			Comment:     comment,
+			NullComment: n.n.Comment == nil,
+		})
 }
 
 func (p *planner) upsertIndexComment(

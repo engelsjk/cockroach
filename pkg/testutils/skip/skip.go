@@ -11,6 +11,7 @@
 package skip
 
 import (
+	"flag"
 	"fmt"
 	"testing"
 
@@ -94,7 +95,18 @@ func UnderStressRace(t SkippableTest, args ...interface{}) {
 // run with the metamorphic build tag.
 func UnderMetamorphic(t SkippableTest, args ...interface{}) {
 	t.Helper()
-	if util.MetamorphicBuild {
+	if util.IsMetamorphicBuild() {
 		t.Skip(append([]interface{}{"disabled under metamorphic"}, args...))
 	}
+}
+
+// UnderBench returns true iff a test is currently running under `go
+// test -bench`.  When true, tests should avoid writing data on
+// stdout/stderr from goroutines that run asynchronously with the
+// test.
+func UnderBench() bool {
+	// We use here the understanding that `go test -bench` runs the
+	// test executable with `-test.bench 1`.
+	f := flag.Lookup("test.bench")
+	return f != nil && f.Value.String() != ""
 }

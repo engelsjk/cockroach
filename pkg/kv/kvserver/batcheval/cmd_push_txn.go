@@ -30,14 +30,11 @@ func init() {
 }
 
 func declareKeysPushTransaction(
-	_ *roachpb.RangeDescriptor,
-	header roachpb.Header,
-	req roachpb.Request,
-	latchSpans, _ *spanset.SpanSet,
+	rs ImmutableRangeState, _ roachpb.Header, req roachpb.Request, latchSpans, _ *spanset.SpanSet,
 ) {
 	pr := req.(*roachpb.PushTxnRequest)
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.TransactionKey(pr.PusheeTxn.Key, pr.PusheeTxn.ID)})
-	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.AbortSpanKey(header.RangeID, pr.PusheeTxn.ID)})
+	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.AbortSpanKey(rs.GetRangeID(), pr.PusheeTxn.ID)})
 }
 
 // PushTxn resolves conflicts between concurrent txns (or between
@@ -127,6 +124,8 @@ func PushTxn(
 		return result.Result{}, errors.Errorf("request timestamp %s less than pushee txn timestamp %s", h.Timestamp, args.PusheeTxn.WriteTimestamp)
 	}
 	now := cArgs.EvalCtx.Clock().Now()
+	// TODO(nvanbenschoten): remove this limitation. But when doing so,
+	// keep the h.Timestamp.Less(args.PushTo) check above.
 	if now.Less(h.Timestamp) {
 		// The batch's timestamp should have been used to update the clock.
 		return result.Result{}, errors.Errorf("request timestamp %s less than current clock time %s", h.Timestamp, now)

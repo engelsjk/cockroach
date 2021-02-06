@@ -21,8 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -34,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations/leasemanager"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -42,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -549,7 +545,7 @@ func TestCreateSystemTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	table := tabledesc.NewExistingMutable(systemschema.NamespaceTable.TableDescriptor)
+	table := tabledesc.NewExistingMutable(*systemschema.NamespaceTable.TableDesc())
 	table.ID = keys.MaxReservedDescID
 
 	prevPrivileges, ok := descpb.SystemAllowedPrivileges[table.ID]
@@ -803,16 +799,16 @@ func TestMigrateNamespaceTableDescriptors(t *testing.T) {
 			ts, err := txn.GetProtoTs(ctx, key, desc)
 			require.NoError(t, err)
 			table := descpb.TableFromDescriptor(desc, ts)
-			table.CreateAsOfTime = systemschema.NamespaceTable.CreateAsOfTime
-			table.ModificationTime = systemschema.NamespaceTable.ModificationTime
+			table.CreateAsOfTime = systemschema.NamespaceTable.GetCreateAsOfTime()
+			table.ModificationTime = systemschema.NamespaceTable.GetModificationTime()
 			require.True(t, table.Equal(systemschema.NamespaceTable.TableDesc()))
 		}
 		{
 			ts, err := txn.GetProtoTs(ctx, deprecatedKey, desc)
 			require.NoError(t, err)
 			table := descpb.TableFromDescriptor(desc, ts)
-			table.CreateAsOfTime = systemschema.DeprecatedNamespaceTable.CreateAsOfTime
-			table.ModificationTime = systemschema.DeprecatedNamespaceTable.ModificationTime
+			table.CreateAsOfTime = systemschema.DeprecatedNamespaceTable.GetCreateAsOfTime()
+			table.ModificationTime = systemschema.DeprecatedNamespaceTable.GetModificationTime()
 			require.True(t, table.Equal(systemschema.DeprecatedNamespaceTable.TableDesc()))
 		}
 		return nil
@@ -844,7 +840,7 @@ CREATE TABLE system.jobs (
 		keys.SystemDatabaseID,
 		keys.JobsTableID,
 		oldJobsTableSchema,
-		systemschema.JobsTable.Privileges,
+		systemschema.JobsTable.GetPrivileges(),
 	)
 	require.NoError(t, err)
 
@@ -884,14 +880,14 @@ CREATE TABLE system.jobs (
 
 	newJobsTable := catalogkv.TestingGetTableDescriptor(
 		mt.kvDB, keys.SystemSQLCodec, "system", "jobs")
-	require.Equal(t, 7, len(newJobsTable.Columns))
-	require.Equal(t, "created_by_type", newJobsTable.Columns[5].Name)
-	require.Equal(t, "created_by_id", newJobsTable.Columns[6].Name)
-	require.Equal(t, 2, len(newJobsTable.Families))
+	require.Equal(t, 7, len(newJobsTable.PublicColumns()))
+	require.Equal(t, "created_by_type", newJobsTable.PublicColumns()[5].GetName())
+	require.Equal(t, "created_by_id", newJobsTable.PublicColumns()[6].GetName())
+	require.Equal(t, 2, len(newJobsTable.GetFamilies()))
 	// Ensure we keep old family name.
-	require.Equal(t, primaryFamilyName, newJobsTable.Families[0].Name)
+	require.Equal(t, primaryFamilyName, newJobsTable.GetFamilies()[0].Name)
 	// Make sure our primary family has new columns added to it.
-	require.Equal(t, newPrimaryFamilyColumns, newJobsTable.Families[0].ColumnNames)
+	require.Equal(t, newPrimaryFamilyColumns, newJobsTable.GetFamilies()[0].ColumnNames)
 
 	// Run the migration again -- it should be a no-op.
 	require.NoError(t, mt.runMigration(ctx, migration))
@@ -929,7 +925,7 @@ func TestVersionAlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable
 		keys.SystemDatabaseID,
 		keys.JobsTableID,
 		oldJobsTableSchema,
-		systemschema.JobsTable.Privileges,
+		systemschema.JobsTable.GetPrivileges(),
 	)
 	require.NoError(t, err)
 
@@ -966,98 +962,19 @@ func TestVersionAlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable
 
 	newJobsTable := catalogkv.TestingGetTableDescriptor(
 		mt.kvDB, keys.SystemSQLCodec, "system", "jobs")
-	require.Equal(t, 9, len(newJobsTable.Columns))
-	require.Equal(t, "claim_session_id", newJobsTable.Columns[7].Name)
-	require.Equal(t, "claim_instance_id", newJobsTable.Columns[8].Name)
-	require.Equal(t, 3, len(newJobsTable.Families))
+	require.Equal(t, 9, len(newJobsTable.PublicColumns()))
+	require.Equal(t, "claim_session_id", newJobsTable.PublicColumns()[7].GetName())
+	require.Equal(t, "claim_instance_id", newJobsTable.PublicColumns()[8].GetName())
+	require.Equal(t, 3, len(newJobsTable.GetFamilies()))
 	// Ensure we keep old family names.
-	require.Equal(t, "fam_0_id_status_created_payload", newJobsTable.Families[0].Name)
-	require.Equal(t, "progress", newJobsTable.Families[1].Name)
+	require.Equal(t, "fam_0_id_status_created_payload", newJobsTable.GetFamilies()[0].Name)
+	require.Equal(t, "progress", newJobsTable.GetFamilies()[1].Name)
 	// ... and that the new one is here.
-	require.Equal(t, "claim", newJobsTable.Families[2].Name)
+	require.Equal(t, "claim", newJobsTable.GetFamilies()[2].Name)
 
 	// Run the migration again -- it should be a no-op.
 	require.NoError(t, mt.runMigration(ctx, migration))
 	newJobsTableAgain := catalogkv.TestingGetTableDescriptor(
 		mt.kvDB, keys.SystemSQLCodec, "system", "jobs")
 	require.Equal(t, newJobsTable, newJobsTableAgain)
-}
-
-func TestMarkDeprecatedSchemaChangeJobsFailed(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-
-	mt := makeMigrationTest(ctx, t)
-	defer mt.close(ctx)
-
-	migration := mt.pop(t, "mark non-terminal schema change jobs with a pre-20.1 format version as failed")
-	mt.start(t, base.TestServerArgs{})
-
-	// Write some fake job records for schema changes with a pre-20.1 format
-	// version. Due to their format version, they will never be adopted. We just
-	// verify that the migration marks them as failed if in a non-terminal state,
-	// and otherwise leaves them alone.
-
-	payload := jobspb.Payload{
-		Details: jobspb.WrapPayloadDetails(jobspb.SchemaChangeDetails{
-			FormatVersion: jobspb.BaseFormatVersion,
-		}),
-	}
-	payloadBytes, err := protoutil.Marshal(&payload)
-	require.NoError(t, err)
-
-	testCases := []struct {
-		initialState        jobs.Status
-		expectedFinalStatus jobs.Status
-		expectedErrorPrefix string
-		jobID               int64
-	}{
-		{
-			initialState:        jobs.StatusRunning,
-			expectedFinalStatus: jobs.StatusFailed,
-			expectedErrorPrefix: "schema change jobs started prior to v20.1",
-			jobID:               int64(builtins.GenerateUniqueInt(base.SQLInstanceID(mt.server.NodeID()))),
-		},
-		{
-			initialState:        jobs.StatusReverting,
-			expectedFinalStatus: jobs.StatusFailed,
-			expectedErrorPrefix: "schema change jobs started prior to v20.1",
-			jobID:               int64(builtins.GenerateUniqueInt(base.SQLInstanceID(mt.server.NodeID()))),
-		},
-		{
-			initialState:        jobs.StatusSucceeded,
-			expectedFinalStatus: jobs.StatusSucceeded,
-			jobID:               int64(builtins.GenerateUniqueInt(base.SQLInstanceID(mt.server.NodeID()))),
-		},
-		{
-			initialState:        jobs.StatusCanceled,
-			expectedFinalStatus: jobs.StatusCanceled,
-			jobID:               int64(builtins.GenerateUniqueInt(base.SQLInstanceID(mt.server.NodeID()))),
-		},
-	}
-
-	insertStmt := `INSERT INTO system.jobs (id, status, payload) VALUES ($1, $2, $3)`
-	for _, testCase := range testCases {
-		mt.sqlDB.Exec(t, insertStmt, testCase.jobID, testCase.initialState, payloadBytes)
-	}
-
-	require.NoError(t, mt.runMigration(ctx, migration))
-
-	query := `SELECT status, payload FROM system.jobs WHERE id = $1`
-	for _, testCase := range testCases {
-		var status string
-		var payloadBytes []byte
-		row := mt.sqlDB.QueryRow(t, query, testCase.jobID)
-		row.Scan(&status, &payloadBytes)
-
-		require.Equal(t, status, string(testCase.expectedFinalStatus))
-
-		var payload jobspb.Payload
-		require.NoError(t, protoutil.Unmarshal(payloadBytes, &payload))
-		if testCase.expectedErrorPrefix != "" {
-			require.Regexp(t, testCase.expectedErrorPrefix, payload.Error)
-		} else {
-			require.Empty(t, payload.Error)
-		}
-	}
 }

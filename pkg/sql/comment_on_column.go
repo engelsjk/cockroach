@@ -15,22 +15,24 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type commentOnColumnNode struct {
 	n         *tree.CommentOnColumn
-	tableDesc *tabledesc.Immutable
+	tableDesc catalog.TableDescriptor
 }
 
 // CommentOnColumn add comment on a column.
 // Privileges: CREATE on table.
 func (p *planner) CommentOnColumn(ctx context.Context, n *tree.CommentOnColumn) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"COMMENT ON COLUMN",
 	); err != nil {
 		return nil, err
@@ -53,7 +55,7 @@ func (p *planner) CommentOnColumn(ctx context.Context, n *tree.CommentOnColumn) 
 }
 
 func (n *commentOnColumnNode) startExec(params runParams) error {
-	col, _, err := n.tableDesc.FindColumnByName(n.n.ColumnItem.ColumnName)
+	col, err := n.tableDesc.FindColumnWithName(n.n.ColumnItem.ColumnName)
 	if err != nil {
 		return err
 	}
@@ -66,8 +68,8 @@ func (n *commentOnColumnNode) startExec(params runParams) error {
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			"UPSERT INTO system.comments VALUES ($1, $2, $3, $4)",
 			keys.ColumnCommentType,
-			n.tableDesc.ID,
-			col.ID,
+			n.tableDesc.GetID(),
+			col.GetID(),
 			*n.n.Comment)
 		if err != nil {
 			return err
@@ -80,32 +82,31 @@ func (n *commentOnColumnNode) startExec(params runParams) error {
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3",
 			keys.ColumnCommentType,
-			n.tableDesc.ID,
-			col.ID)
+			n.tableDesc.GetID(),
+			col.GetID())
 		if err != nil {
 			return err
 		}
 	}
 
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogCommentOnColumn,
-		int32(n.tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			TableName  string
-			ColumnName string
-			Statement  string
-			User       string
-			Comment    *string
-		}{
-			n.tableDesc.Name,
-			string(n.n.ColumnItem.ColumnName),
-			n.n.String(),
-			params.p.User().Normalized(),
-			n.n.Comment},
-	)
+	comment := ""
+	if n.n.Comment != nil {
+		comment = *n.n.Comment
+	}
+
+	tn, err := params.p.getQualifiedTableName(params.ctx, n.tableDesc)
+	if err != nil {
+		return err
+	}
+
+	return params.p.logEvent(params.ctx,
+		n.tableDesc.GetID(),
+		&eventpb.CommentOnColumn{
+			TableName:   tn.FQString(),
+			ColumnName:  string(n.n.ColumnItem.ColumnName),
+			Comment:     comment,
+			NullComment: n.n.Comment == nil,
+		})
 }
 
 func (n *commentOnColumnNode) Next(runParams) (bool, error) { return false, nil }

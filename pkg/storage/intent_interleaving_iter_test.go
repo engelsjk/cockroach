@@ -39,6 +39,15 @@ func scanRoachKey(t *testing.T, td *datadriven.TestData, field string) roachpb.K
 	rk := roachpb.Key(k)
 	if strings.HasPrefix(k, "L") {
 		rk = append(keys.LocalRangePrefix, rk[1:]...)
+	} else if strings.HasPrefix(k, "S") {
+		rk = append(keys.LocalStorePrefix, rk[1:]...)
+	} else if strings.HasPrefix(k, "Y") {
+		rk = append(keys.LocalRangeLockTablePrefix.PrefixEnd(), rk[1:]...)
+	} else if strings.HasPrefix(k, "Z") {
+		if len(rk) != 1 {
+			panic("Z represents LocalMax and should not have more than one character")
+		}
+		rk = keys.LocalMax
 	}
 	return bytes.ReplaceAll(rk, []byte("\\0"), []byte{0})
 }
@@ -46,6 +55,12 @@ func scanRoachKey(t *testing.T, td *datadriven.TestData, field string) roachpb.K
 func makePrintableKey(k MVCCKey) MVCCKey {
 	if bytes.HasPrefix(k.Key, keys.LocalRangePrefix) {
 		k.Key = append([]byte("L"), k.Key[len(keys.LocalRangePrefix):]...)
+	} else if bytes.HasPrefix(k.Key, keys.LocalStorePrefix) {
+		k.Key = append([]byte("S"), k.Key[len(keys.LocalStorePrefix):]...)
+	} else if bytes.HasPrefix(k.Key, keys.LocalRangeLockTablePrefix.PrefixEnd()) {
+		k.Key = append([]byte("Y"), k.Key[len(keys.LocalRangeLockTablePrefix):]...)
+	} else if bytes.Equal(k.Key, keys.LocalMax) {
+		k.Key = []byte("Z")
 	}
 	k.Key = bytes.ReplaceAll(k.Key, []byte{0}, []byte("\\0"))
 	return k
@@ -54,9 +69,13 @@ func makePrintableKey(k MVCCKey) MVCCKey {
 func scanSeekKey(t *testing.T, td *datadriven.TestData) MVCCKey {
 	key := MVCCKey{Key: scanRoachKey(t, td, "k")}
 	if td.HasArg("ts") {
-		var ts int
-		td.ScanArgs(t, "ts", &ts)
-		key.Timestamp.WallTime = int64(ts)
+		var tsS string
+		td.ScanArgs(t, "ts", &tsS)
+		ts, err := hlc.ParseTimestamp(tsS)
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		key.Timestamp = ts
 	}
 	return key
 }
@@ -139,13 +158,13 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 			if uuid.Hi != 0 {
 				hiStr = fmt.Sprintf("%d,", uuid.Hi)
 			}
-			fmt.Fprintf(b, "output: meta k=%s ts=%d txn=%s%d\n",
-				string(k1.Key), meta.Timestamp.WallTime, hiStr, uuid.Lo)
+			fmt.Fprintf(b, "output: meta k=%s ts=%s txn=%s%d\n",
+				string(k1.Key), meta.Timestamp, hiStr, uuid.Lo)
 		}
 		return
 	}
-	fmt.Fprintf(b, "output: value k=%s ts=%d v=%s\n",
-		string(k1.Key), k1.Timestamp.WallTime, string(v1))
+	fmt.Fprintf(b, "output: value k=%s ts=%s v=%s\n",
+		string(k1.Key), k1.Timestamp, string(v1))
 }
 
 // TestIntentInterleavingIter is a datadriven test consisting of two commands:
@@ -162,7 +181,12 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 //   followed by newline separated sequence of operations:
 //     next, prev, seek-lt, seek-ge, set-upper, next-key
 //
-// A key starting with L is interpreted as a local-range key.
+// Keys are interpreted as:
+// - starting with L is interpreted as a local-range key.
+// - starting with S is interpreted as a store local key.
+// - starting with Y is interpreted as a local key starting immediately after
+//   the lock table key space. This is for testing edge cases wrt bounds.
+// - a single Z is interpreted as LocalMax
 func TestIntentInterleavingIter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -223,9 +247,14 @@ func TestIntentInterleavingIter(t *testing.T) {
 						var meta enginepb.MVCCMetadata
 						var txnUUID uuid.UUID
 						if locksSection || d.HasArg("ts") {
-							var ts, txn int
-							d.ScanArgs(t, "ts", &ts)
-							meta.Timestamp.WallTime = int64(ts)
+							var tsS string
+							d.ScanArgs(t, "ts", &tsS)
+							ts, err := hlc.ParseTimestamp(tsS)
+							if err != nil {
+								t.Fatalf("%v", err)
+							}
+							meta.Timestamp = ts.ToLegacyTimestamp()
+							var txn int
 							d.ScanArgs(t, "txn", &txn)
 							txnUUID = uuid.FromUint128(uint128.FromInts(0, uint64(txn)))
 							meta.Txn = &enginepb.TxnMeta{ID: txnUUID}
@@ -252,11 +281,15 @@ func TestIntentInterleavingIter(t *testing.T) {
 							t.Fatalf("%s: value in locks section", d.Pos)
 						}
 						key := scanRoachKey(t, d, "k")
-						var ts int
-						d.ScanArgs(t, "ts", &ts)
+						var tsS string
+						d.ScanArgs(t, "ts", &tsS)
+						ts, err := hlc.ParseTimestamp(tsS)
+						if err != nil {
+							t.Fatalf("%v", err)
+						}
 						var value string
 						d.ScanArgs(t, "v", &value)
-						mvccKey := MVCCKey{Key: key, Timestamp: hlc.Timestamp{WallTime: int64(ts)}}
+						mvccKey := MVCCKey{Key: key, Timestamp: ts}
 						if err := batch.PutMVCC(mvccKey, []byte(value)); err != nil {
 							return err.Error()
 						}
@@ -335,6 +368,86 @@ func TestIntentInterleavingIter(t *testing.T) {
 			}
 		})
 	})
+}
+
+func TestIntentInterleavingIterBoundaries(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	eng := createTestPebbleEngine()
+	defer eng.Close()
+	// Boundary cases for constrainedToLocal.
+	func() {
+		opts := IterOptions{LowerBound: keys.MinKey}
+		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		require.Equal(t, constrainedToLocal, iter.constraint)
+		iter.SetUpperBound(keys.LocalMax)
+		require.Equal(t, constrainedToLocal, iter.constraint)
+		iter.SeekLT(MVCCKey{Key: keys.LocalMax})
+		iter.Close()
+	}()
+	func() {
+		opts := IterOptions{UpperBound: keys.LocalMax}
+		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		require.Equal(t, constrainedToLocal, iter.constraint)
+		iter.SetUpperBound(keys.LocalMax)
+		require.Equal(t, constrainedToLocal, iter.constraint)
+		iter.Close()
+	}()
+	require.Panics(t, func() {
+		opts := IterOptions{UpperBound: keys.LocalMax}
+		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		iter.SeekLT(MVCCKey{Key: keys.MaxKey})
+	})
+	// Boundary cases for constrainedToGlobal
+	func() {
+		opts := IterOptions{LowerBound: keys.LocalMax}
+		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		require.Equal(t, constrainedToGlobal, iter.constraint)
+		iter.Close()
+	}()
+	require.Panics(t, func() {
+		opts := IterOptions{LowerBound: keys.LocalMax}
+		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		require.Equal(t, constrainedToGlobal, iter.constraint)
+		iter.SetUpperBound(keys.LocalMax)
+		iter.Close()
+	})
+	require.Panics(t, func() {
+		opts := IterOptions{LowerBound: keys.LocalMax}
+		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		require.Equal(t, constrainedToGlobal, iter.constraint)
+		iter.SeekLT(MVCCKey{Key: keys.LocalMax})
+		iter.Close()
+	})
+	// Panics for using a local key that is above the lock table.
+	require.Panics(t, func() {
+		opts := IterOptions{UpperBound: keys.LocalMax}
+		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		require.Equal(t, constrainedToLocal, iter.constraint)
+		iter.SeekLT(MVCCKey{Key: keys.LocalRangeLockTablePrefix.PrefixEnd()})
+		iter.Close()
+	})
+	require.Panics(t, func() {
+		opts := IterOptions{UpperBound: keys.LocalMax}
+		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		require.Equal(t, constrainedToLocal, iter.constraint)
+		iter.SeekGE(MVCCKey{Key: keys.LocalRangeLockTablePrefix.PrefixEnd()})
+		iter.Close()
+	})
+	// Prefix iteration does not affect the constraint if bounds are
+	// specified.
+	func() {
+		opts := IterOptions{Prefix: true, LowerBound: keys.LocalMax}
+		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		require.Equal(t, constrainedToGlobal, iter.constraint)
+		iter.Close()
+	}()
+	// Prefix iteration with no bounds.
+	func() {
+		iter := newIntentInterleavingIterator(eng, IterOptions{Prefix: true}).(*intentInterleavingIter)
+		require.Equal(t, notConstrained, iter.constraint)
+		iter.Close()
+	}()
 }
 
 type lockKeyValue struct {
@@ -442,7 +555,7 @@ func generateIterOps(rng *rand.Rand, mvcckv []MVCCKeyValue) []string {
 			fwdDirection = false
 		}
 		if useTimestamp {
-			op = fmt.Sprintf("%s k=%s ts=%d", op, string(seekKey.Key), seekKey.Timestamp.WallTime)
+			op = fmt.Sprintf("%s k=%s ts=%s", op, string(seekKey.Key), seekKey.Timestamp)
 		} else {
 			op = fmt.Sprintf("%s k=%s", op, string(seekKey.Key))
 		}
@@ -522,6 +635,7 @@ func doOps(t *testing.T, ops []string, eng Engine, interleave bool, out *strings
 
 var seedFlag = flag.Int64("seed", -1, "specify seed to use for random number generator")
 
+// TODO(sumeer): generate a mix of local and global keys.
 func TestRandomizedIntentInterleavingIter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 

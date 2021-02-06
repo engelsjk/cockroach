@@ -9,11 +9,12 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/fmtsafe",
     visibility = ["//visibility:public"],
     deps = [
-        "//vendor/github.com/cockroachdb/errors",
-        "//vendor/golang.org/x/tools/go/analysis",
-        "//vendor/golang.org/x/tools/go/analysis/passes/inspect",
-        "//vendor/golang.org/x/tools/go/ast/inspector",
-        "//vendor/golang.org/x/tools/go/types/typeutil",
+        "//pkg/util/log/logpb",
+        "@com_github_cockroachdb_errors//:errors",
+        "@org_golang_x_tools//go/analysis",
+        "@org_golang_x_tools//go/analysis/passes/inspect",
+        "@org_golang_x_tools//go/ast/inspector",
+        "@org_golang_x_tools//go/types/typeutil",
     ],
 )
 
@@ -23,6 +24,6 @@ go_test(
     deps = [
         ":fmtsafe",
         "//pkg/testutils/skip",
-        "//vendor/golang.org/x/tools/go/analysis/analysistest",
+        "@org_golang_x_tools//go/analysis/analysistest",
     ],
 )

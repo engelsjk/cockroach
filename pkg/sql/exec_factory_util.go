@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -101,44 +102,21 @@ func makeScanColumnsConfig(table cat.Table, cols exec.TableColumnOrdinalSet) sca
 		col := table.Column(ord)
 		colOrd := ord
 		if col.Kind() == cat.VirtualInverted {
+			typ := col.DatumType()
 			colOrd = col.InvertedSourceColumnOrdinal()
 			col = table.Column(colOrd)
+			colCfg.virtualColumn = &struct {
+				colID tree.ColumnID
+				typ   *types.T
+			}{
+				colID: tree.ColumnID(col.ColID()),
+				typ:   typ,
+			}
 		}
 		colCfg.wantedColumns = append(colCfg.wantedColumns, tree.ColumnID(col.ColID()))
 		colCfg.wantedColumnsOrdinals = append(colCfg.wantedColumnsOrdinals, uint32(colOrd))
 	}
 	return colCfg
-}
-
-func constructExplainDistSQLOrVecNode(
-	options *tree.ExplainOptions,
-	analyze bool,
-	stmtType tree.StatementType,
-	p *planComponents,
-	planner *planner,
-) (exec.Node, error) {
-	if options.Flags[tree.ExplainFlagEnv] {
-		return nil, errors.New("ENV only supported with (OPT) option")
-	}
-
-	switch options.Mode {
-	case tree.ExplainDistSQL:
-		return &explainDistSQLNode{
-			options:  options,
-			plan:     *p,
-			analyze:  analyze,
-			stmtType: stmtType,
-		}, nil
-
-	case tree.ExplainVec:
-		return &explainVecNode{
-			options: options,
-			plan:    *p,
-		}, nil
-
-	default:
-		panic(errors.AssertionFailedf("unsupported explain mode %v", options.Mode))
-	}
 }
 
 // getResultColumnsForSimpleProject populates result columns for a simple
@@ -314,4 +292,12 @@ func constructOpaque(metadata opt.OpaqueMetadata) (planNode, error) {
 		return nil, errors.AssertionFailedf("unexpected OpaqueMetadata object type %T", metadata)
 	}
 	return o.plan, nil
+}
+
+func convertFastIntSetToUint32Slice(colIdxs util.FastIntSet) []uint32 {
+	cols := make([]uint32, 0, colIdxs.Len())
+	for i, ok := colIdxs.Next(0); ok; i, ok = colIdxs.Next(i + 1) {
+		cols = append(cols, uint32(i))
+	}
+	return cols
 }

@@ -14,7 +14,6 @@ import (
 	"context"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -29,16 +28,15 @@ import (
 )
 
 func (p *planner) AlterPrimaryKey(
-	ctx context.Context, tableDesc *tabledesc.Mutable, alterPKNode *tree.AlterTableAlterPrimaryKey,
+	ctx context.Context,
+	tableDesc *tabledesc.Mutable,
+	alterPKNode *tree.AlterTableAlterPrimaryKey,
+	localityConfigSwap *descpb.PrimaryKeySwap_LocalityConfigSwap,
 ) error {
 	if alterPKNode.Interleave != nil {
-		p.BufferClientNotice(
-			ctx,
-			errors.WithIssueLink(
-				pgnotice.Newf("interleaved tables and indexes are deprecated in 20.2 and will be removed in 21.2"),
-				errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
-			),
-		)
+		if err := interleavedTableDeprecationAction(p.RunParams(ctx)); err != nil {
+			return err
+		}
 	}
 
 	if alterPKNode.Sharded != nil {
@@ -57,9 +55,16 @@ func (p *planner) AlterPrimaryKey(
 	for i := range tableDesc.Mutations {
 		mut := &tableDesc.Mutations[i]
 		if mut.MutationID == currentMutationID {
+			errBase := "primary key"
+			if localityConfigSwap != nil {
+				errBase = "locality"
+			}
 			return unimplemented.NewWithIssuef(
-				45510, "cannot perform a primary key change on %s "+
-					"with other schema changes on %s in the same transaction", tableDesc.Name, tableDesc.Name)
+				45510,
+				"cannot perform a %[1]s change on %[2]s with other schema changes on %[2]s in the same transaction",
+				errBase,
+				tableDesc.Name,
+			)
 		}
 		if mut.MutationID < currentMutationID {
 			// We can handle indexes being deleted concurrently. We do this
@@ -67,7 +72,7 @@ func (p *planner) AlterPrimaryKey(
 			// primary key change. If we errored out when seeing a previous
 			// index drop, then users would see a confusing message that a
 			// schema change is in progress when it doesn't seem like one is.
-			// TODO (rohany): This feels like such a hack until (#45150) is fixed.
+			// TODO (rohany): This feels like such a hack until (#45510) is fixed.
 			if mut.GetIndex() != nil && mut.Direction == descpb.DescriptorMutation_DROP {
 				continue
 			}
@@ -77,39 +82,39 @@ func (p *planner) AlterPrimaryKey(
 	}
 
 	for _, elem := range alterPKNode.Columns {
-		col, dropped, err := tableDesc.FindColumnByName(elem.Column)
+		col, err := tableDesc.FindColumnWithName(elem.Column)
 		if err != nil {
 			return err
 		}
-		if dropped {
+		if col.Dropped() {
 			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
-				"column %q is being dropped", col.Name)
+				"column %q is being dropped", col.GetName())
 		}
-		if col.Nullable {
-			return pgerror.Newf(pgcode.InvalidSchemaDefinition, "cannot use nullable column %q in primary key", col.Name)
+		if col.IsNullable() {
+			return pgerror.Newf(pgcode.InvalidSchemaDefinition, "cannot use nullable column %q in primary key", col.GetName())
 		}
 	}
 
 	// Disable primary key changes on tables that are interleaved parents.
-	if len(tableDesc.PrimaryIndex.InterleavedBy) != 0 {
+	if tableDesc.GetPrimaryIndex().NumInterleavedBy() != 0 {
 		var sb strings.Builder
 		sb.WriteString("[")
 		comma := ", "
-		for i := range tableDesc.PrimaryIndex.InterleavedBy {
-			interleave := &tableDesc.PrimaryIndex.InterleavedBy[i]
+		for i := 0; i < tableDesc.GetPrimaryIndex().NumInterleavedBy(); i++ {
+			interleaveTableID := tableDesc.GetPrimaryIndex().GetInterleavedBy(i).Table
 			if i != 0 {
 				sb.WriteString(comma)
 			}
-			childTable, err := p.Descriptors().GetTableVersionByID(
+			childTable, err := p.Descriptors().GetImmutableTableByID(
 				ctx,
 				p.Txn(),
-				interleave.Table,
+				interleaveTableID,
 				tree.ObjectLookupFlags{},
 			)
 			if err != nil {
 				return err
 			}
-			sb.WriteString(childTable.Name)
+			sb.WriteString(childTable.GetName())
 		}
 		sb.WriteString("]")
 		return errors.Newf(
@@ -120,7 +125,7 @@ func (p *planner) AlterPrimaryKey(
 	}
 
 	nameExists := func(name string) bool {
-		_, _, err := tableDesc.FindIndexByName(name)
+		_, err := tableDesc.FindIndexWithName(name)
 		return err == nil
 	}
 
@@ -129,6 +134,12 @@ func (p *planner) AlterPrimaryKey(
 		"new_primary_key",
 		nameExists,
 	)
+	if alterPKNode.Name != "" &&
+		// Allow reuse of existing primary key's name.
+		tableDesc.PrimaryIndex.Name != string(alterPKNode.Name) &&
+		nameExists(string(alterPKNode.Name)) {
+		return pgerror.Newf(pgcode.DuplicateObject, "constraint with name %s already exists", alterPKNode.Name)
+	}
 	newPrimaryIndexDesc := &descpb.IndexDescriptor{
 		Name:              name,
 		Unique:            true,
@@ -213,10 +224,72 @@ func (p *planner) AlterPrimaryKey(
 		return err
 	}
 
+	// isNewPartitionAllBy is set if a new PARTITON ALL BY statement is introduced.
+	isNewPartitionAllBy := false
+	var partitionAllBy *tree.PartitionBy
+	var err error
+	if localityConfigSwap != nil {
+		switch localityConfigSwap.OldLocalityConfig.Locality.(type) {
+		case *descpb.TableDescriptor_LocalityConfig_Global_,
+			*descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
+			switch to := localityConfigSwap.NewLocalityConfig.Locality.(type) {
+			case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
+				isNewPartitionAllBy = true
+				colName := tree.RegionalByRowRegionDefaultColName
+				if as := to.RegionalByRow.As; as != nil {
+					colName = tree.Name(*as)
+				}
+				dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
+					ctx,
+					p.txn,
+					tableDesc.GetParentID(),
+					tree.DatabaseLookupFlags{Required: true},
+				)
+				if err != nil {
+					return err
+				}
+				partitionAllBy = partitionByForRegionalByRow(
+					*dbDesc.DatabaseDesc().RegionConfig,
+					colName,
+				)
+			default:
+				return errors.AssertionFailedf(
+					"unknown locality config swap: %T to %T",
+					localityConfigSwap.OldLocalityConfig.Locality,
+					localityConfigSwap.NewLocalityConfig.Locality,
+				)
+			}
+		default:
+			return errors.AssertionFailedf(
+				"unknown locality config swap: %T to %T",
+				localityConfigSwap.OldLocalityConfig.Locality,
+				localityConfigSwap.NewLocalityConfig.Locality,
+			)
+		}
+	} else if tableDesc.IsPartitionAllBy() {
+		partitionAllBy, err = partitionByFromTableDesc(p.ExecCfg().Codec, tableDesc)
+		if err != nil {
+			return err
+		}
+	}
+	if partitionAllBy != nil {
+		*newPrimaryIndexDesc, err = CreatePartitioning(
+			ctx,
+			p.ExecCfg().Settings,
+			p.EvalContext(),
+			tableDesc,
+			*newPrimaryIndexDesc,
+			partitionAllBy,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Create a new index that indexes everything the old primary index
 	// does, but doesn't store anything.
-	if shouldCopyPrimaryKey(tableDesc, newPrimaryIndexDesc) {
-		oldPrimaryIndexCopy := protoutil.Clone(&tableDesc.PrimaryIndex).(*descpb.IndexDescriptor)
+	if shouldCopyPrimaryKey(tableDesc, newPrimaryIndexDesc, localityConfigSwap) {
+		oldPrimaryIndexCopy := tableDesc.GetPrimaryIndex().IndexDescDeepCopy()
 		// Clear the name of the index so that it gets generated by AllocateIDs.
 		oldPrimaryIndexCopy.Name = ""
 		oldPrimaryIndexCopy.StoreColumnIDs = nil
@@ -224,7 +297,7 @@ func (p *planner) AlterPrimaryKey(
 		// Make the copy of the old primary index not-interleaved. This decision
 		// can be revisited based on user experience.
 		oldPrimaryIndexCopy.Interleave = descpb.InterleaveDescriptor{}
-		if err := addIndexMutationWithSpecificPrimaryKey(ctx, tableDesc, oldPrimaryIndexCopy, newPrimaryIndexDesc); err != nil {
+		if err := addIndexMutationWithSpecificPrimaryKey(ctx, tableDesc, &oldPrimaryIndexCopy, newPrimaryIndexDesc); err != nil {
 			return err
 		}
 	}
@@ -232,33 +305,37 @@ func (p *planner) AlterPrimaryKey(
 	// We have to rewrite all indexes that either:
 	// * depend on uniqueness from the old primary key (inverted, non-unique, or unique with nulls).
 	// * don't store or index all columns in the new primary key.
-	shouldRewriteIndex := func(idx *descpb.IndexDescriptor) bool {
-		shouldRewrite := false
+	// * is affected by a locality config swap.
+	shouldRewriteIndex := func(idx *descpb.IndexDescriptor) (bool, error) {
+		if localityConfigSwap != nil {
+			return true, nil
+		}
 		for _, colID := range newPrimaryIndexDesc.ColumnIDs {
 			if !idx.ContainsColumnID(colID) {
-				shouldRewrite = true
-				break
+				return true, nil
 			}
 		}
 		if idx.Unique {
 			for _, colID := range idx.ColumnIDs {
-				col, err := tableDesc.FindColumnByID(colID)
+				col, err := tableDesc.FindColumnWithID(colID)
 				if err != nil {
-					panic(err)
+					return false, err
 				}
-				if col.Nullable {
-					shouldRewrite = true
-					break
+				if col.IsNullable() {
+					return true, nil
 				}
 			}
 		}
-		return shouldRewrite || !idx.Unique || idx.Type == descpb.IndexDescriptor_INVERTED
+		return !idx.Unique || idx.Type == descpb.IndexDescriptor_INVERTED, nil
 	}
 	var indexesToRewrite []*descpb.IndexDescriptor
-	for i := range tableDesc.Indexes {
-		idx := &tableDesc.Indexes[i]
-		if idx.ID != newPrimaryIndexDesc.ID && shouldRewriteIndex(idx) {
-			indexesToRewrite = append(indexesToRewrite, idx)
+	for _, idx := range tableDesc.PublicNonPrimaryIndexes() {
+		shouldRewrite, err := shouldRewriteIndex(idx.IndexDesc())
+		if err != nil {
+			return err
+		}
+		if idx.GetID() != newPrimaryIndexDesc.ID && shouldRewrite {
+			indexesToRewrite = append(indexesToRewrite, idx.IndexDesc())
 		}
 	}
 
@@ -268,8 +345,14 @@ func (p *planner) AlterPrimaryKey(
 		// If there is an index that is getting built right now that started in a previous txn, we
 		// need to potentially rebuild that index as well.
 		if idx := mut.GetIndex(); mut.MutationID < currentMutationID && idx != nil &&
-			mut.Direction == descpb.DescriptorMutation_ADD && shouldRewriteIndex(idx) {
-			indexesToRewrite = append(indexesToRewrite, idx)
+			mut.Direction == descpb.DescriptorMutation_ADD {
+			shouldRewrite, err := shouldRewriteIndex(idx)
+			if err != nil {
+				return err
+			}
+			if shouldRewrite {
+				indexesToRewrite = append(indexesToRewrite, idx)
+			}
 		}
 	}
 
@@ -294,33 +377,65 @@ func (p *planner) AlterPrimaryKey(
 				return err
 			}
 		}
+		// TODO(#59719): decide what happens if any multiregion tables have
+		// PARTITION BY statements. We currently do not support this and ignore
+		// these old statements.
+		//
+		// Detect partitioning if we are newly adding a PARTITION BY ALL statement.
+		// If the table is already PARTITION ALL BY, we already have the correct implicit
+		// column descriptor in front of each index, and calling CreatePartitioning again
+		// will make these indexes explicit.
+		if isNewPartitionAllBy {
+			if *newIndex, err = CreatePartitioning(
+				ctx,
+				p.ExecCfg().Settings,
+				p.EvalContext(),
+				tableDesc,
+				*newIndex,
+				partitionAllBy,
+			); err != nil {
+				return err
+			}
+		}
 		oldIndexIDs = append(oldIndexIDs, idx.ID)
 		newIndexIDs = append(newIndexIDs, newIndex.ID)
 	}
 
 	swapArgs := &descpb.PrimaryKeySwap{
-		OldPrimaryIndexId: tableDesc.PrimaryIndex.ID,
-		NewPrimaryIndexId: newPrimaryIndexDesc.ID,
-		NewIndexes:        newIndexIDs,
-		OldIndexes:        oldIndexIDs,
+		OldPrimaryIndexId:   tableDesc.GetPrimaryIndexID(),
+		NewPrimaryIndexId:   newPrimaryIndexDesc.ID,
+		NewIndexes:          newIndexIDs,
+		OldIndexes:          oldIndexIDs,
+		NewPrimaryIndexName: string(alterPKNode.Name),
+		LocalityConfigSwap:  localityConfigSwap,
 	}
 	tableDesc.AddPrimaryKeySwapMutation(swapArgs)
 
 	// Mark the primary key of the table as valid.
-	tableDesc.PrimaryIndex.Disabled = false
+	{
+		primaryIndex := *tableDesc.GetPrimaryIndex().IndexDesc()
+		primaryIndex.Disabled = false
+		tableDesc.SetPrimaryIndex(primaryIndex)
+	}
 
 	// N.B. We don't schedule index deletions here because the existing
 	// indexes need to be visible to the user until the primary key swap
 	// actually occurs. Deletions will get enqueued in the phase when
 	// the swap happens.
 
-	// Send a notice to users about the async cleanup jobs.
+	// Send a notice to users about how this job is asynchronous.
 	// TODO(knz): Mention the job ID in the client notice.
+	noticeStr := "primary key changes are finalized asynchronously"
+	if localityConfigSwap != nil {
+		noticeStr = "LOCALITY changes will be finalized asynchronously"
+	}
 	p.BufferClientNotice(
 		ctx,
 		pgnotice.Newf(
-			"primary key changes are finalized asynchronously; "+
-				"further schema changes on this table may be restricted until the job completes"),
+			"%s; further schema changes on this table may be restricted "+
+				"until the job completes",
+			noticeStr,
+		),
 	)
 
 	return nil
@@ -333,8 +448,16 @@ func (p *planner) AlterPrimaryKey(
 // * The primary key is not the default rowid primary key.
 // * The new primary key isn't the same hash sharded old primary key with a
 //   different bucket count.
-func shouldCopyPrimaryKey(desc *tabledesc.Mutable, newPK *descpb.IndexDescriptor) bool {
-	oldPK := desc.PrimaryIndex
+// * There is no partitioning change.
+func shouldCopyPrimaryKey(
+	desc *tabledesc.Mutable,
+	newPK *descpb.IndexDescriptor,
+	localityConfigSwap *descpb.PrimaryKeySwap_LocalityConfigSwap,
+) bool {
+	if localityConfigSwap != nil {
+		return false
+	}
+	oldPK := desc.GetPrimaryIndex()
 	if !desc.HasPrimaryKey() {
 		return false
 	}
@@ -344,7 +467,7 @@ func shouldCopyPrimaryKey(desc *tabledesc.Mutable, newPK *descpb.IndexDescriptor
 	// The first column in the columnIDs is the shard column, which will be different.
 	// Slice it out to see what the actual index columns are.
 	if oldPK.IsSharded() && newPK.IsSharded() &&
-		descpb.ColumnIDs(oldPK.ColumnIDs[1:]).Equals(newPK.ColumnIDs[1:]) {
+		descpb.ColumnIDs(oldPK.IndexDesc().ColumnIDs[1:]).Equals(newPK.ColumnIDs[1:]) {
 		return false
 	}
 

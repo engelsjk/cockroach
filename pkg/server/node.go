@@ -11,6 +11,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -25,10 +26,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -39,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -95,18 +99,18 @@ var (
 // Cluster settings.
 var (
 	// graphiteEndpoint is host:port, if any, of Graphite metrics server.
-	graphiteEndpoint = settings.RegisterPublicStringSetting(
+	graphiteEndpoint = settings.RegisterStringSetting(
 		"external.graphite.endpoint",
 		"if nonempty, push server metrics to the Graphite or Carbon server at the specified host:port",
 		"",
-	)
+	).WithPublic()
 	// graphiteInterval is how often metrics are pushed to Graphite, if enabled.
-	graphiteInterval = settings.RegisterPublicNonNegativeDurationSettingWithMaximum(
+	graphiteInterval = settings.RegisterDurationSetting(
 		graphiteIntervalKey,
 		"the interval at which metrics are pushed to Graphite (if enabled)",
 		10*time.Second,
-		maxGraphiteInterval,
-	)
+		settings.NonNegativeDurationWithMaximum(maxGraphiteInterval),
+	).WithPublic()
 )
 
 type nodeMetrics struct {
@@ -153,8 +157,8 @@ type Node struct {
 	clusterID    *base.ClusterIDContainer // UUID for Cockroach cluster
 	Descriptor   roachpb.NodeDescriptor   // Node ID, network/physical topology
 	storeCfg     kvserver.StoreConfig     // Config to use and pass to stores
-	eventLogger  sql.EventLogger
-	stores       *kvserver.Stores // Access to node-local stores
+	sqlExec      *sql.InternalExecutor    // For event logging
+	stores       *kvserver.Stores         // Access to node-local stores
 	metrics      nodeMetrics
 	recorder     *status.MetricsRecorder
 	startedAt    int64
@@ -255,10 +259,14 @@ func bootstrapCluster(
 				return splits[i].Less(splits[j])
 			})
 
+			var storeKnobs kvserver.StoreTestingKnobs
+			if kn, ok := initCfg.testingKnobs.Store.(*kvserver.StoreTestingKnobs); ok {
+				storeKnobs = *kn
+			}
 			if err := kvserver.WriteInitialClusterData(
 				ctx, eng, initialValues,
 				bootstrapVersion.Version, len(engines), splits,
-				hlc.UnixNano(),
+				hlc.UnixNano(), storeKnobs,
 			); err != nil {
 				return nil, err
 			}
@@ -282,19 +290,19 @@ func NewNode(
 	execCfg *sql.ExecutorConfig,
 	clusterID *base.ClusterIDContainer,
 ) *Node {
-	var eventLogger sql.EventLogger
+	var sqlExec *sql.InternalExecutor
 	if execCfg != nil {
-		eventLogger = sql.MakeEventLogger(execCfg)
+		sqlExec = execCfg.InternalExecutor
 	}
 	n := &Node{
-		storeCfg:    cfg,
-		stopper:     stopper,
-		recorder:    recorder,
-		metrics:     makeNodeMetrics(reg, cfg.HistogramWindowInterval),
-		stores:      kvserver.NewStores(cfg.AmbientCtx, cfg.Clock),
-		txnMetrics:  txnMetrics,
-		eventLogger: eventLogger,
-		clusterID:   clusterID,
+		storeCfg:   cfg,
+		stopper:    stopper,
+		recorder:   recorder,
+		metrics:    makeNodeMetrics(reg, cfg.HistogramWindowInterval),
+		stores:     kvserver.NewStores(cfg.AmbientCtx, cfg.Clock),
+		txnMetrics: txnMetrics,
+		sqlExec:    sqlExec,
+		clusterID:  clusterID,
 	}
 	n.perReplicaServer = kvserver.MakeServer(&n.Descriptor, n.stores)
 	return n
@@ -302,7 +310,7 @@ func NewNode(
 
 // InitLogger needs to be called if a nil execCfg was passed to NewNode().
 func (n *Node) InitLogger(execCfg *sql.ExecutorConfig) {
-	n.eventLogger = sql.MakeEventLogger(execCfg)
+	n.sqlExec = execCfg.InternalExecutor
 }
 
 // String implements fmt.Stringer.
@@ -580,7 +588,7 @@ func (n *Node) initializeAdditionalStores(
 
 	// Write a new status summary after all stores have been initialized; this
 	// helps the UI remain responsive when new nodes are added.
-	if err := n.writeNodeStatus(ctx, 0 /* alertTTL */); err != nil {
+	if err := n.writeNodeStatus(ctx, 0 /* alertTTL */, false /* mustExist */); err != nil {
 		log.Warningf(ctx, "error writing node summary after store bootstrap: %s", err)
 	}
 
@@ -591,7 +599,7 @@ func (n *Node) initializeAdditionalStores(
 // information. Starts a goroutine to loop until the node is closed.
 func (n *Node) startGossiping(ctx context.Context, stopper *stop.Stopper) {
 	ctx = n.AnnotateCtx(ctx)
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "start-gossip", func(ctx context.Context) {
 		// Verify we've already gossiped our node descriptor.
 		//
 		// TODO(tbg): see if we really needed to do this earlier already. We
@@ -622,7 +630,7 @@ func (n *Node) startGossiping(ctx context.Context, stopper *stop.Stopper) {
 				if err := n.storeCfg.Gossip.SetNodeDescriptor(&n.Descriptor); err != nil {
 					log.Warningf(ctx, "couldn't gossip descriptor for node %d: %s", n.Descriptor.NodeID, err)
 				}
-			case <-stopper.ShouldStop():
+			case <-stopper.ShouldQuiesce():
 				return
 			}
 		}
@@ -643,7 +651,7 @@ func (n *Node) gossipStores(ctx context.Context) {
 // maintained.
 func (n *Node) startComputePeriodicMetrics(stopper *stop.Stopper, interval time.Duration) {
 	ctx := n.AnnotateCtx(context.Background())
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "compute-metrics", func(ctx context.Context) {
 		// Compute periodic stats at the same frequency as metrics are sampled.
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -653,7 +661,7 @@ func (n *Node) startComputePeriodicMetrics(stopper *stop.Stopper, interval time.
 				if err := n.computePeriodicMetrics(ctx, tick); err != nil {
 					log.Errorf(ctx, "failed computing periodic metrics: %s", err)
 				}
-			case <-stopper.ShouldStop():
+			case <-stopper.ShouldQuiesce():
 				return
 			}
 		}
@@ -675,13 +683,13 @@ func (n *Node) startGraphiteStatsExporter(st *cluster.Settings) {
 	ctx := logtags.AddTag(n.AnnotateCtx(context.Background()), "graphite stats exporter", nil)
 	pm := metric.MakePrometheusExporter()
 
-	n.stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = n.stopper.RunAsyncTask(ctx, "graphite-exporter", func(ctx context.Context) {
 		var timer timeutil.Timer
 		defer timer.Stop()
 		for {
 			timer.Reset(graphiteInterval.Get(&st.SV))
 			select {
-			case <-n.stopper.ShouldStop():
+			case <-n.stopper.ShouldQuiesce():
 				return
 			case <-timer.C:
 				timer.Read = true
@@ -698,13 +706,15 @@ func (n *Node) startGraphiteStatsExporter(st *cluster.Settings) {
 
 // startWriteNodeStatus begins periodically persisting status summaries for the
 // node and its stores.
-func (n *Node) startWriteNodeStatus(frequency time.Duration) {
+func (n *Node) startWriteNodeStatus(frequency time.Duration) error {
 	ctx := logtags.AddTag(n.AnnotateCtx(context.Background()), "summaries", nil)
-	// Immediately record summaries once on server startup.
-	if err := n.writeNodeStatus(ctx, 0 /* alertTTL */); err != nil {
-		log.Warningf(ctx, "error recording initial status summaries: %s", err)
+	// Immediately record summaries once on server startup. The update loop below
+	// will only update the key if it exists, to avoid race conditions during
+	// node decommissioning, so we have to error out if we can't create it.
+	if err := n.writeNodeStatus(ctx, 0 /* alertTTL */, false /* mustExist */); err != nil {
+		return errors.Wrap(err, "error recording initial status summaries")
 	}
-	n.stopper.RunWorker(ctx, func(ctx context.Context) {
+	return n.stopper.RunAsyncTask(ctx, "write-node-status", func(ctx context.Context) {
 		// Write a status summary immediately; this helps the UI remain
 		// responsive when new nodes are added.
 		ticker := time.NewTicker(frequency)
@@ -716,10 +726,16 @@ func (n *Node) startWriteNodeStatus(frequency time.Duration) {
 				// alerts don't disappear and reappear spuriously while at the same
 				// time ensuring that an alert doesn't linger for too long after having
 				// resolved.
-				if err := n.writeNodeStatus(ctx, 2*frequency); err != nil {
+				//
+				// The status key must already exist, to avoid race conditions
+				// during decommissioning of this node. Decommissioning may be
+				// carried out by a different node, so this avoids resurrecting
+				// the status entry after the decommissioner has removed it.
+				// See Server.Decommission().
+				if err := n.writeNodeStatus(ctx, 2*frequency, true /* mustExist */); err != nil {
 					log.Warningf(ctx, "error recording status summaries: %s", err)
 				}
-			case <-n.stopper.ShouldStop():
+			case <-n.stopper.ShouldQuiesce():
 				return
 			}
 		}
@@ -728,7 +744,9 @@ func (n *Node) startWriteNodeStatus(frequency time.Duration) {
 
 // writeNodeStatus retrieves status summaries from the supplied
 // NodeStatusRecorder and persists them to the cockroach data store.
-func (n *Node) writeNodeStatus(ctx context.Context, alertTTL time.Duration) error {
+// If mustExist is true the status key must already exist and must
+// not change during writing -- if false, the status is always written.
+func (n *Node) writeNodeStatus(ctx context.Context, alertTTL time.Duration, mustExist bool) error {
 	var err error
 	if runErr := n.stopper.RunTask(ctx, "node.Node: writing summary", func(ctx context.Context) {
 		nodeStatus := n.recorder.GenerateNodeStatus(ctx)
@@ -759,7 +777,7 @@ func (n *Node) writeNodeStatus(ctx context.Context, alertTTL time.Duration) erro
 			// state (since it'll be incremented every ~10s).
 		}
 
-		err = n.recorder.WriteNodeStatus(ctx, n.storeCfg.DB, *nodeStatus)
+		err = n.recorder.WriteNodeStatus(ctx, n.storeCfg.DB, *nodeStatus, mustExist)
 	}); runErr != nil {
 		err = runErr
 	}
@@ -769,40 +787,49 @@ func (n *Node) writeNodeStatus(ctx context.Context, alertTTL time.Duration) erro
 // recordJoinEvent begins an asynchronous task which attempts to log a "node
 // join" or "node restart" event. This query will retry until it succeeds or the
 // server stops.
-func (n *Node) recordJoinEvent() {
+func (n *Node) recordJoinEvent(ctx context.Context) {
+	var event eventpb.EventPayload
+	var nodeDetails *eventpb.CommonNodeEventDetails
+	if !n.initialStart {
+		ev := &eventpb.NodeRestart{}
+		event = ev
+		nodeDetails = &ev.CommonNodeEventDetails
+		nodeDetails.LastUp = n.lastUp
+	} else {
+		ev := &eventpb.NodeJoin{}
+		event = ev
+		nodeDetails = &ev.CommonNodeEventDetails
+		nodeDetails.LastUp = n.startedAt
+	}
+	event.CommonDetails().Timestamp = timeutil.Now().UnixNano()
+	nodeDetails.StartedAt = n.startedAt
+	nodeDetails.NodeID = int32(n.Descriptor.NodeID)
+
+	// Ensure that the event goes to log files even if LogRangeEvents is
+	// disabled (which means skip the system.eventlog _table_).
+	log.StructuredEvent(ctx, event)
+
 	if !n.storeCfg.LogRangeEvents {
 		return
 	}
 
-	logEventType := sql.EventLogNodeRestart
-	lastUp := n.lastUp
-	if n.initialStart {
-		logEventType = sql.EventLogNodeJoin
-		lastUp = n.startedAt
-	}
-
-	n.stopper.RunWorker(context.Background(), func(bgCtx context.Context) {
+	_ = n.stopper.RunAsyncTask(ctx, "record-join", func(bgCtx context.Context) {
 		ctx, span := n.AnnotateCtxWithSpan(bgCtx, "record-join-event")
 		defer span.Finish()
 		retryOpts := base.DefaultRetryOptions()
-		retryOpts.Closer = n.stopper.ShouldStop()
+		retryOpts.Closer = n.stopper.ShouldQuiesce()
 		for r := retry.Start(retryOpts); r.Next(); {
 			if err := n.storeCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				return n.eventLogger.InsertEventRecord(
-					ctx,
+				return sql.InsertEventRecord(ctx, n.sqlExec,
 					txn,
-					logEventType,
 					int32(n.Descriptor.NodeID),
 					int32(n.Descriptor.NodeID),
-					struct {
-						Descriptor roachpb.NodeDescriptor
-						ClusterID  uuid.UUID
-						StartedAt  int64
-						LastUp     int64
-					}{n.Descriptor, n.clusterID.Get(), n.startedAt, lastUp},
+					true, /* skipExternalLog - we already call log.StructuredEvent above */
+					event,
+					false, /* onlyLog */
 				)
 			}); err != nil {
-				log.Warningf(ctx, "%s: unable to log %s event: %s", n, logEventType, err)
+				log.Warningf(ctx, "%s: unable to log event %v: %v", n, event, err)
 			} else {
 				return
 			}
@@ -897,33 +924,30 @@ func (n *Node) Batch(
 // and "child of remote span" cases are important, as this RPC can be called
 // either through the network or directly if the caller is local.
 //
-// It returns the derived context and a cleanup function to be called when
-// servicing the RPC is done. The cleanup function will close the span and, in
-// case the span was the child of a remote span and "snowball tracing" was
-// enabled on that parent span, it serializes the local trace into the
-// BatchResponse. The cleanup function takes the BatchResponse in which the
-// response is to serialized. The BatchResponse can be nil in case no response
-// is to be returned to the rpc caller.
+// It returns the derived context and a cleanup function to be
+// called when servicing the RPC is done. The cleanup function will
+// close the span and serialize any data recorded to that span into
+// the BatchResponse. The cleanup function takes the BatchResponse
+// in which the response is to serialized. The BatchResponse can
+// be nil in case no response is to be returned to the rpc caller.
 func (n *Node) setupSpanForIncomingRPC(
 	ctx context.Context, isLocalRequest bool,
 ) (context.Context, func(*roachpb.BatchResponse)) {
 	// The operation name matches the one created by the interceptor in the
 	// remoteTrace case below.
 	const opName = "/cockroach.roachpb.Internal/Batch"
+	tr := n.storeCfg.AmbientCtx.Tracer
 	var newSpan, grpcSpan *tracing.Span
 	if isLocalRequest {
 		// This is a local request which circumvented gRPC. Start a span now.
-		ctx, newSpan = tracing.ChildSpan(ctx, opName)
+		ctx, newSpan = tracing.EnsureChildSpan(ctx, tr, opName)
 	} else {
 		grpcSpan = tracing.SpanFromContext(ctx)
 		if grpcSpan == nil {
 			// If tracing information was passed via gRPC metadata, the gRPC interceptor
 			// should have opened a span for us. If not, open a span now (if tracing is
 			// disabled, this will be a noop span).
-			newSpan = n.storeCfg.AmbientCtx.Tracer.StartSpan(
-				opName, tracing.WithLogTags(n.storeCfg.AmbientCtx.LogTags()),
-			)
-			ctx = tracing.ContextWithSpan(ctx, newSpan)
+			ctx, newSpan = tr.StartSpanCtx(ctx, opName)
 		} else {
 			grpcSpan.SetTag("node", n.Descriptor.NodeID)
 		}
@@ -937,10 +961,9 @@ func (n *Node) setupSpanForIncomingRPC(
 			return
 		}
 		if grpcSpan != nil {
-			// If this is a "snowball trace", we'll need to return all the recorded
-			// spans in the BatchResponse at the end of the request.
-			// We don't want to do this if the operation is on the same host, in which
-			// case everything is already part of the same recording.
+			// If our local span descends from a parent on the other
+			// end of the RPC (i.e. the !isLocalRequest) case,
+			// attach the span recording to the batch response.
 			if rec := grpcSpan.GetRecording(); rec != nil {
 				br.CollectedSpans = append(br.CollectedSpans, rec...)
 			}
@@ -993,6 +1016,114 @@ func (n *Node) RangeFeed(
 		return stream.Send(&event)
 	}
 	return nil
+}
+
+// ResetQuorum implements the roachpb.InternalServer interface.
+func (n *Node) ResetQuorum(
+	ctx context.Context, req *roachpb.ResetQuorumRequest,
+) (_ *roachpb.ResetQuorumResponse, rErr error) {
+	// Get range descriptor and save original value of the descriptor for the input range id.
+	var desc roachpb.RangeDescriptor
+	var expValue roachpb.Value
+	txnTries := 0
+	if err := n.storeCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		txnTries++
+		if txnTries > 1 {
+			log.Infof(ctx, "failed to retrieve range descriptor for r%d, retrying...", req.RangeID)
+		}
+		kvs, err := kvclient.ScanMetaKVs(ctx, txn, roachpb.Span{
+			Key:    roachpb.KeyMin,
+			EndKey: roachpb.KeyMax,
+		})
+		if err != nil {
+			return err
+		}
+
+		for i := range kvs {
+			if err := kvs[i].Value.GetProto(&desc); err != nil {
+				return err
+			}
+			if desc.RangeID == roachpb.RangeID(req.RangeID) {
+				expValue = *kvs[i].Value
+				return nil
+			}
+		}
+		return errors.Errorf("r%d not found", req.RangeID)
+	}); err != nil {
+		log.Errorf(ctx, "range descriptor for r%d could not be read: %v", req.RangeID, err)
+		return nil, err
+	}
+	log.Infof(ctx, "retrieved original range descriptor %s", desc)
+
+	// Check that we've actually lost quorum.
+	livenessMap := n.storeCfg.NodeLiveness.GetIsLiveMap()
+	available := desc.Replicas().CanMakeProgress(func(rDesc roachpb.ReplicaDescriptor) bool {
+		return livenessMap[rDesc.NodeID].IsLive
+	})
+	if available {
+		return nil, errors.Errorf("targeted range to recover has not lost quorum.")
+	}
+	// Check that we're not a metaX range.
+	if bytes.HasPrefix(desc.StartKey, keys.Meta1Prefix) || bytes.HasPrefix(desc.StartKey, keys.Meta2Prefix) {
+		return nil, errors.Errorf("targeted range to recover is a meta1 or meta2 range.")
+	}
+
+	// Update the range descriptor and update meta ranges for the descriptor, removing all replicas.
+	deadReplicas := append([]roachpb.ReplicaDescriptor(nil), desc.Replicas().Descriptors()...)
+	for _, rd := range deadReplicas {
+		desc.RemoveReplica(rd.NodeID, rd.StoreID)
+	}
+	// Pick any store on the current node to send the snapshot to.
+	var storeID roachpb.StoreID
+	if err := n.stores.VisitStores(func(s *kvserver.Store) error {
+		if storeID == 0 {
+			storeID = s.StoreID()
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if storeID == 0 {
+		return nil, errors.New("no store found")
+	}
+	// Add current node as new replica.
+	toReplicaDescriptor := desc.AddReplica(n.Descriptor.NodeID, storeID, roachpb.VOTER_FULL)
+	// Increment the generation so that the various caches will recognize this descriptor as newer.
+	desc.IncrementGeneration()
+
+	log.Infof(ctx, "initiating recovery process using %s", desc)
+
+	// Update the meta2 entry. Note that we're intentionally
+	// eschewing updateRangeAddressing since the copy of the
+	// descriptor that resides on the range itself has lost quorum.
+	metaKey := keys.RangeMetaKey(desc.EndKey).AsRawKey()
+	if err := n.storeCfg.DB.CPut(ctx, metaKey, &desc, expValue.TagAndDataBytes()); err != nil {
+		return nil, err
+	}
+	log.Infof(ctx, "updated meta2 entry for r%d", desc.RangeID)
+
+	// Set up connection to self. Use rpc.SystemClass to avoid throttling.
+	conn, err := n.storeCfg.NodeDialer.Dial(ctx, n.Descriptor.NodeID, rpc.SystemClass)
+	if err != nil {
+		return nil, err
+	}
+
+	// Initialize and send an empty snapshot to self in order to use crdb
+	// internal upreplication and rebalancing mechanisms to create further
+	// replicas from this fresh snapshot.
+	if err := kvserver.SendEmptySnapshot(
+		ctx,
+		n.storeCfg.Settings,
+		conn,
+		n.storeCfg.Clock.Now(),
+		desc,
+		toReplicaDescriptor,
+	); err != nil {
+		return nil, err
+	}
+	log.Infof(ctx, "sent empty snapshot to %s", toReplicaDescriptor)
+
+	return &roachpb.ResetQuorumResponse{}, nil
 }
 
 // GossipSubscription implements the roachpb.InternalServer interface.

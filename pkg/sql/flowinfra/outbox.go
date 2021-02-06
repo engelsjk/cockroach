@@ -14,6 +14,7 @@ import (
 	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -64,6 +65,15 @@ type Outbox struct {
 
 	statsCollectionEnabled bool
 	stats                  execinfrapb.ComponentStats
+
+	// numOutboxes is an atomic that keeps track of how many outboxes are left.
+	// When there is one outbox left, the flow-level stats are added to the last
+	// outbox's span stats unless isGatewayNode is true, in which case, the flow
+	// will do so in its Cleanup method.
+	numOutboxes *int32
+
+	// isGatewayNode specifies whether this outbox is running on the gateway node.
+	isGatewayNode bool
 }
 
 var _ execinfra.RowReceiver = &Outbox{}
@@ -73,12 +83,16 @@ var _ Startable = &Outbox{}
 func NewOutbox(
 	flowCtx *execinfra.FlowCtx,
 	nodeID roachpb.NodeID,
-	flowID execinfrapb.FlowID,
 	streamID execinfrapb.StreamID,
+	numOutboxes *int32,
+	isGatewayNode bool,
 ) *Outbox {
 	m := &Outbox{flowCtx: flowCtx, nodeID: nodeID}
-	m.encoder.SetHeaderFields(flowID, streamID)
+	m.encoder.SetHeaderFields(flowCtx.ID, streamID)
 	m.streamID = streamID
+	m.numOutboxes = numOutboxes
+	m.isGatewayNode = isGatewayNode
+	m.stats.Component = flowCtx.StreamComponentID(streamID)
 	return m
 }
 
@@ -129,6 +143,9 @@ func (m *Outbox) addRow(
 			m.encoder.AddMetadata(ctx, execinfrapb.ProducerMetadata{Err: encodingErr})
 			mustFlush = true
 		}
+		if m.statsCollectionEnabled {
+			m.stats.NetTx.TuplesSent.Add(1)
+		}
 	}
 	m.numRows++
 	var flushErr error
@@ -150,21 +167,15 @@ func (m *Outbox) flush(ctx context.Context) error {
 		return nil
 	}
 	msg := m.encoder.FormMessage(ctx)
-	if m.statsCollectionEnabled {
-		if m.flowCtx.Cfg.TestingKnobs.DeterministicStats {
-			// Some fields in the msg have variable sizes across different runs (e.g.
-			// metadata). To keep a useful bytes value for tests, we only count the
-			// encoded row message size.
-			m.stats.NetTx.BytesSent.Add(int64(len(msg.Data.RawBytes)))
-		} else {
-			m.stats.NetTx.BytesSent.Add(int64(msg.Size()))
-		}
-	}
 
 	if log.V(3) {
 		log.Infof(ctx, "flushing outbox")
 	}
 	sendErr := m.stream.Send(msg)
+	if m.statsCollectionEnabled {
+		m.stats.NetTx.BytesSent.Add(int64(msg.Size()))
+		m.stats.NetTx.MessagesSent.Add(1)
+	}
 	for _, rpm := range msg.Data.Metadata {
 		if metricsMeta, ok := rpm.Value.(*execinfrapb.RemoteProducerMetadata_Metrics_); ok {
 			metricsMeta.Metrics.Release()
@@ -207,14 +218,14 @@ func (m *Outbox) mainLoop(ctx context.Context) error {
 
 	var span *tracing.Span
 	ctx, span = execinfra.ProcessorSpan(ctx, "outbox")
-	if span != nil && span.IsRecording() {
+	if span != nil && span.IsVerbose() {
 		m.statsCollectionEnabled = true
 		span.SetTag(execinfrapb.FlowIDTagKey, m.flowCtx.ID.String())
 		span.SetTag(execinfrapb.StreamIDTagKey, m.streamID)
 	}
-	// spanFinished specifies whether we called tracing.FinishSpan on the span.
-	// Some code paths (e.g. stats collection) need to prematurely call
-	// FinishSpan to get trace data.
+	// spanFinished specifies whether we've Finish()-ed the span. Some code
+	// paths (e.g. stats collection) need to prematurely call it to get trace
+	// data.
 	spanFinished := false
 	defer func() {
 		if !spanFinished {
@@ -286,6 +297,13 @@ func (m *Outbox) mainLoop(ctx context.Context) error {
 					err := m.flush(ctx)
 					if err != nil {
 						return err
+					}
+					if !m.isGatewayNode && m.numOutboxes != nil && atomic.AddInt32(m.numOutboxes, -1) == 0 {
+						// TODO(cathymw): maxMemUsage shouldn't be attached to span stats that are associated with streams,
+						// since it's a flow level stat. However, due to the row exec engine infrastructure, it is too
+						// complicated to attach this to a flow level span. If the row exec engine gets removed, getting
+						// maxMemUsage from streamStats should be removed as well.
+						m.stats.FlowStats.MaxMemUsage.Set(uint64(m.flowCtx.EvalCtx.Mon.MaximumBytes()))
 					}
 					span.SetSpanStats(&m.stats)
 					span.Finish()

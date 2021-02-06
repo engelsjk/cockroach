@@ -1,4 +1,5 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("//build:STRINGER.bzl", "stringer")
 
 go_library(
     name = "schemachange",
@@ -7,14 +8,18 @@ go_library(
         "error_code_set.go",
         "error_screening.go",
         "operation_generator.go",
-        "optype_string.go",
         "schemachange.go",
+        # TODO(alanmas,irfansharif): Generate this stringer file within the
+        # sandbox as well.
+        "txstatus_string.go",
         "type_resolver.go",
+        ":gen-optype-stringer",  # keep
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/workload/schemachange",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/security",
+        "//pkg/sql/catalog/colinfo",
         "//pkg/sql/parser",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
@@ -26,9 +31,15 @@ go_library(
         "//pkg/util/timeutil",
         "//pkg/workload",
         "//pkg/workload/histogram",
-        "//vendor/github.com/cockroachdb/errors",
-        "//vendor/github.com/jackc/pgx",
-        "//vendor/github.com/lib/pq/oid",
-        "//vendor/github.com/spf13/pflag",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_jackc_pgx//:pgx",
+        "@com_github_lib_pq//oid",
+        "@com_github_spf13_pflag//:pflag",
     ],
+)
+
+stringer(
+    name = "gen-optype-stringer",
+    src = "operation_generator.go",
+    typ = "opType",
 )

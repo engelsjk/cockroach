@@ -12,7 +12,13 @@ import { assert } from "chai";
 import Long from "long";
 
 import * as protos from "src/js/protos";
-import { addNumericStats, NumericStat, flattenStatementStats, StatementStatistics, combineStatementStats } from "./appStats";
+import {
+  addNumericStats,
+  NumericStat,
+  flattenStatementStats,
+  StatementStatistics,
+  combineStatementStats,
+} from "./appStats";
 import IExplainTreePlanNode = protos.cockroach.sql.IExplainTreePlanNode;
 import ISensitiveInfo = protos.cockroach.sql.ISensitiveInfo;
 
@@ -50,19 +56,19 @@ describe("addNumericStats", () => {
     const b = emptyStats();
     const ab = emptyStats();
 
-    aData.forEach(v => {
+    aData.forEach((v) => {
       countA++;
       sumA += v;
       record(a, countA, v);
     });
 
-    bData.forEach(v => {
+    bData.forEach((v) => {
       countB++;
       sumB += v;
       record(b, countB, v);
     });
 
-    bData.concat(aData).forEach(v => {
+    bData.concat(aData).forEach((v) => {
       countAB++;
       sumAB += v;
       record(ab, countAB, v);
@@ -152,10 +158,9 @@ function randomStat(scale: number = 1): NumericStat {
 
 function randomStats(sensitiveInfo?: ISensitiveInfo): StatementStatistics {
   const count = randomInt(1000);
-  // tslint:disable:variable-name
   const first_attempt_count = randomInt(count);
   const max_retries = randomInt(count - first_attempt_count);
-  // tslint:enable:variable-name
+  const exec_stat_collection_count = randomInt(count);
 
   return {
     count: Long.fromNumber(count),
@@ -170,11 +175,13 @@ function randomStats(sensitiveInfo?: ISensitiveInfo): StatementStatistics {
     bytes_read: randomStat(),
     rows_read: randomStat(),
     sensitive_info: sensitiveInfo || makeSensitiveInfo(null, null),
+    exec_stat_collection_count: Long.fromNumber(exec_stat_collection_count),
   };
 }
 
 function randomString(length: number = 10): string {
-  const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const possible =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   let text = "";
   for (let i = 0; i < length; i++) {
     text += possible.charAt(Math.floor(Math.random() * possible.length));
@@ -194,7 +201,10 @@ function randomPlanDescription(): IExplainTreePlanNode {
   };
 }
 
-function makeSensitiveInfo(lastErr: string, planDescription: IExplainTreePlanNode): ISensitiveInfo {
+function makeSensitiveInfo(
+  lastErr: string,
+  planDescription: IExplainTreePlanNode,
+): ISensitiveInfo {
   return {
     last_err: lastErr,
     most_recent_plan_description: planDescription,
@@ -211,50 +221,126 @@ describe("combineStatementStats", () => {
     const ac = combineStatementStats([a, c]);
     const bc = combineStatementStats([b, c]);
 
-    // tslint:disable:variable-name
     const ab_c = combineStatementStats([ab, c]);
     const ac_b = combineStatementStats([ac, b]);
     const bc_a = combineStatementStats([bc, a]);
-    // tslint:enable:variable-name
 
     assert.equal(ab_c.count.toString(), ac_b.count.toString());
     assert.equal(ab_c.count.toString(), bc_a.count.toString());
+    assert.equal(
+      ab_c.exec_stat_collection_count.toString(),
+      ac_b.exec_stat_collection_count.toString(),
+    );
+    assert.equal(
+      ab_c.exec_stat_collection_count.toString(),
+      bc_a.exec_stat_collection_count.toString(),
+    );
 
-    assert.equal(ab_c.first_attempt_count.toString(), ac_b.first_attempt_count.toString());
-    assert.equal(ab_c.first_attempt_count.toString(), bc_a.first_attempt_count.toString());
+    assert.equal(
+      ab_c.first_attempt_count.toString(),
+      ac_b.first_attempt_count.toString(),
+    );
+    assert.equal(
+      ab_c.first_attempt_count.toString(),
+      bc_a.first_attempt_count.toString(),
+    );
 
     assert.equal(ab_c.max_retries.toString(), ac_b.max_retries.toString());
     assert.equal(ab_c.max_retries.toString(), bc_a.max_retries.toString());
 
     assert.approximately(ab_c.num_rows.mean, ac_b.num_rows.mean, 0.0000001);
     assert.approximately(ab_c.num_rows.mean, bc_a.num_rows.mean, 0.0000001);
-    assert.approximately(ab_c.num_rows.squared_diffs, ac_b.num_rows.squared_diffs, 0.0000001);
-    assert.approximately(ab_c.num_rows.squared_diffs, bc_a.num_rows.squared_diffs, 0.0000001);
+    assert.approximately(
+      ab_c.num_rows.squared_diffs,
+      ac_b.num_rows.squared_diffs,
+      0.0000001,
+    );
+    assert.approximately(
+      ab_c.num_rows.squared_diffs,
+      bc_a.num_rows.squared_diffs,
+      0.0000001,
+    );
 
     assert.approximately(ab_c.parse_lat.mean, ac_b.parse_lat.mean, 0.0000001);
     assert.approximately(ab_c.parse_lat.mean, bc_a.parse_lat.mean, 0.0000001);
-    assert.approximately(ab_c.parse_lat.squared_diffs, ac_b.parse_lat.squared_diffs, 0.0000001);
-    assert.approximately(ab_c.parse_lat.squared_diffs, bc_a.parse_lat.squared_diffs, 0.0000001);
+    assert.approximately(
+      ab_c.parse_lat.squared_diffs,
+      ac_b.parse_lat.squared_diffs,
+      0.0000001,
+    );
+    assert.approximately(
+      ab_c.parse_lat.squared_diffs,
+      bc_a.parse_lat.squared_diffs,
+      0.0000001,
+    );
 
     assert.approximately(ab_c.plan_lat.mean, ac_b.plan_lat.mean, 0.0000001);
     assert.approximately(ab_c.plan_lat.mean, bc_a.plan_lat.mean, 0.0000001);
-    assert.approximately(ab_c.plan_lat.squared_diffs, ac_b.plan_lat.squared_diffs, 0.0000001);
-    assert.approximately(ab_c.plan_lat.squared_diffs, bc_a.plan_lat.squared_diffs, 0.0000001);
+    assert.approximately(
+      ab_c.plan_lat.squared_diffs,
+      ac_b.plan_lat.squared_diffs,
+      0.0000001,
+    );
+    assert.approximately(
+      ab_c.plan_lat.squared_diffs,
+      bc_a.plan_lat.squared_diffs,
+      0.0000001,
+    );
 
     assert.approximately(ab_c.run_lat.mean, ac_b.run_lat.mean, 0.0000001);
     assert.approximately(ab_c.run_lat.mean, bc_a.run_lat.mean, 0.0000001);
-    assert.approximately(ab_c.run_lat.squared_diffs, ac_b.run_lat.squared_diffs, 0.0000001);
-    assert.approximately(ab_c.run_lat.squared_diffs, bc_a.run_lat.squared_diffs, 0.0000001);
+    assert.approximately(
+      ab_c.run_lat.squared_diffs,
+      ac_b.run_lat.squared_diffs,
+      0.0000001,
+    );
+    assert.approximately(
+      ab_c.run_lat.squared_diffs,
+      bc_a.run_lat.squared_diffs,
+      0.0000001,
+    );
 
-    assert.approximately(ab_c.service_lat.mean, ac_b.service_lat.mean, 0.0000001);
-    assert.approximately(ab_c.service_lat.mean, bc_a.service_lat.mean, 0.0000001);
-    assert.approximately(ab_c.service_lat.squared_diffs, ac_b.service_lat.squared_diffs, 0.0000001);
-    assert.approximately(ab_c.service_lat.squared_diffs, bc_a.service_lat.squared_diffs, 0.0000001);
+    assert.approximately(
+      ab_c.service_lat.mean,
+      ac_b.service_lat.mean,
+      0.0000001,
+    );
+    assert.approximately(
+      ab_c.service_lat.mean,
+      bc_a.service_lat.mean,
+      0.0000001,
+    );
+    assert.approximately(
+      ab_c.service_lat.squared_diffs,
+      ac_b.service_lat.squared_diffs,
+      0.0000001,
+    );
+    assert.approximately(
+      ab_c.service_lat.squared_diffs,
+      bc_a.service_lat.squared_diffs,
+      0.0000001,
+    );
 
-    assert.approximately(ab_c.overhead_lat.mean, ac_b.overhead_lat.mean, 0.0000001);
-    assert.approximately(ab_c.overhead_lat.mean, bc_a.overhead_lat.mean, 0.0000001);
-    assert.approximately(ab_c.overhead_lat.squared_diffs, ac_b.overhead_lat.squared_diffs, 0.0000001);
-    assert.approximately(ab_c.overhead_lat.squared_diffs, bc_a.overhead_lat.squared_diffs, 0.0000001);
+    assert.approximately(
+      ab_c.overhead_lat.mean,
+      ac_b.overhead_lat.mean,
+      0.0000001,
+    );
+    assert.approximately(
+      ab_c.overhead_lat.mean,
+      bc_a.overhead_lat.mean,
+      0.0000001,
+    );
+    assert.approximately(
+      ab_c.overhead_lat.squared_diffs,
+      ac_b.overhead_lat.squared_diffs,
+      0.0000001,
+    );
+    assert.approximately(
+      ab_c.overhead_lat.squared_diffs,
+      bc_a.overhead_lat.squared_diffs,
+      0.0000001,
+    );
   });
 
   describe("when sensitiveInfo has data", () => {

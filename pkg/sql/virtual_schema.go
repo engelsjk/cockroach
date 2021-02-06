@@ -165,7 +165,8 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 		0, /* parentID */
 		parentSchemaID,
 		id,
-		startTime, /* creationTime */
+		descpb.InvalidID, /* regionEnumID */
+		startTime,        /* creationTime */
 		publicSelectPrivileges,
 		nil,                        /* affected */
 		nil,                        /* semaCtx */
@@ -176,11 +177,11 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 	if err != nil {
 		return mutDesc.TableDescriptor, err
 	}
-	for i := range mutDesc.Indexes {
-		idx := &mutDesc.Indexes[i]
-		if len(idx.ColumnIDs) > 1 {
+	for _, index := range mutDesc.PublicNonPrimaryIndexes() {
+		if index.NumColumns() > 1 {
 			panic("we don't know how to deal with virtual composite indexes yet")
 		}
+		idx := *index.IndexDesc()
 		// All indexes of virtual tables automatically STORE all other columns in
 		// the table.
 		idx.StoreColumnIDs = make([]descpb.ColumnID, len(mutDesc.Columns)-len(idx.ColumnIDs))
@@ -199,6 +200,7 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 			idx.StoreColumnNames[outputIdx] = mutDesc.Columns[j].Name
 			outputIdx++
 		}
+		mutDesc.SetPublicNonPrimaryIndex(index.Ordinal(), idx)
 	}
 	return mutDesc.TableDescriptor, nil
 }
@@ -351,7 +353,7 @@ func (v *virtualSchemaEntry) GetObjectByName(
 		// invalid input type like "notatype" will be parsed successfully as
 		// a ResolvableTypeReference, so the error here does not need to be
 		// intercepted and inspected.
-		typRef, err := parser.ParseType(name)
+		typRef, err := parser.GetTypeReferenceFromName(tree.Name(name))
 		if err != nil {
 			return nil, err
 		}
@@ -374,7 +376,7 @@ func (v *virtualSchemaEntry) GetObjectByName(
 
 type virtualDefEntry struct {
 	virtualDef                 virtualSchemaDef
-	desc                       *tabledesc.Immutable
+	desc                       catalog.TableDescriptor
 	comment                    string
 	validWithNoDatabaseContext bool
 }
@@ -425,9 +427,9 @@ func (e *virtualDefEntry) validateRow(datums tree.Datums, columns colinfo.Result
 		col := &columns[i]
 		datum := datums[i]
 		if datum == tree.DNull {
-			if !e.desc.Columns[i].Nullable {
+			if !e.desc.PublicColumns()[i].IsNullable() {
 				return errors.AssertionFailedf("column %s.%s not nullable, but found NULL value",
-					e.desc.Name, col.Name)
+					e.desc.GetName(), col.Name)
 			}
 		} else if !datum.ResolvedType().Equivalent(col.Typ) {
 			return errors.AssertionFailedf("datum column %q expected to be type %s; found type %s",
@@ -447,11 +449,10 @@ func (e *virtualDefEntry) getPlanInfo(
 	idxConstraint *constraint.Constraint,
 ) (colinfo.ResultColumns, virtualTableConstructor) {
 	var columns colinfo.ResultColumns
-	for i := range e.desc.Columns {
-		col := &e.desc.Columns[i]
+	for _, col := range e.desc.PublicColumns() {
 		columns = append(columns, colinfo.ResultColumn{
-			Name:           col.Name,
-			Typ:            col.Type,
+			Name:           col.GetName(),
+			Typ:            col.GetType(),
 			TableID:        table.GetID(),
 			PGAttributeNum: col.GetPGAttributeNum(),
 		})
@@ -459,15 +460,15 @@ func (e *virtualDefEntry) getPlanInfo(
 
 	constructor := func(ctx context.Context, p *planner, dbName string) (planNode, error) {
 		var dbDesc *dbdesc.Immutable
+		var err error
 		if dbName != "" {
-			dbDescI, err := p.LogicalSchemaAccessor().GetDatabaseDesc(ctx, p.txn, p.ExecCfg().Codec,
+			_, dbDesc, err = p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
 				dbName, tree.DatabaseLookupFlags{
 					Required: true, AvoidCached: p.avoidCachedDescriptors,
 				})
 			if err != nil {
 				return nil, err
 			}
-			dbDesc = dbDescI.(*dbdesc.Immutable)
 		} else {
 			if !e.validWithNoDatabaseContext {
 				return nil, errInvalidDbPrefix
@@ -505,11 +506,11 @@ func (e *virtualDefEntry) getPlanInfo(
 
 			if index.ID == 1 {
 				return nil, errors.AssertionFailedf(
-					"programming error: can't constrain scan on primary virtual index of table %s", e.desc.Name)
+					"programming error: can't constrain scan on primary virtual index of table %s", e.desc.GetName())
 			}
 
 			// Figure out the ordinal position of the column that we're filtering on.
-			columnIdxMap := table.ColumnIdxMap()
+			columnIdxMap := catalog.ColumnIDToOrdinalMap(table.PublicColumns())
 			indexKeyDatums := make([]tree.Datum, len(index.ColumnIDs))
 
 			generator, cleanup := setupGenerator(ctx, e.makeConstrainedRowsGenerator(
@@ -735,7 +736,7 @@ func (vs *VirtualSchemaHolder) getVirtualTableEntryByID(id descpb.ID) (*virtualD
 
 // VirtualTabler is used to fetch descriptors for virtual tables and databases.
 type VirtualTabler interface {
-	getVirtualTableDesc(tn *tree.TableName) (*tabledesc.Immutable, error)
+	getVirtualTableDesc(tn *tree.TableName) (catalog.TableDescriptor, error)
 	getVirtualSchemaEntry(name string) (*virtualSchemaEntry, bool)
 	getVirtualTableEntry(tn *tree.TableName) (*virtualDefEntry, error)
 	getVirtualTableEntryByID(id descpb.ID) (*virtualDefEntry, error)
@@ -748,7 +749,7 @@ type VirtualTabler interface {
 // getVirtualTableDesc is part of the VirtualTabler interface.
 func (vs *VirtualSchemaHolder) getVirtualTableDesc(
 	tn *tree.TableName,
-) (*tabledesc.Immutable, error) {
+) (catalog.TableDescriptor, error) {
 	t, err := vs.getVirtualTableEntry(tn)
 	if err != nil || t == nil {
 		return nil, err

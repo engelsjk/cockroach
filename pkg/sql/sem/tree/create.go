@@ -25,10 +25,12 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/errors"
@@ -185,12 +187,12 @@ type CreateIndex struct {
 	Sharded     *ShardedIndexDef
 	// Extra columns to be stored together with the indexed ones as an optimization
 	// for improved reading performance.
-	Storing       NameList
-	Interleave    *InterleaveDef
-	PartitionBy   *PartitionBy
-	StorageParams StorageParams
-	Predicate     Expr
-	Concurrently  bool
+	Storing          NameList
+	Interleave       *InterleaveDef
+	PartitionByIndex *PartitionByIndex
+	StorageParams    StorageParams
+	Predicate        Expr
+	Concurrently     bool
 }
 
 // Format implements the NodeFormatter interface.
@@ -237,8 +239,8 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 	if node.Interleave != nil {
 		ctx.FormatNode(node.Interleave)
 	}
-	if node.PartitionBy != nil {
-		ctx.FormatNode(node.PartitionBy)
+	if node.PartitionByIndex != nil {
+		ctx.FormatNode(node.PartitionByIndex)
 	}
 	if node.StorageParams != nil {
 		ctx.WriteString(" WITH (")
@@ -309,6 +311,8 @@ type CreateType struct {
 	Variety  CreateTypeVariety
 	// EnumLabels is set when this represents a CREATE TYPE ... AS ENUM statement.
 	EnumLabels EnumValueList
+	// IfNotExists is true if IF NOT EXISTS was requested.
+	IfNotExists bool
 }
 
 var _ Statement = &CreateType{}
@@ -316,6 +320,9 @@ var _ Statement = &CreateType{}
 // Format implements the NodeFormatter interface.
 func (node *CreateType) Format(ctx *FmtCtx) {
 	ctx.WriteString("CREATE TYPE ")
+	if node.IfNotExists {
+		ctx.WriteString("IF NOT EXISTS ")
+	}
 	ctx.FormatNode(node.TypeName)
 	ctx.WriteString(" ")
 	switch node.Variety {
@@ -376,6 +383,7 @@ type ColumnTableDef struct {
 	Name     Name
 	Type     ResolvableTypeReference
 	IsSerial bool
+	Hidden   bool
 	Nullable struct {
 		Nullability    Nullability
 		ConstraintName Name
@@ -405,6 +413,7 @@ type ColumnTableDef struct {
 	Computed struct {
 		Computed bool
 		Expr     Expr
+		Virtual  bool
 	}
 	Family struct {
 		Name        Name
@@ -487,6 +496,8 @@ func NewColumnTableDef(
 			}
 			d.DefaultExpr.Expr = t.Expr
 			d.DefaultExpr.ConstraintName = c.Name
+		case HiddenConstraint:
+			d.Hidden = true
 		case NotNullConstraint:
 			if d.Nullable.Nullability == Null {
 				return nil, pgerror.Newf(pgcode.Syntax,
@@ -532,6 +543,7 @@ func NewColumnTableDef(
 		case *ColumnComputedDef:
 			d.Computed.Computed = true
 			d.Computed.Expr = t.Expr
+			d.Computed.Virtual = t.Virtual
 		case *ColumnFamilyConstraint:
 			if d.HasColumnFamily() {
 				return nil, pgerror.Newf(pgcode.InvalidTableDefinition,
@@ -562,6 +574,11 @@ func (node *ColumnTableDef) IsComputed() bool {
 	return node.Computed.Computed
 }
 
+// IsVirtual returns if the ColumnTableDef is a virtual column.
+func (node *ColumnTableDef) IsVirtual() bool {
+	return node.Computed.Virtual
+}
+
 // HasColumnFamily returns if the ColumnTableDef has a column family.
 func (node *ColumnTableDef) HasColumnFamily() bool {
 	return node.Family.Name != "" || node.Family.Create
@@ -581,6 +598,9 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	if node.Nullable.Nullability != SilentNull && node.Nullable.ConstraintName != "" {
 		ctx.WriteString(" CONSTRAINT ")
 		ctx.FormatNode(&node.Nullable.ConstraintName)
+	}
+	if node.Hidden {
+		ctx.WriteString(" NOT VISIBLE")
 	}
 	switch node.Nullable.Nullability {
 	case Null:
@@ -644,7 +664,11 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	if node.IsComputed() {
 		ctx.WriteString(" AS (")
 		ctx.FormatNode(node.Computed.Expr)
-		ctx.WriteString(") STORED")
+		if node.Computed.Virtual {
+			ctx.WriteString(") VIRTUAL")
+		} else {
+			ctx.WriteString(") STORED")
+		}
 	}
 	if node.HasColumnFamily() {
 		if node.Family.Create {
@@ -696,6 +720,7 @@ func (ColumnCollation) columnQualification()             {}
 func (*ColumnDefault) columnQualification()              {}
 func (NotNullConstraint) columnQualification()           {}
 func (NullConstraint) columnQualification()              {}
+func (HiddenConstraint) columnQualification()            {}
 func (PrimaryKeyConstraint) columnQualification()        {}
 func (ShardedPrimaryKeyConstraint) columnQualification() {}
 func (UniqueConstraint) columnQualification()            {}
@@ -717,6 +742,9 @@ type NotNullConstraint struct{}
 
 // NullConstraint represents NULL on a column.
 type NullConstraint struct{}
+
+// HiddenConstraint represents HIDDEN on a column.
+type HiddenConstraint struct{}
 
 // PrimaryKeyConstraint represents PRIMARY KEY on a column.
 type PrimaryKeyConstraint struct{}
@@ -748,7 +776,8 @@ type ColumnFKConstraint struct {
 
 // ColumnComputedDef represents the description of a computed column.
 type ColumnComputedDef struct {
-	Expr Expr
+	Expr    Expr
+	Virtual bool
 }
 
 // ColumnFamilyConstraint represents FAMILY on a column.
@@ -761,15 +790,15 @@ type ColumnFamilyConstraint struct {
 // IndexTableDef represents an index definition within a CREATE TABLE
 // statement.
 type IndexTableDef struct {
-	Name          Name
-	Columns       IndexElemList
-	Sharded       *ShardedIndexDef
-	Storing       NameList
-	Interleave    *InterleaveDef
-	Inverted      bool
-	PartitionBy   *PartitionBy
-	StorageParams StorageParams
-	Predicate     Expr
+	Name             Name
+	Columns          IndexElemList
+	Sharded          *ShardedIndexDef
+	Storing          NameList
+	Interleave       *InterleaveDef
+	Inverted         bool
+	PartitionByIndex *PartitionByIndex
+	StorageParams    StorageParams
+	Predicate        Expr
 }
 
 // Format implements the NodeFormatter interface.
@@ -796,8 +825,8 @@ func (node *IndexTableDef) Format(ctx *FmtCtx) {
 	if node.Interleave != nil {
 		ctx.FormatNode(node.Interleave)
 	}
-	if node.PartitionBy != nil {
-		ctx.FormatNode(node.PartitionBy)
+	if node.PartitionByIndex != nil {
+		ctx.FormatNode(node.PartitionByIndex)
 	}
 	if node.StorageParams != nil {
 		ctx.WriteString(" WITH (")
@@ -868,8 +897,8 @@ func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 	if node.Interleave != nil {
 		ctx.FormatNode(node.Interleave)
 	}
-	if node.PartitionBy != nil {
-		ctx.FormatNode(node.PartitionBy)
+	if node.PartitionByIndex != nil {
+		ctx.FormatNode(node.PartitionByIndex)
 	}
 	if node.Predicate != nil {
 		ctx.WriteString(" WHERE ")
@@ -1078,8 +1107,63 @@ const (
 	PartitionByRange PartitionByType = "RANGE"
 )
 
+// PartitionByIndex represents a PARTITION BY definition within
+// a CREATE/ALTER INDEX statement.
+type PartitionByIndex struct {
+	*PartitionBy
+}
+
+// ContainsPartitions determines if the partition by table contains
+// a partition clause which is not PARTITION BY NOTHING.
+func (node *PartitionByIndex) ContainsPartitions() bool {
+	return node != nil && node.PartitionBy != nil
+}
+
+// ContainsPartitioningClause determines if the partition by table contains
+// a partitioning clause, including PARTITION BY NOTHING.
+func (node *PartitionByIndex) ContainsPartitioningClause() bool {
+	return node != nil
+}
+
+// PartitionByTable represents a PARTITION [ALL] BY definition within
+// a CREATE/ALTER TABLE statement.
+type PartitionByTable struct {
+	// All denotes PARTITION ALL BY.
+	All bool
+
+	*PartitionBy
+}
+
+// Format implements the NodeFormatter interface.
+func (node *PartitionByTable) Format(ctx *FmtCtx) {
+	if node == nil {
+		ctx.WriteString(` PARTITION BY NOTHING`)
+		return
+	}
+	ctx.WriteString(` PARTITION `)
+	if node.All {
+		ctx.WriteString(`ALL `)
+	}
+	ctx.WriteString(`BY `)
+	node.PartitionBy.formatListOrRange(ctx)
+}
+
+// ContainsPartitions determines if the partition by table contains
+// a partition clause which is not PARTITION BY NOTHING.
+func (node *PartitionByTable) ContainsPartitions() bool {
+	return node != nil && node.PartitionBy != nil
+}
+
+// ContainsPartitioningClause determines if the partition by table contains
+// a partitioning clause, including PARTITION BY NOTHING.
+func (node *PartitionByTable) ContainsPartitioningClause() bool {
+	return node != nil
+}
+
 // PartitionBy represents an PARTITION BY definition within a CREATE/ALTER
-// TABLE/INDEX statement.
+// TABLE/INDEX statement or within a subpartition statement.
+// This is wrapped by top level PartitionByTable/PartitionByIndex
+// structs for table and index definitions respectively.
 type PartitionBy struct {
 	Fields NameList
 	// Exactly one of List or Range is required to be non-empty.
@@ -1089,14 +1173,19 @@ type PartitionBy struct {
 
 // Format implements the NodeFormatter interface.
 func (node *PartitionBy) Format(ctx *FmtCtx) {
+	ctx.WriteString(` PARTITION BY `)
+	node.formatListOrRange(ctx)
+}
+
+func (node *PartitionBy) formatListOrRange(ctx *FmtCtx) {
 	if node == nil {
-		ctx.WriteString(` PARTITION BY NOTHING`)
+		ctx.WriteString(`NOTHING`)
 		return
 	}
 	if len(node.List) > 0 {
-		ctx.WriteString(` PARTITION BY LIST (`)
+		ctx.WriteString(`LIST (`)
 	} else if len(node.Range) > 0 {
-		ctx.WriteString(` PARTITION BY RANGE (`)
+		ctx.WriteString(`RANGE (`)
 	}
 	ctx.FormatNode(&node.Fields)
 	ctx.WriteString(`) (`)
@@ -1193,18 +1282,19 @@ const (
 
 // CreateTable represents a CREATE TABLE statement.
 type CreateTable struct {
-	IfNotExists   bool
-	Table         TableName
-	Interleave    *InterleaveDef
-	PartitionBy   *PartitionBy
-	Persistence   Persistence
-	StorageParams StorageParams
-	OnCommit      CreateTableOnCommitSetting
+	IfNotExists      bool
+	Table            TableName
+	Interleave       *InterleaveDef
+	PartitionByTable *PartitionByTable
+	Persistence      Persistence
+	StorageParams    StorageParams
+	OnCommit         CreateTableOnCommitSetting
 	// In CREATE...AS queries, Defs represents a list of ColumnTableDefs, one for
 	// each column, and a ConstraintTableDef for each constraint on a subset of
 	// these columns.
 	Defs     TableDefs
 	AsSource *Select
+	Locality *Locality
 }
 
 // As returns true if this table represents a CREATE TABLE ... AS statement,
@@ -1263,11 +1353,15 @@ func (node *CreateTable) FormatBody(ctx *FmtCtx) {
 		if node.Interleave != nil {
 			ctx.FormatNode(node.Interleave)
 		}
-		if node.PartitionBy != nil {
-			ctx.FormatNode(node.PartitionBy)
+		if node.PartitionByTable != nil {
+			ctx.FormatNode(node.PartitionByTable)
 		}
 		// No storage parameters are implemented, so we never list the storage
 		// parameters in the output format.
+		if node.Locality != nil {
+			ctx.WriteString(" ")
+			node.Locality.Format(ctx)
+		}
 	}
 }
 
@@ -1714,6 +1808,12 @@ type RefreshMaterializedView struct {
 	Name              *UnresolvedObjectName
 	Concurrently      bool
 	RefreshDataOption RefreshDataOption
+}
+
+// TelemetryCounter returns the telemetry counter to increment
+// when this command is used.
+func (node *RefreshMaterializedView) TelemetryCounter() telemetry.Counter {
+	return sqltelemetry.SchemaRefreshMaterializedView
 }
 
 // RefreshDataOption corresponds to arguments for the REFRESH MATERIALIZED VIEW

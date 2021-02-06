@@ -28,24 +28,17 @@ import (
 )
 
 // RecordingType is the type of recording that a Span might be performing.
-type RecordingType int
+type RecordingType int32
 
 const (
-	// NoRecording means that the Span isn't recording. Child spans created from
-	// it similarly won't be recording by default.
-	NoRecording RecordingType = iota
-	// SnowballRecording means that the Span is recording and that derived
-	// spans will be as well, in the same mode (this includes remote spans,
-	// i.e. this mode crosses RPC boundaries). Derived spans will maintain
-	// their own recording, and this recording will be included in that of
-	// any local parent spans.
-	SnowballRecording
-	// SingleNodeRecording means that the Span is recording and that locally
-	// derived spans will as well (i.e. a remote Span typically won't be
-	// recording by default, in contrast to SnowballRecording). Similar to
-	// SnowballRecording, children have their own recording which is also
-	// included in that of their parents.
-	SingleNodeRecording
+	// RecordingOff means that the Span discards all events handed to it.
+	// Child spans created from it similarly won't be recording by default.
+	RecordingOff RecordingType = iota
+	// RecordingVerbose means that the Span is adding events passed in via LogKV
+	// and LogData to its recording and that derived spans will do so as well.
+	RecordingVerbose
+
+	// TODO(tbg): add RecordingBackground for always-on tracing.
 )
 
 type traceLogData struct {

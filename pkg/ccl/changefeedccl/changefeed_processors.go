@@ -42,6 +42,7 @@ import (
 
 type changeAggregator struct {
 	execinfra.ProcessorBase
+	execinfra.StreamingProcessor
 
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.ChangeAggregatorSpec
@@ -138,7 +139,7 @@ func newChangeAggregatorProcessor(
 	}
 
 	var err error
-	if ca.encoder, err = getEncoder(ca.spec.Feed.Opts); err != nil {
+	if ca.encoder, err = getEncoder(ca.spec.Feed.Opts, ca.spec.Feed.Targets); err != nil {
 		return nil, err
 	}
 
@@ -154,16 +155,13 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 
 	spans, sf := ca.setupSpans()
 	timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf, initialInclusiveLowerBound: ca.spec.Feed.StatementTime}
-	nodeID, err := ca.flowCtx.EvalCtx.NodeID.OptionalNodeIDErr(48274)
-	if err != nil {
-		ca.MoveToDraining(err)
-		return ctx
-	}
 
-	if ca.sink, err = getSink(
-		ctx, ca.spec.Feed.SinkURI, nodeID, ca.spec.Feed.Opts, ca.spec.Feed.Targets,
+	var err error
+	ca.sink, err = getSink(
+		ctx, ca.spec.Feed.SinkURI, ca.flowCtx.EvalCtx.NodeID.SQLInstanceID(), ca.spec.Feed.Opts, ca.spec.Feed.Targets,
 		ca.flowCtx.Cfg.Settings, timestampOracle, ca.flowCtx.Cfg.ExternalStorageFromURI, ca.spec.User(),
-	); err != nil {
+	)
+	if err != nil {
 		err = MarkRetryableError(err)
 		// Early abort in the case that there is an error creating the sink.
 		ca.MoveToDraining(err)
@@ -407,6 +405,7 @@ const (
 
 type changeFrontier struct {
 	execinfra.ProcessorBase
+	execinfra.StreamingProcessor
 
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.ChangeFrontierSpec
@@ -521,7 +520,7 @@ func newChangeFrontierProcessor(
 	}
 
 	var err error
-	if cf.encoder, err = getEncoder(spec.Feed.Opts); err != nil {
+	if cf.encoder, err = getEncoder(spec.Feed.Opts, spec.Feed.Targets); err != nil {
 		return nil, err
 	}
 
@@ -536,18 +535,15 @@ func (cf *changeFrontier) Start(ctx context.Context) context.Context {
 	// early returns if errors are detected.
 	ctx = cf.StartInternal(ctx, changeFrontierProcName)
 
-	nodeID, err := cf.flowCtx.EvalCtx.NodeID.OptionalNodeIDErr(48274)
-	if err != nil {
-		cf.MoveToDraining(err)
-		return ctx
-	}
 	// Pass a nil oracle because this sink is only used to emit resolved timestamps
 	// but the oracle is only used when emitting row updates.
 	var nilOracle timestampLowerBoundOracle
-	if cf.sink, err = getSink(
-		ctx, cf.spec.Feed.SinkURI, nodeID, cf.spec.Feed.Opts, cf.spec.Feed.Targets,
+	var err error
+	cf.sink, err = getSink(
+		ctx, cf.spec.Feed.SinkURI, cf.flowCtx.EvalCtx.NodeID.SQLInstanceID(), cf.spec.Feed.Opts, cf.spec.Feed.Targets,
 		cf.flowCtx.Cfg.Settings, nilOracle, cf.flowCtx.Cfg.ExternalStorageFromURI, cf.spec.User(),
-	); err != nil {
+	)
+	if err != nil {
 		err = MarkRetryableError(err)
 		cf.MoveToDraining(err)
 		return ctx
@@ -853,7 +849,7 @@ func (cf *changeFrontier) maybeProtectTimestamp(
 
 	jobID := cf.spec.JobID
 	targets := cf.spec.Feed.Targets
-	return createProtectedTimestampRecord(ctx, pts, txn, jobID, targets, resolved, progress)
+	return createProtectedTimestampRecord(ctx, cf.flowCtx.Codec(), pts, txn, jobID, targets, resolved, progress)
 }
 
 func (cf *changeFrontier) maybeEmitResolved(newResolved hlc.Timestamp) error {

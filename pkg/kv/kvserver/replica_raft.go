@@ -77,6 +77,7 @@ func (r *Replica) evalAndPropose(
 	// If the request hit a server-side concurrency retry error, immediately
 	// proagate the error. Don't assume ownership of the concurrency guard.
 	if isConcurrencyRetryError(pErr) {
+		pErr = maybeAttachLease(pErr, lease)
 		return nil, nil, 0, pErr
 	}
 
@@ -264,12 +265,12 @@ func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pE
 		replID := r.ReplicaID()
 		for _, rDesc := range crt.Removed() {
 			if rDesc.ReplicaID == replID {
-				msg := fmt.Sprintf("received invalid ChangeReplicasTrigger %s to remove self (leaseholder)", crt)
-				log.Errorf(p.ctx, "%v", msg)
-				return 0, roachpb.NewErrorf("%s: %s", r, msg)
+				err := errors.Mark(errors.Newf("received invalid ChangeReplicasTrigger %s to remove self (leaseholder)", crt),
+					errMarkInvalidReplicationChange)
+				log.Errorf(p.ctx, "%v", err)
+				return 0, roachpb.NewError(err)
 			}
 		}
-
 	} else if p.command.ReplicatedEvalResult.AddSSTable != nil {
 		log.VEvent(p.ctx, 4, "sideloadable proposal detected")
 		version = raftVersionSideloaded
@@ -654,13 +655,10 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	r.sendRaftMessages(ctx, msgApps)
 
 	// Use a more efficient write-only batch because we don't need to do any
-	// reads from the batch. Any reads are performed via the "distinct" batch
-	// which passes the reads through to the underlying DB.
-	batch := r.store.Engine().NewWriteOnlyBatch()
+	// reads from the batch. Any reads are performed on the underlying DB.
+	batch := r.store.Engine().NewUnindexedBatch(false /* writeOnly */)
 	defer batch.Close()
 
-	// We know that all of the writes from here forward will be to distinct keys.
-	writer := batch.Distinct()
 	prevLastIndex := lastIndex
 	if len(rd.Entries) > 0 {
 		// All of the entries are appended to distinct keys, returning a new
@@ -672,7 +670,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		}
 		raftLogSize += sideLoadedEntriesSize
 		if lastIndex, lastTerm, raftLogSize, err = r.append(
-			ctx, writer, lastIndex, lastTerm, raftLogSize, thinEntries,
+			ctx, batch, lastIndex, lastTerm, raftLogSize, thinEntries,
 		); err != nil {
 			const expl = "during append"
 			return stats, expl, errors.Wrap(err, expl)
@@ -690,12 +688,11 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		//
 		// We have both in the same batch, so there's no problem. If that ever
 		// changes, we must write and sync the Entries before the HardState.
-		if err := r.raftMu.stateLoader.SetHardState(ctx, writer, rd.HardState); err != nil {
+		if err := r.raftMu.stateLoader.SetHardState(ctx, batch, rd.HardState); err != nil {
 			const expl = "during setHardState"
 			return stats, expl, errors.Wrap(err, expl)
 		}
 	}
-	writer.Close()
 	// Synchronously commit the batch with the Raft log entries and Raft hard
 	// state as we're promising not to lose this data.
 	//
@@ -759,7 +756,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	// queue. We might have been handed leadership by a remote node which wanted
 	// to remove itself from the range.
 	if becameLeader && r.store.replicateQueue != nil {
-		r.store.replicateQueue.MaybeAddAsync(ctx, r, r.store.Clock().Now())
+		r.store.replicateQueue.MaybeAddAsync(ctx, r, r.store.Clock().NowAsClockTimestamp())
 	}
 
 	// Update raft log entry cache. We clear any older, uncommitted log entries
@@ -1450,10 +1447,7 @@ func (r *Replica) withRaftGroup(
 }
 
 func shouldCampaignOnWake(
-	leaseStatus kvserverpb.LeaseStatus,
-	lease roachpb.Lease,
-	storeID roachpb.StoreID,
-	raftStatus raft.BasicStatus,
+	leaseStatus kvserverpb.LeaseStatus, storeID roachpb.StoreID, raftStatus raft.BasicStatus,
 ) bool {
 	// When waking up a range, campaign unless we know that another
 	// node holds a valid lease (this is most important after a split,
@@ -1461,7 +1455,7 @@ func shouldCampaignOnWake(
 	// time, with a lease pre-assigned to one of them). Note that
 	// thanks to PreVote, unnecessary campaigns are not disruptive so
 	// we should err on the side of campaigining here.
-	anotherOwnsLease := leaseStatus.State == kvserverpb.LeaseState_VALID && !lease.OwnedBy(storeID)
+	anotherOwnsLease := leaseStatus.IsValid() && !leaseStatus.OwnedBy(storeID)
 
 	// If we're already campaigning or know who the leader is, don't
 	// start a new term.
@@ -1480,9 +1474,9 @@ func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 		return
 	}
 
-	leaseStatus := r.leaseStatus(ctx, *r.mu.state.Lease, r.store.Clock().Now(), r.mu.minLeaseProposedTS)
+	leaseStatus := r.leaseStatusAtRLocked(ctx, r.store.Clock().NowAsClockTimestamp())
 	raftStatus := r.mu.internalRaftGroup.BasicStatus()
-	if shouldCampaignOnWake(leaseStatus, *r.mu.state.Lease, r.store.StoreID(), raftStatus) {
+	if shouldCampaignOnWake(leaseStatus, r.store.StoreID(), raftStatus) {
 		log.VEventf(ctx, 3, "campaigning")
 		if err := r.mu.internalRaftGroup.Campaign(); err != nil {
 			log.VEventf(ctx, 1, "failed to campaign: %s", err)
@@ -1672,6 +1666,7 @@ func handleTruncatedStateBelowRaft(
 	oldTruncatedState, newTruncatedState *roachpb.RaftTruncatedState,
 	loader stateloader.StateLoader,
 	readWriter storage.ReadWriter,
+	assertNoLegacy bool,
 ) (_apply bool, _ error) {
 	// If this is a log truncation, load the resulting unreplicated or legacy
 	// replicated truncated state (in that order). If the migration is happening
@@ -1684,6 +1679,10 @@ func handleTruncatedStateBelowRaft(
 	truncStatePostApply, truncStateIsLegacy, err := loader.LoadRaftTruncatedState(ctx, readWriter)
 	if err != nil {
 		return false, errors.Wrap(err, "loading truncated state")
+	}
+
+	if assertNoLegacy && truncStateIsLegacy {
+		log.Fatalf(ctx, "found legacy truncated state which should no longer exist")
 	}
 
 	// Truncate the Raft log from the entry after the previous
@@ -1800,7 +1799,7 @@ func maybeCampaignAfterConfChange(
 	// If the leader is no longer in the descriptor but we are the first voter,
 	// campaign.
 	_, leaderStillThere := desc.GetReplicaDescriptorByID(roachpb.ReplicaID(st.Lead))
-	if !leaderStillThere && storeID == desc.Replicas().Voters()[0].StoreID {
+	if !leaderStillThere && storeID == desc.Replicas().VoterDescriptors()[0].StoreID {
 		log.VEventf(ctx, 3, "leader got removed by conf change; campaigning")
 		_ = raftGroup.Campaign()
 	}

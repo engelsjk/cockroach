@@ -190,6 +190,8 @@ var AggregateOpReverseMap = map[Operator]string{
 	CountRowsOp:           "count_rows",
 	CovarPopOp:            "covar_pop",
 	CovarSampOp:           "covar_samp",
+	RegressionAvgXOp:      "regr_avgx",
+	RegressionAvgYOp:      "regr_avgy",
 	RegressionInterceptOp: "regr_intercept",
 	RegressionR2Op:        "regr_r2",
 	RegressionSlopeOp:     "regr_slope",
@@ -317,9 +319,9 @@ func AggregateIgnoresNulls(op Operator) bool {
 		ConstNotNullAggOp, CorrOp, CountOp, MaxOp, MinOp, SqrDiffOp, StdDevOp,
 		StringAggOp, SumOp, SumIntOp, VarianceOp, XorAggOp, PercentileDiscOp,
 		PercentileContOp, STMakeLineOp, STCollectOp, STExtentOp, STUnionOp, StdDevPopOp,
-		VarPopOp, CovarPopOp, CovarSampOp, RegressionInterceptOp, RegressionR2Op,
-		RegressionSlopeOp, RegressionSXXOp, RegressionSXYOp, RegressionSYYOp,
-		RegressionCountOp:
+		VarPopOp, CovarPopOp, CovarSampOp, RegressionAvgXOp, RegressionAvgYOp,
+		RegressionInterceptOp, RegressionR2Op, RegressionSlopeOp, RegressionSXXOp,
+		RegressionSXYOp, RegressionSYYOp, RegressionCountOp:
 		return true
 
 	case ArrayAggOp, ConcatAggOp, ConstAggOp, CountRowsOp, FirstAggOp, JsonAggOp,
@@ -343,8 +345,9 @@ func AggregateIsNullOnEmpty(op Operator) bool {
 		MaxOp, MinOp, SqrDiffOp, StdDevOp, STMakeLineOp, StringAggOp, SumOp, SumIntOp,
 		VarianceOp, XorAggOp, PercentileDiscOp, PercentileContOp,
 		JsonObjectAggOp, JsonbObjectAggOp, StdDevPopOp, STCollectOp, STExtentOp, STUnionOp,
-		VarPopOp, CovarPopOp, CovarSampOp, RegressionInterceptOp, RegressionR2Op,
-		RegressionSlopeOp, RegressionSXXOp, RegressionSXYOp, RegressionSYYOp:
+		VarPopOp, CovarPopOp, CovarSampOp, RegressionAvgXOp, RegressionAvgYOp,
+		RegressionInterceptOp, RegressionR2Op, RegressionSlopeOp, RegressionSXXOp,
+		RegressionSXYOp, RegressionSYYOp:
 		return true
 
 	case CountOp, CountRowsOp, RegressionCountOp:
@@ -371,8 +374,8 @@ func AggregateIsNeverNullOnNonNullInput(op Operator) bool {
 		JsonAggOp, JsonbAggOp, MaxOp, MinOp, SqrDiffOp, STMakeLineOp,
 		StringAggOp, SumOp, SumIntOp, XorAggOp, PercentileDiscOp, PercentileContOp,
 		JsonObjectAggOp, JsonbObjectAggOp, StdDevPopOp, STCollectOp, STExtentOp, STUnionOp,
-		VarPopOp, CovarPopOp, RegressionSXXOp, RegressionSXYOp, RegressionSYYOp,
-		RegressionCountOp:
+		VarPopOp, CovarPopOp, RegressionAvgXOp, RegressionAvgYOp, RegressionSXXOp,
+		RegressionSXYOp, RegressionSYYOp, RegressionCountOp:
 		return true
 
 	case VarianceOp, StdDevOp, CorrOp, CovarSampOp, RegressionInterceptOp,
@@ -397,9 +400,9 @@ func AggregateIsNeverNull(op Operator) bool {
 
 // AggregatesCanMerge returns true if the given inner and outer operators can be
 // replaced with a single equivalent operator, assuming the outer operator is
-// aggregating on the inner. In other words, the inner-outer aggregate pair
-// forms a valid "decomposition" of a single aggregate. For example, the
-// following pairs of queries are equivalent:
+// aggregating on the inner and that both operators are unordered. In other
+// words, the inner-outer aggregate pair forms a valid "decomposition" of a
+// single aggregate. For example, the following pairs of queries are equivalent:
 //
 //   SELECT sum(s) FROM (SELECT sum(y) FROM xy GROUP BY x) AS f(s);
 //   SELECT sum(y) FROM xy;
@@ -425,9 +428,9 @@ func AggregatesCanMerge(inner, outer Operator) bool {
 	case ArrayAggOp, AvgOp, ConcatAggOp, CorrOp, JsonAggOp, JsonbAggOp,
 		JsonObjectAggOp, JsonbObjectAggOp, PercentileContOp, PercentileDiscOp,
 		SqrDiffOp, STCollectOp, StdDevOp, StringAggOp, VarianceOp, StdDevPopOp,
-		VarPopOp, CovarPopOp, CovarSampOp, RegressionInterceptOp, RegressionR2Op,
-		RegressionSlopeOp, RegressionSXXOp, RegressionSXYOp, RegressionSYYOp,
-		RegressionCountOp:
+		VarPopOp, CovarPopOp, CovarSampOp, RegressionAvgXOp, RegressionAvgYOp,
+		RegressionInterceptOp, RegressionR2Op, RegressionSlopeOp, RegressionSXXOp,
+		RegressionSXYOp, RegressionSYYOp, RegressionCountOp:
 		return false
 
 	default:
@@ -447,8 +450,9 @@ func AggregateIgnoresDuplicates(op Operator) bool {
 		SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, JsonAggOp, JsonbAggOp,
 		StringAggOp, PercentileDiscOp, PercentileContOp, StdDevPopOp, STMakeLineOp,
 		VarPopOp, JsonObjectAggOp, JsonbObjectAggOp, STCollectOp, CovarPopOp,
-		CovarSampOp, RegressionInterceptOp, RegressionR2Op, RegressionSlopeOp,
-		RegressionSXXOp, RegressionSXYOp, RegressionSYYOp, RegressionCountOp:
+		CovarSampOp, RegressionAvgXOp, RegressionAvgYOp, RegressionInterceptOp,
+		RegressionR2Op, RegressionSlopeOp, RegressionSXXOp, RegressionSXYOp,
+		RegressionSYYOp, RegressionCountOp:
 		return false
 
 	default:

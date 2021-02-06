@@ -16,9 +16,9 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
-// SafeMessage makes Immutable a SafeMessager.
-func (desc *Immutable) SafeMessage() string {
-	return formatSafeTableDesc("tabledesc.Immutable", desc)
+// SafeMessage makes immutable a SafeMessager.
+func (desc *immutable) SafeMessage() string {
+	return formatSafeTableDesc("tabledesc.immutable", desc)
 }
 
 // SafeMessage makes Mutable a SafeMessager.
@@ -107,15 +107,16 @@ func formatSafeColumn(
 }
 
 func formatSafeTableIndexes(w *redact.StringBuilder, desc catalog.TableDescriptor) {
-	td := desc.TableDesc()
-	w.Printf(", PrimaryIndex: %d", td.PrimaryIndex.ID)
-	w.Printf(", NextIndexID: %d", td.NextIndexID)
+	w.Printf(", PrimaryIndex: %d", desc.GetPrimaryIndexID())
+	w.Printf(", NextIndexID: %d", desc.GetNextIndexID())
 	w.Printf(", Indexes: [")
-	formatSafeIndex(w, &td.PrimaryIndex, nil)
-	for i := range td.Indexes {
-		w.Printf(", ")
-		formatSafeIndex(w, &td.Indexes[i], nil)
-	}
+	_ = catalog.ForEachActiveIndex(desc, func(idx catalog.Index) error {
+		if !idx.Primary() {
+			w.Printf(", ")
+		}
+		formatSafeIndex(w, idx.IndexDesc(), nil)
+		return nil
+	})
 	w.Printf("]")
 }
 
@@ -175,6 +176,7 @@ func formatSafeIndex(
 func formatSafeTableConstraints(w *redact.StringBuilder, desc catalog.TableDescriptor) {
 	td := desc.TableDesc()
 	formatSafeTableChecks(w, td.Checks)
+	formatSafeTableUniqueWithoutIndexConstraints(w, td.UniqueWithoutIndexConstraints)
 	formatSafeTableFKs(w, "InboundFKs", td.InboundFKs)
 	formatSafeTableFKs(w, "OutboundFKs", td.OutboundFKs)
 }
@@ -228,6 +230,23 @@ func formatSafeTableChecks(
 	}
 }
 
+func formatSafeTableUniqueWithoutIndexConstraints(
+	w *redact.StringBuilder, constraints []descpb.UniqueWithoutIndexConstraint,
+) {
+	for i := range constraints {
+		c := &constraints[i]
+		if i == 0 {
+			w.Printf(", Unique Without Index Constraints: [")
+		} else {
+			w.Printf(", ")
+		}
+		formatSafeUniqueWithoutIndexConstraint(w, c, nil)
+	}
+	if len(constraints) > 0 {
+		w.Printf("]")
+	}
+}
+
 func formatSafeTableColumnFamilies(w *redact.StringBuilder, desc catalog.TableDescriptor) {
 	td := desc.TableDesc()
 	w.Printf(", NextFamilyID: %d", td.NextFamilyID)
@@ -267,7 +286,7 @@ func formatSafeTableMutationJobs(w *redact.StringBuilder, td catalog.TableDescri
 }
 
 func formatSafeMutations(w *redact.StringBuilder, td catalog.TableDescriptor) {
-	mutations := td.TableDesc().Mutations
+	mutations := td.GetMutations()
 	for i := range mutations {
 		w.Printf(", ")
 		m := &mutations[i]
@@ -347,6 +366,21 @@ func formatSafeCheck(
 	if c.Hidden {
 		w.Printf(", Hidden: true")
 	}
+	if m != nil {
+		w.Printf(", State: %s, MutationID: %d", m.Direction, m.MutationID)
+	}
+	w.Printf("}")
+}
+
+func formatSafeUniqueWithoutIndexConstraint(
+	w *redact.StringBuilder, c *descpb.UniqueWithoutIndexConstraint, m *descpb.DescriptorMutation,
+) {
+	// TODO(ajwerner): expose OID hashing to get the OID for the
+	// constraint.
+	w.Printf("{TableID: %d", c.TableID)
+	w.Printf(", Columns: ")
+	formatSafeColumnIDs(w, c.ColumnIDs)
+	w.Printf(", Validity: %s", c.Validity.String())
 	if m != nil {
 		w.Printf(", State: %s, MutationID: %d", m.Direction, m.MutationID)
 	}

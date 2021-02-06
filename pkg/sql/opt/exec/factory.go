@@ -14,12 +14,13 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/optional"
 )
 
 // Node represents a node in the execution tree
@@ -40,7 +41,7 @@ type ScanParams struct {
 	// At most one of IndexConstraint or InvertedConstraint is non-nil, depending
 	// on the index type.
 	IndexConstraint    *constraint.Constraint
-	InvertedConstraint invertedexpr.InvertedSpans
+	InvertedConstraint inverted.Spans
 
 	// If non-zero, the scan returns this many rows.
 	HardLimit int64
@@ -296,7 +297,10 @@ type EstimatedStats struct {
 // TODO(radu): can/should we just use execinfrapb.ComponentStats instead?
 type ExecutionStats struct {
 	// RowCount is the number of rows produced by the operator.
-	RowCount uint64
+	RowCount optional.Uint
+
+	KVBytesRead optional.Uint
+	KVRowsRead  optional.Uint
 }
 
 // BuildPlanForExplainFn builds an execution plan against the given

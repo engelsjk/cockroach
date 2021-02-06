@@ -11,51 +11,53 @@ CREATE TABLE crdb_internal.t (x INT)
 query error database "crdb_internal" does not exist
 DROP DATABASE crdb_internal
 
-query TTTTI
+query TTTTIT
 SHOW TABLES FROM crdb_internal
 ----
-crdb_internal  backward_dependencies        table  NULL  NULL
-crdb_internal  builtin_functions            table  NULL  NULL
-crdb_internal  cluster_queries              table  NULL  NULL
-crdb_internal  cluster_sessions             table  NULL  NULL
-crdb_internal  cluster_settings             table  NULL  NULL
-crdb_internal  cluster_transactions         table  NULL  NULL
-crdb_internal  create_statements            table  NULL  NULL
-crdb_internal  create_type_statements       table  NULL  NULL
-crdb_internal  databases                    table  NULL  NULL
-crdb_internal  feature_usage                table  NULL  NULL
-crdb_internal  forward_dependencies         table  NULL  NULL
-crdb_internal  gossip_alerts                table  NULL  NULL
-crdb_internal  gossip_liveness              table  NULL  NULL
-crdb_internal  gossip_network               table  NULL  NULL
-crdb_internal  gossip_nodes                 table  NULL  NULL
-crdb_internal  index_columns                table  NULL  NULL
-crdb_internal  invalid_objects              table  NULL  NULL
-crdb_internal  jobs                         table  NULL  NULL
-crdb_internal  kv_node_status               table  NULL  NULL
-crdb_internal  kv_store_status              table  NULL  NULL
-crdb_internal  leases                       table  NULL  NULL
-crdb_internal  node_build_info              table  NULL  NULL
-crdb_internal  node_metrics                 table  NULL  NULL
-crdb_internal  node_queries                 table  NULL  NULL
-crdb_internal  node_runtime_info            table  NULL  NULL
-crdb_internal  node_sessions                table  NULL  NULL
-crdb_internal  node_statement_statistics    table  NULL  NULL
-crdb_internal  node_transaction_statistics  table  NULL  NULL
-crdb_internal  node_transactions            table  NULL  NULL
-crdb_internal  node_txn_stats               table  NULL  NULL
-crdb_internal  partitions                   table  NULL  NULL
-crdb_internal  predefined_comments          table  NULL  NULL
-crdb_internal  ranges                       view   NULL  NULL
-crdb_internal  ranges_no_leases             table  NULL  NULL
-crdb_internal  schema_changes               table  NULL  NULL
-crdb_internal  session_trace                table  NULL  NULL
-crdb_internal  session_variables            table  NULL  NULL
-crdb_internal  table_columns                table  NULL  NULL
-crdb_internal  table_indexes                table  NULL  NULL
-crdb_internal  table_row_statistics         table  NULL  NULL
-crdb_internal  tables                       table  NULL  NULL
-crdb_internal  zones                        table  NULL  NULL
+crdb_internal  backward_dependencies        table  NULL  NULL  NULL
+crdb_internal  builtin_functions            table  NULL  NULL  NULL
+crdb_internal  cluster_database_privileges  table  NULL  NULL  NULL
+crdb_internal  cluster_queries              table  NULL  NULL  NULL
+crdb_internal  cluster_sessions             table  NULL  NULL  NULL
+crdb_internal  cluster_settings             table  NULL  NULL  NULL
+crdb_internal  cluster_transactions         table  NULL  NULL  NULL
+crdb_internal  create_statements            table  NULL  NULL  NULL
+crdb_internal  create_type_statements       table  NULL  NULL  NULL
+crdb_internal  databases                    table  NULL  NULL  NULL
+crdb_internal  feature_usage                table  NULL  NULL  NULL
+crdb_internal  forward_dependencies         table  NULL  NULL  NULL
+crdb_internal  gossip_alerts                table  NULL  NULL  NULL
+crdb_internal  gossip_liveness              table  NULL  NULL  NULL
+crdb_internal  gossip_network               table  NULL  NULL  NULL
+crdb_internal  gossip_nodes                 table  NULL  NULL  NULL
+crdb_internal  index_columns                table  NULL  NULL  NULL
+crdb_internal  invalid_objects              table  NULL  NULL  NULL
+crdb_internal  jobs                         table  NULL  NULL  NULL
+crdb_internal  kv_node_status               table  NULL  NULL  NULL
+crdb_internal  kv_store_status              table  NULL  NULL  NULL
+crdb_internal  leases                       table  NULL  NULL  NULL
+crdb_internal  node_build_info              table  NULL  NULL  NULL
+crdb_internal  node_inflight_trace_spans    table  NULL  NULL  NULL
+crdb_internal  node_metrics                 table  NULL  NULL  NULL
+crdb_internal  node_queries                 table  NULL  NULL  NULL
+crdb_internal  node_runtime_info            table  NULL  NULL  NULL
+crdb_internal  node_sessions                table  NULL  NULL  NULL
+crdb_internal  node_statement_statistics    table  NULL  NULL  NULL
+crdb_internal  node_transaction_statistics  table  NULL  NULL  NULL
+crdb_internal  node_transactions            table  NULL  NULL  NULL
+crdb_internal  node_txn_stats               table  NULL  NULL  NULL
+crdb_internal  partitions                   table  NULL  NULL  NULL
+crdb_internal  predefined_comments          table  NULL  NULL  NULL
+crdb_internal  ranges                       view   NULL  NULL  NULL
+crdb_internal  ranges_no_leases             table  NULL  NULL  NULL
+crdb_internal  schema_changes               table  NULL  NULL  NULL
+crdb_internal  session_trace                table  NULL  NULL  NULL
+crdb_internal  session_variables            table  NULL  NULL  NULL
+crdb_internal  table_columns                table  NULL  NULL  NULL
+crdb_internal  table_indexes                table  NULL  NULL  NULL
+crdb_internal  table_row_statistics         table  NULL  NULL  NULL
+crdb_internal  tables                       table  NULL  NULL  NULL
+crdb_internal  zones                        table  NULL  NULL  NULL
 
 statement ok
 CREATE DATABASE testdb; CREATE TABLE testdb.foo(x INT)
@@ -227,10 +229,10 @@ SELECT * FROM crdb_internal.table_indexes WHERE descriptor_name = ''
 ----
 descriptor_id  descriptor_name  index_id  index_name  index_type  is_unique  is_inverted
 
-query ITITTITT colnames
+query ITITTITTB colnames
 SELECT * FROM crdb_internal.index_columns WHERE descriptor_name = ''
 ----
-descriptor_id  descriptor_name  index_id  index_name  column_type  column_id  column_name  column_direction
+descriptor_id  descriptor_name  index_id  index_name  column_type  column_id  column_name  column_direction  implicit
 
 query ITIIITITT colnames
 SELECT * FROM crdb_internal.backward_dependencies WHERE descriptor_name = ''
@@ -247,6 +249,11 @@ SELECT * FROM crdb_internal.zones WHERE false
 ----
 zone_id  subzone_id  target  range_name  database_name  table_name  index_name  partition_name
 raw_config_yaml  raw_config_sql  raw_config_protobuf full_config_yaml full_config_sql
+
+query IIIITTT colnames
+SELECT * FROM crdb_internal.node_inflight_trace_spans WHERE span_id < 0
+----
+trace_id  parent_span_id  span_id  goroutine_id  start_time  duration  operation
 
 query ITTTTTTTTTTTTI colnames
 SELECT * FROM crdb_internal.ranges WHERE range_id < 0
@@ -281,7 +288,7 @@ SELECT zone_id, target FROM crdb_internal.zones ORDER BY 1
 query T
 SELECT quote_literal(raw_config_yaml) FROM crdb_internal.zones WHERE zone_id = 0
 ----
-e'range_min_bytes: 134217728\nrange_max_bytes: 536870912\ngc:\n  ttlseconds: 90000\nnum_replicas: 3\nconstraints: []\nlease_preferences: []\n'
+e'range_min_bytes: 134217728\nrange_max_bytes: 536870912\ngc:\n  ttlseconds: 90000\nglobal_reads: null\nnum_replicas: 3\nnum_voters: null\nconstraints: []\nvoter_constraints: []\nlease_preferences: []\n'
 
 query T
 SELECT raw_config_sql FROM crdb_internal.zones WHERE zone_id = 0
@@ -346,11 +353,11 @@ SELECT node_id, network, regexp_replace(address, '\d+$', '<port>') as address, a
 node_id  network  address           attrs  locality            server_version
 1        tcp      127.0.0.1:<port>  []     region=test,dc=dc1  <server_version>
 
-query IITBBT colnames
-SELECT node_id, epoch, regexp_replace(expiration, '^\d+\.\d+,\d+$', '<timestamp>') as expiration, draining, decommissioning, membership FROM crdb_internal.gossip_liveness WHERE node_id = 1
+query ITTBBT colnames
+SELECT node_id, regexp_replace(epoch::string, '^\d+$', '<epoch>') as epoch, regexp_replace(expiration, '^\d+\.\d+,\d+$', '<timestamp>') as expiration, draining, decommissioning, membership FROM crdb_internal.gossip_liveness WHERE node_id = 1
 ----
 node_id  epoch  expiration    draining  decommissioning     membership
-1        1      <timestamp>   false     false               active
+1        <epoch>      <timestamp>   false     false               active
 
 query ITTTTTT colnames
 SELECT node_id, network, regexp_replace(address, '\d+$', '<port>') as address, attrs, locality, regexp_replace(server_version, '^\d+\.\d+(-\d+)?$', '<server_version>') as server_version, regexp_replace(go_version, '^go.+$', '<go_version>') as go_version
@@ -634,6 +641,32 @@ SELECT
 FROM
 	table41834;
 
+# Compact a range at this node, store.
+query II colnames
+SELECT node_id, store_id FROM crdb_internal.kv_store_status ORDER BY (node_id, store_id) LIMIT 1
+----
+node_id  store_id
+1        1
+
+# Do the compaction.
+query B colnames
+SELECT crdb_internal.compact_engine_span(1, 1, start_key, end_key)
+FROM crdb_internal.ranges_no_leases WHERE table_name = 'foo' LIMIT 1
+----
+crdb_internal.compact_engine_span
+true
+
+# Failed compaction due to unknown node.
+query error could not dial node ID 153
+SELECT crdb_internal.compact_engine_span(153, 1, decode('c08989', 'hex'), decode('c0898a', 'hex'))
+
+# Failed compaction due to unknown store.
+query error store 23 was not found
+SELECT crdb_internal.compact_engine_span(1, 23, decode('c08989', 'hex'), decode('c0898a', 'hex'))
+
+# Failed compaction due to invalid range.
+query error is not less than end
+SELECT crdb_internal.compact_engine_span(1, 1, decode('c0898a', 'hex'), decode('c08989', 'hex'))
 
 subtest builtin_is_admin
 
@@ -696,3 +729,84 @@ node_id  application_name     key                   statement_ids               
 1        test_txn_statistics  7134109142904971730   {14727561584397653517}                                            1
 1        test_txn_statistics  7134109142904971742   {14727561584397653505}                                            1
 1        test_txn_statistics  10166963080898232577  {2484845987516053214}                                             1
+
+## crdb_internal.cluster_database_privileges
+subtest cluster_database_privileges
+
+statement ok
+CREATE DATABASE other_db; SET DATABASE = other_db
+
+query TTT colnames
+SELECT * FROM crdb_internal.cluster_database_privileges
+----
+database_name  grantee  privilege_type
+other_db       admin    ALL
+other_db       root     ALL
+
+statement ok
+GRANT SELECT ON DATABASE other_db TO testuser;
+GRANT DROP ON DATABASE other_db TO testuser
+
+query TTT colnames
+SELECT * FROM crdb_internal.cluster_database_privileges
+----
+database_name  grantee   privilege_type
+other_db       admin     ALL
+other_db       root      ALL
+other_db       testuser  DROP
+other_db       testuser  SELECT
+
+statement ok
+SET DATABASE = test
+
+# crdb_internal can be used with the anonymous database.
+# It should show information across all databases.
+subtest anonymous_database
+
+query TTT colnames
+SELECT * FROM "".crdb_internal.cluster_database_privileges ORDER BY 1,2,3
+----
+database_name  grantee   privilege_type
+defaultdb      admin     ALL
+defaultdb      root      ALL
+other_db       admin     ALL
+other_db       root      ALL
+other_db       testuser  DROP
+other_db       testuser  SELECT
+postgres       admin     ALL
+postgres       root      ALL
+system         admin     GRANT
+system         admin     SELECT
+system         root      GRANT
+system         root      SELECT
+test           admin     ALL
+test           root      ALL
+testdb         admin     ALL
+testdb         root      ALL
+
+statement ok
+SET DATABASE = "";
+
+query TTT colnames
+SELECT * FROM crdb_internal.cluster_database_privileges ORDER BY 1,2,3
+----
+database_name  grantee   privilege_type
+defaultdb      admin     ALL
+defaultdb      root      ALL
+other_db       admin     ALL
+other_db       root      ALL
+other_db       testuser  DROP
+other_db       testuser  SELECT
+postgres       admin     ALL
+postgres       root      ALL
+system         admin     GRANT
+system         admin     SELECT
+system         root      GRANT
+system         root      SELECT
+test           admin     ALL
+test           root      ALL
+testdb         admin     ALL
+testdb         root      ALL
+
+statement ok
+SET DATABASE = test

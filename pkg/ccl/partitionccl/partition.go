@@ -97,17 +97,6 @@ func valueEncodePartitionTuple(
 		}
 
 		var semaCtx tree.SemaContext
-
-		// Disallow partitioning by user-defined types because it causes issues
-		// during table descriptor validation.
-		//
-		// TODO(ajwerner): Fix this limitation by reworking validation in the
-		// descs.Collection to operate on hydrated descriptors.
-		if cols[i].Type.UserDefined() {
-			return nil, errors.UnimplementedError(errors.IssueLink{
-				IssueURL: "https://github.com/cockroachdb/cockroach/issues/55342",
-			}, "partitioning by enum values is not supported")
-		}
 		typedExpr, err := schemaexpr.SanitizeVarFreeExpr(evalCtx.Context, expr, cols[i].Type, "partition",
 			&semaCtx,
 			tree.VolatilityImmutable,
@@ -164,6 +153,7 @@ func createPartitioningImpl(
 	tableDesc *tabledesc.Mutable,
 	indexDesc *descpb.IndexDescriptor,
 	partBy *tree.PartitionBy,
+	numImplicitColumns int,
 	colOffset int,
 ) (descpb.PartitioningDescriptor, error) {
 	partDesc := descpb.PartitioningDescriptor{}
@@ -171,6 +161,7 @@ func createPartitioningImpl(
 		return partDesc, nil
 	}
 	partDesc.NumColumns = uint32(len(partBy.Fields))
+	partDesc.NumImplicitColumns = uint32(numImplicitColumns)
 
 	partitioningString := func() string {
 		// We don't have the fields for our parent partitions handy, but we can use
@@ -192,12 +183,16 @@ func createPartitioningImpl(
 		}
 		// Search by name because some callsites of this method have not
 		// allocated ids yet (so they are still all the 0 value).
-		col, err := tableDesc.FindActiveColumnByName(indexDesc.ColumnNames[colOffset+i])
+		name := indexDesc.ColumnNames[colOffset+i]
+		col, err := tableDesc.FindColumnWithName(tree.Name(name))
 		if err != nil {
 			return partDesc, err
 		}
-		cols = append(cols, *col)
-		if string(partBy.Fields[i]) != col.Name {
+		if !col.Public() {
+			return partDesc, colinfo.NewUndefinedColumnError(name)
+		}
+		cols = append(cols, *col.ColumnDesc())
+		if string(partBy.Fields[i]) != col.GetName() {
 			// This used to print the first `colOffset + len(partBy.Fields)` fields
 			// but there might not be this many columns in the index. See #37682.
 			n := colOffset + i + 1
@@ -221,8 +216,14 @@ func createPartitioningImpl(
 		}
 		if l.Subpartition != nil {
 			newColOffset := colOffset + int(partDesc.NumColumns)
+			if numImplicitColumns > 0 {
+				return descpb.PartitioningDescriptor{}, unimplemented.New(
+					"PARTITION BY SUBPARTITION",
+					"implicit column partitioning on a subpartition is not yet supported",
+				)
+			}
 			subpartitioning, err := createPartitioningImpl(
-				ctx, evalCtx, tableDesc, indexDesc, l.Subpartition, newColOffset)
+				ctx, evalCtx, tableDesc, indexDesc, l.Subpartition, 0 /* implicitColumnNames */, newColOffset)
 			if err != nil {
 				return partDesc, err
 			}
@@ -255,6 +256,58 @@ func createPartitioningImpl(
 	return partDesc, nil
 }
 
+// detectImplicitPartitionColumns detects implicit partitioning columns
+// and returns a new index descriptor with the implicit columns modified
+// on the index descriptor and the number of implicit columns prepended.
+func detectImplicitPartitionColumns(
+	evalCtx *tree.EvalContext,
+	tableDesc *tabledesc.Mutable,
+	indexDesc descpb.IndexDescriptor,
+	partBy *tree.PartitionBy,
+) (descpb.IndexDescriptor, int, error) {
+	if !evalCtx.SessionData.ImplicitColumnPartitioningEnabled {
+		return indexDesc, 0, nil
+	}
+	seenImplicitColumnNames := map[string]struct{}{}
+	var implicitColumnIDs []descpb.ColumnID
+	var implicitColumns []string
+	var implicitColumnDirections []descpb.IndexDescriptor_Direction
+	// Iterate over each field in the PARTITION BY until it matches the start
+	// of the actual explicitly indexed columns.
+	for _, field := range partBy.Fields {
+		// As soon as the fields match, we have no implicit columns to add.
+		if string(field) == indexDesc.ColumnNames[0] {
+			break
+		}
+
+		col, err := tableDesc.FindColumnWithName(field)
+		if err != nil {
+			return indexDesc, 0, err
+		}
+		if !col.Public() {
+			return indexDesc, 0, colinfo.NewUndefinedColumnError(string(field))
+		}
+		if _, ok := seenImplicitColumnNames[col.GetName()]; ok {
+			return indexDesc, 0, pgerror.Newf(
+				pgcode.InvalidObjectDefinition,
+				`found multiple definitions in partition using column "%s"`,
+				col.GetName(),
+			)
+		}
+		seenImplicitColumnNames[col.GetName()] = struct{}{}
+		implicitColumns = append(implicitColumns, col.GetName())
+		implicitColumnIDs = append(implicitColumnIDs, col.GetID())
+		implicitColumnDirections = append(implicitColumnDirections, descpb.IndexDescriptor_ASC)
+	}
+
+	if len(implicitColumns) > 0 {
+		indexDesc.ColumnNames = append(implicitColumns, indexDesc.ColumnNames...)
+		indexDesc.ColumnIDs = append(implicitColumnIDs, indexDesc.ColumnIDs...)
+		indexDesc.ColumnDirections = append(implicitColumnDirections, indexDesc.ColumnDirections...)
+	}
+	return indexDesc, len(implicitColumns), nil
+}
+
 // createPartitioning constructs the partitioning descriptor for an index that
 // is partitioned into ranges, each addressable by zone configs.
 func createPartitioning(
@@ -262,16 +315,35 @@ func createPartitioning(
 	st *cluster.Settings,
 	evalCtx *tree.EvalContext,
 	tableDesc *tabledesc.Mutable,
-	indexDesc *descpb.IndexDescriptor,
+	indexDesc descpb.IndexDescriptor,
 	partBy *tree.PartitionBy,
-) (descpb.PartitioningDescriptor, error) {
+) (descpb.IndexDescriptor, error) {
 	org := sql.ClusterOrganization.Get(&st.SV)
 	if err := utilccl.CheckEnterpriseEnabled(st, evalCtx.ClusterID, org, "partitions"); err != nil {
-		return descpb.PartitioningDescriptor{}, err
+		return indexDesc, err
 	}
 
-	return createPartitioningImpl(
-		ctx, evalCtx, tableDesc, indexDesc, partBy, 0 /* colOffset */)
+	var numImplicitColumns int
+	var err error
+	indexDesc, numImplicitColumns, err = detectImplicitPartitionColumns(evalCtx, tableDesc, indexDesc, partBy)
+	if err != nil {
+		return indexDesc, err
+	}
+
+	partitioning, err := createPartitioningImpl(
+		ctx,
+		evalCtx,
+		tableDesc,
+		&indexDesc,
+		partBy,
+		numImplicitColumns,
+		0, /* colOffset */
+	)
+	if err != nil {
+		return indexDesc, err
+	}
+	indexDesc.Partitioning = partitioning
+	return indexDesc, err
 }
 
 // selectPartitionExprs constructs an expression for selecting all rows in the
@@ -286,12 +358,11 @@ func selectPartitionExprs(
 
 	a := &rowenc.DatumAlloc{}
 	var prefixDatums []tree.Datum
-	if err := tableDesc.ForeachIndex(catalog.IndexOpts{
+	if err := catalog.ForEachIndex(tableDesc, catalog.IndexOpts{
 		AddMutations: true,
-	}, func(idxDesc *descpb.IndexDescriptor, _ bool) error {
-		genExpr := true
+	}, func(idx catalog.Index) error {
 		return selectPartitionExprsByName(
-			a, evalCtx, tableDesc, idxDesc, &idxDesc.Partitioning, prefixDatums, exprsByPartName, genExpr)
+			a, evalCtx, tableDesc, idx.IndexDesc(), &idx.IndexDesc().Partitioning, prefixDatums, exprsByPartName, true /* genExpr */)
 	}); err != nil {
 		return nil, err
 	}
@@ -314,11 +385,11 @@ func selectPartitionExprs(
 	// dummy IndexVars. Swap them out for actual column references.
 	finalExpr, err := tree.SimpleVisit(expr, func(e tree.Expr) (recurse bool, newExpr tree.Expr, _ error) {
 		if ivar, ok := e.(*tree.IndexedVar); ok {
-			col, err := tableDesc.FindColumnByID(descpb.ColumnID(ivar.Idx))
+			col, err := tableDesc.FindColumnWithID(descpb.ColumnID(ivar.Idx))
 			if err != nil {
 				return false, nil, err
 			}
-			return false, &tree.ColumnItem{ColumnName: tree.Name(col.Name)}, nil
+			return false, &tree.ColumnItem{ColumnName: tree.Name(col.GetName())}, nil
 		}
 		return true, e, nil
 	})
@@ -378,11 +449,11 @@ func selectPartitionExprsByName(
 		// the column ordinal references, so reconstruct them here.
 		colVars = make(tree.Exprs, len(prefixDatums)+int(partDesc.NumColumns))
 		for i := range colVars {
-			col, err := tableDesc.FindActiveColumnByID(idxDesc.ColumnIDs[i])
+			col, err := tabledesc.FindPublicColumnWithID(tableDesc, idxDesc.ColumnIDs[i])
 			if err != nil {
 				return err
 			}
-			colVars[i] = tree.NewTypedOrdinalReference(int(col.ID), col.Type)
+			colVars[i] = tree.NewTypedOrdinalReference(int(col.GetID()), col.GetType())
 		}
 	}
 

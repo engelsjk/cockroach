@@ -136,11 +136,80 @@ func TestAllocateIDs(t *testing.T) {
 		t.Fatalf("expected %s, but found %s", a, b)
 	}
 }
+func TestValidateDatabaseDesc(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testData := []struct {
+		err  string
+		desc *dbdesc.Immutable
+	}{
+		{`invalid database ID 0`,
+			dbdesc.NewImmutable(descpb.DatabaseDescriptor{
+				Name:       "db",
+				ID:         0,
+				Privileges: &descpb.PrivilegeDescriptor{},
+			}),
+		},
+		{
+			`region "us-east-1" seen twice on db 200`,
+			dbdesc.NewImmutable(descpb.DatabaseDescriptor{
+				Name: "multi-region-db",
+				ID:   200,
+				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
+					Regions: []descpb.DatabaseDescriptor_RegionConfig_Region{
+						{Name: "us-east-1"},
+						{Name: "us-east-1"},
+					},
+					PrimaryRegion: "us-east-1",
+				},
+				Privileges: &descpb.PrivilegeDescriptor{},
+			}),
+		},
+		{
+			`primary region unset on a multi-region db 200`,
+			dbdesc.NewImmutable(descpb.DatabaseDescriptor{
+				Name: "multi-region-db",
+				ID:   200,
+				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
+					Regions: []descpb.DatabaseDescriptor_RegionConfig_Region{
+						{Name: "us-east-1"},
+					},
+				},
+				Privileges: &descpb.PrivilegeDescriptor{},
+			}),
+		},
+		{
+			`primary region not found in list of regions on db 200`,
+			dbdesc.NewImmutable(descpb.DatabaseDescriptor{
+				Name: "multi-region-db",
+				ID:   200,
+				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
+					Regions: []descpb.DatabaseDescriptor_RegionConfig_Region{
+						{Name: "us-east-1"},
+					},
+					PrimaryRegion: "us-east-2",
+				},
+				Privileges: &descpb.PrivilegeDescriptor{},
+			}),
+		},
+	}
+	for i, d := range testData {
+		t.Run(d.err, func(t *testing.T) {
+			if err := d.desc.Validate(); err == nil {
+				t.Errorf("%d: expected \"%s\", but found success: %+v", i, d.err, d.desc)
+			} else if d.err != err.Error() && "internal error: "+d.err != err.Error() {
+				t.Errorf("%d: expected \"%s\", but found \"%+v\"", i, d.err, err)
+			}
+		})
+	}
+}
 
 func TestValidateTableDesc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
+
+	computedExpr := "1 + 1"
 
 	testData := []struct {
 		err  string
@@ -171,6 +240,18 @@ func TestValidateTableDesc(t *testing.T) {
 					{ID: 0},
 				},
 				NextColumnID: 2,
+			}},
+		{`virtual column "virt" is not computed`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+					{ID: 2, Name: "virt", Virtual: true},
+				},
+				NextColumnID: 3,
 			}},
 		{`invalid column ID 0`,
 			descpb.TableDescriptor{
@@ -340,7 +421,7 @@ func TestValidateTableDesc(t *testing.T) {
 				NextColumnID: 2,
 				NextFamilyID: 1,
 			}},
-		{`column 1 is not in any column family`,
+		{`column "bar" is not in any column family`,
 			descpb.TableDescriptor{
 				ID:            2,
 				ParentID:      1,
@@ -369,6 +450,23 @@ func TestValidateTableDesc(t *testing.T) {
 					{ID: 1, Name: "qux", ColumnIDs: []descpb.ColumnID{1}, ColumnNames: []string{"bar"}},
 				},
 				NextColumnID: 2,
+				NextFamilyID: 2,
+			}},
+		{`virtual computed column "virt" cannot be part of a family`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+					{ID: 2, Name: "virt", ComputeExpr: &computedExpr, Virtual: true},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "fam1", ColumnIDs: []descpb.ColumnID{1}, ColumnNames: []string{"bar"}},
+					{ID: 1, Name: "fam2", ColumnIDs: []descpb.ColumnID{2}, ColumnNames: []string{"virt"}},
+				},
+				NextColumnID: 3,
 				NextFamilyID: 2,
 			}},
 		{`table must contain a primary key`,
@@ -579,6 +677,35 @@ func TestValidateTableDesc(t *testing.T) {
 				NextFamilyID: 1,
 				NextIndexID:  2,
 			}},
+		{`mismatched STORING column IDs (1) and names (0)`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "c1"},
+					{ID: 2, Name: "c2"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{
+						ID:          0,
+						Name:        "fam",
+						ColumnIDs:   []descpb.ColumnID{1, 2},
+						ColumnNames: []string{"c1", "c2"},
+					},
+				},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID: 1, Name: "primary",
+					ColumnIDs:        []descpb.ColumnID{1},
+					ColumnNames:      []string{"c1"},
+					ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+					StoreColumnIDs:   []descpb.ColumnID{2},
+				},
+				NextColumnID: 3,
+				NextFamilyID: 1,
+				NextIndexID:  2,
+			}},
 		{`at least one of LIST or RANGE partitioning must be used`,
 			// Verify that validatePartitioning is hooked up. The rest of these
 			// tests are in TestValidatePartitionion.
@@ -645,11 +772,167 @@ func TestValidateTableDesc(t *testing.T) {
 				NextFamilyID: 1,
 				NextIndexID:  3,
 			}},
+		{`TableID mismatch for unique without index constraint "bar_unique": "1" doesn't match descriptor: "2"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1},
+						ColumnNames: []string{"bar"},
+					},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+				UniqueWithoutIndexConstraints: []descpb.UniqueWithoutIndexConstraint{
+					{
+						TableID:   1,
+						ColumnIDs: []descpb.ColumnID{1},
+						Name:      "bar_unique",
+					},
+				},
+			}},
+		{`column-id "2" does not exist`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1},
+						ColumnNames: []string{"bar"},
+					},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+				UniqueWithoutIndexConstraints: []descpb.UniqueWithoutIndexConstraint{
+					{
+						TableID:   2,
+						ColumnIDs: []descpb.ColumnID{1, 2},
+						Name:      "bar_unique",
+					},
+				},
+			}},
+		{`unique without index constraint "bar_unique" contains duplicate column "1"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1},
+						ColumnNames: []string{"bar"},
+					},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+				UniqueWithoutIndexConstraints: []descpb.UniqueWithoutIndexConstraint{
+					{
+						TableID:   2,
+						ColumnIDs: []descpb.ColumnID{1, 1},
+						Name:      "bar_unique",
+					},
+				},
+			}},
+		{`empty unique without index constraint name`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1},
+						ColumnNames: []string{"bar"},
+					},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+				UniqueWithoutIndexConstraints: []descpb.UniqueWithoutIndexConstraint{
+					{
+						TableID:   2,
+						ColumnIDs: []descpb.ColumnID{1},
+					},
+				},
+			}},
+		{`primary index column "v" cannot be virtual`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+					{ID: 2, Name: "v", ComputeExpr: &computedExpr, Virtual: true},
+				},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID:          1,
+					Name:        "primary",
+					Unique:      true,
+					ColumnIDs:   []descpb.ColumnID{1, 2},
+					ColumnNames: []string{"bar", "v"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1},
+						ColumnNames: []string{"bar"},
+					},
+				},
+				NextColumnID: 3,
+				NextFamilyID: 1,
+			}},
+		{`index "sec" cannot store virtual column "v"`,
+			descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.FamilyFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "c1"},
+					{ID: 2, Name: "c2"},
+					{ID: 3, Name: "v", ComputeExpr: &computedExpr, Virtual: true},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary", ColumnIDs: []descpb.ColumnID{1, 2}, ColumnNames: []string{"c1", "c2"}},
+				},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID: 1, Name: "pri", ColumnIDs: []descpb.ColumnID{1},
+					ColumnNames:      []string{"c1"},
+					ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+				},
+				Indexes: []descpb.IndexDescriptor{
+					{ID: 2, Name: "sec", ColumnIDs: []descpb.ColumnID{2},
+						ColumnNames:      []string{"c2"},
+						ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+						StoreColumnNames: []string{"v"},
+						StoreColumnIDs:   []descpb.ColumnID{3},
+					},
+				},
+				NextColumnID: 4,
+				NextFamilyID: 1,
+				NextIndexID:  3,
+			}},
 	}
 	for i, d := range testData {
 		t.Run(d.err, func(t *testing.T) {
 			desc := NewImmutable(d.desc)
-			if err := desc.ValidateTable(ctx); err == nil {
+			if err := ValidateTable(ctx, desc); err == nil {
 				t.Errorf("%d: expected \"%s\", but found success: %+v", i, d.err, d.desc)
 			} else if d.err != err.Error() && "internal error: "+d.err != err.Error() {
 				t.Errorf("%d: expected \"%s\", but found \"%+v\"", i, d.err, err)
@@ -1067,7 +1350,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			descs[otherDesc.ID] = NewImmutable(otherDesc)
 		}
 		desc := NewImmutable(test.desc)
-		if err := desc.ValidateCrossReferences(ctx, descs); err == nil {
+		if err := ValidateCrossReferences(ctx, descs, desc); err == nil {
 			if test.err != "" {
 				t.Errorf("%d: expected \"%s\", but found success: %+v", i, test.err, test.desc)
 			}
@@ -1278,7 +1561,7 @@ func TestValidatePartitioning(t *testing.T) {
 	for i, test := range tests {
 		t.Run(test.err, func(t *testing.T) {
 			desc := NewImmutable(test.desc)
-			err := desc.ValidatePartitioning()
+			err := ValidatePartitioning(desc)
 			if !testutils.IsError(err, test.err) {
 				t.Errorf(`%d: got "%v" expected "%v"`, i, err, test.err)
 			}
@@ -1404,7 +1687,7 @@ func TestMaybeUpgradeFormatVersion(t *testing.T) {
 	tests := []struct {
 		desc       descpb.TableDescriptor
 		expUpgrade bool
-		verify     func(int, *Immutable) // nil means no extra verification.
+		verify     func(int, catalog.TableDescriptor) // nil means no extra verification.
 	}{
 		{
 			desc: descpb.TableDescriptor{
@@ -1415,8 +1698,8 @@ func TestMaybeUpgradeFormatVersion(t *testing.T) {
 				Privileges: descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
 			},
 			expUpgrade: true,
-			verify: func(i int, desc *Immutable) {
-				if len(desc.Families) == 0 {
+			verify: func(i int, desc catalog.TableDescriptor) {
+				if len(desc.GetFamilies()) == 0 {
 					t.Errorf("%d: expected families to be set, but it was empty", i)
 				}
 			},
@@ -1437,7 +1720,9 @@ func TestMaybeUpgradeFormatVersion(t *testing.T) {
 	for i, test := range tests {
 		desc, err := NewFilledInImmutable(context.Background(), nil, &test.desc)
 		require.NoError(t, err)
-		upgraded := desc.GetPostDeserializationChanges().UpgradedFormatVersion
+		changes, err := GetPostDeserializationChanges(desc)
+		require.NoError(t, err)
+		upgraded := changes.UpgradedFormatVersion
 		if upgraded != test.expUpgrade {
 			t.Fatalf("%d: expected upgraded=%t, but got upgraded=%t", i, test.expUpgrade, upgraded)
 		}
@@ -1540,32 +1825,66 @@ func TestColumnNeedsBackfill(t *testing.T) {
 	// Define variable strings here such that we can pass their address below.
 	null := "NULL"
 	four := "4:::INT8"
+
 	// Create Column Descriptors that reflect the definition of a column with a
 	// default value of NULL that was set implicitly, one that was set explicitly,
 	// and one that has an INT default value, respectively.
-	implicitNull := &descpb.ColumnDescriptor{
-		Name: "im", ID: 2, Type: types.Int, DefaultExpr: nil, Nullable: true, ComputeExpr: nil,
+	testCases := []struct {
+		info string
+		desc descpb.ColumnDescriptor
+		// add is true of we expect backfill when adding this column.
+		add bool
+		// drop is true of we expect backfill when adding this column.
+		drop bool
+	}{
+		{
+			info: "implicit SET DEFAULT NULL",
+			desc: descpb.ColumnDescriptor{
+				Name: "am", ID: 2, Type: types.Int, DefaultExpr: nil, Nullable: true, ComputeExpr: nil,
+			},
+			add:  false,
+			drop: true,
+		}, {
+			info: "explicit SET DEFAULT NULL",
+			desc: descpb.ColumnDescriptor{
+				Name: "ex", ID: 3, Type: types.Int, DefaultExpr: &null, Nullable: true, ComputeExpr: nil,
+			},
+			add:  false,
+			drop: true,
+		},
+		{
+			info: "explicit SET DEFAULT non-NULL",
+			desc: descpb.ColumnDescriptor{
+				Name: "four", ID: 4, Type: types.Int, DefaultExpr: &four, Nullable: true, ComputeExpr: nil,
+			},
+			add:  true,
+			drop: true,
+		},
+		{
+			info: "computed stored",
+			desc: descpb.ColumnDescriptor{
+				Name: "stored", ID: 5, Type: types.Int, DefaultExpr: nil, ComputeExpr: &four,
+			},
+			add:  true,
+			drop: true,
+		},
+		{
+			info: "computed virtual",
+			desc: descpb.ColumnDescriptor{
+				Name: "virtual", ID: 6, Type: types.Int, DefaultExpr: nil, ComputeExpr: &four, Virtual: true,
+			},
+			add:  false,
+			drop: false,
+		},
 	}
-	explicitNull := &descpb.ColumnDescriptor{
-		Name: "ex", ID: 3, Type: types.Int, DefaultExpr: &null, Nullable: true, ComputeExpr: nil,
-	}
-	defaultNotNull := &descpb.ColumnDescriptor{
-		Name: "four", ID: 4, Type: types.Int, DefaultExpr: &four, Nullable: true, ComputeExpr: nil,
-	}
-	// Verify that a backfill doesn't occur according to the ColumnNeedsBackfill
-	// function for the default NULL values, and that it does occur for an INT
-	// default value.
-	if ColumnNeedsBackfill(implicitNull) != false {
-		t.Fatal("Expected implicit SET DEFAULT NULL to not require a backfill," +
-			" ColumnNeedsBackfill states that it does.")
-	}
-	if ColumnNeedsBackfill(explicitNull) != false {
-		t.Fatal("Expected explicit SET DEFAULT NULL to not require a backfill," +
-			" ColumnNeedsBackfill states that it does.")
-	}
-	if ColumnNeedsBackfill(defaultNotNull) != true {
-		t.Fatal("Expected explicit SET DEFAULT NULL to require a backfill," +
-			" ColumnNeedsBackfill states that it does not.")
+
+	for _, tc := range testCases {
+		if ColumnNeedsBackfill(descpb.DescriptorMutation_ADD, &tc.desc) != tc.add {
+			t.Errorf("expected ColumnNeedsBackfill to be %v for adding %s", tc.add, tc.info)
+		}
+		if ColumnNeedsBackfill(descpb.DescriptorMutation_DROP, &tc.desc) != tc.drop {
+			t.Errorf("expected ColumnNeedsBackfill to be %v for dropping %s", tc.drop, tc.info)
+		}
 	}
 }
 

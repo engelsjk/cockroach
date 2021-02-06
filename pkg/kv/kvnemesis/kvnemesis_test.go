@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -29,6 +30,8 @@ import (
 
 func TestKVNemesisSingleNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderRace(t)
+
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -52,12 +55,14 @@ func TestKVNemesisSingleNode(t *testing.T) {
 
 func TestKVNemesisMultiNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderRace(t)
+
 	defer log.Scope(t).Close(t)
 
 	// 4 nodes so we have somewhere to move 3x replicated ranges to.
 	const numNodes = 4
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{})
+	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{ReplicationMode: base.ReplicationManual})
 	defer tc.Stopper().Stop(ctx)
 	dbs, sqlDBs := make([]*kv.DB, numNodes), make([]*gosql.DB, numNodes)
 	for i := 0; i < numNodes; i++ {

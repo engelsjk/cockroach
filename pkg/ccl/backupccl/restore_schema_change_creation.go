@@ -125,18 +125,28 @@ func createTypeChangeJobFromDesc(
 	username security.SQLUsername,
 	typ catalog.TypeDescriptor,
 ) (*jobs.StartableJob, error) {
+	// Any non-public members in the type descriptor are accumulated as
+	// "transitioning" and their promotion or removal will be handled in a
+	// single job.
+	var transitioningMembers [][]byte
+	for _, member := range typ.TypeDesc().EnumMembers {
+		if member.Capability == descpb.TypeDescriptor_EnumMember_READ_ONLY {
+			transitioningMembers = append(transitioningMembers, member.PhysicalRepresentation)
+		}
+	}
 	record := jobs.Record{
 		Description:   fmt.Sprintf("RESTORING: type %d", typ.GetID()),
 		Username:      username,
 		DescriptorIDs: descpb.IDs{typ.GetID()},
 		Details: jobspb.TypeSchemaChangeDetails{
-			TypeID: typ.GetID(),
+			TypeID:               typ.GetID(),
+			TransitioningMembers: transitioningMembers,
 		},
 		Progress: jobspb.TypeSchemaChangeProgress{},
 		// Type change jobs are not cancellable.
 		NonCancelable: true,
 	}
-	job, err := jr.CreateStartableJobWithTxn(ctx, record, txn, nil /* resultsCh */)
+	job, err := jr.CreateStartableJobWithTxn(ctx, record, txn)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +201,7 @@ func createSchemaChangeJobsFromMutations(
 			},
 			Progress: jobspb.SchemaChangeProgress{},
 		}
-		newJob, err := jr.CreateStartableJobWithTxn(ctx, jobRecord, txn, nil)
+		newJob, err := jr.CreateStartableJobWithTxn(ctx, jobRecord, txn)
 		if err != nil {
 			return nil, err
 		}

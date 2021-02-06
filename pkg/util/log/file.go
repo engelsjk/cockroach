@@ -15,7 +15,6 @@ package log
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"math"
 	"os"
@@ -65,12 +64,12 @@ type fileSink struct {
 	// name prefix for log files.
 	prefix string
 
-	// syncWrites if true calls file.Flush and file.Sync on every log
+	// bufferedWrites if false calls file.Flush on every log
 	// write. This can be set per-logger e.g. for audit logging.
 	//
 	// Note that synchronization for all log files simultaneously can
-	// also be configured via logging.syncWrites, see SetSync().
-	syncWrites bool
+	// also be configured via logging.flushWrites, see SetAlwaysFlush().
+	bufferedWrites bool
 
 	// logFileMaxSize is the maximum size of a log file in bytes.
 	logFileMaxSize int64
@@ -129,7 +128,7 @@ type fileSink struct {
 // newFileSink creates a new file sink.
 func newFileSink(
 	dir, fileNamePrefix string,
-	forceSyncWrites bool,
+	bufferedWrites bool,
 	fileMaxSize, combinedMaxSize int64,
 	getStartLines func(time.Time) []*buffer,
 ) *fileSink {
@@ -139,7 +138,7 @@ func newFileSink(
 	}
 	f := &fileSink{
 		prefix:                  prefix,
-		syncWrites:              forceSyncWrites,
+		bufferedWrites:          bufferedWrites,
 		logFileMaxSize:          fileMaxSize,
 		logFilesCombinedMaxSize: combinedMaxSize,
 		gcNotify:                make(chan struct{}, 1),
@@ -169,7 +168,7 @@ func (l *fileSink) attachHints(stacks []byte) []byte {
 }
 
 // output implements the logSink interface.
-func (l *fileSink) output(extraSync bool, b []byte) error {
+func (l *fileSink) output(extraFlush bool, b []byte) error {
 	if !l.enabled.Get() {
 		// NB: we need to check filesink.enabled a second time here in
 		// case a test Scope() has disabled it asynchronously while
@@ -188,8 +187,8 @@ func (l *fileSink) output(extraSync bool, b []byte) error {
 		return err
 	}
 
-	if extraSync || l.syncWrites || logging.syncWrites.Get() {
-		l.flushAndSyncLocked(true /*doSync*/)
+	if extraFlush || !l.bufferedWrites || logging.flushWrites.Get() {
+		l.flushAndMaybeSyncLocked(false /*doSync*/)
 	}
 	return nil
 }
@@ -215,24 +214,24 @@ func (l *fileSink) emergencyOutput(b []byte) {
 	// During an emergency, we flush to get the data out to the OS, but
 	// we don't care as much about persistence. In fact, trying too hard
 	// to sync may cause additional stoppage.
-	l.flushAndSyncLocked(false /*doSync*/)
+	l.flushAndMaybeSyncLocked(false /*doSync*/)
 }
 
-// lockAndFlushAndSync is like flushAndSync but locks l.mu first.
-func (l *fileSink) lockAndFlushAndSync(doSync bool) {
+// lockAndFlushAndMaybeSync is like flushAndMaybeSyncLocked but locks l.mu first.
+func (l *fileSink) lockAndFlushAndMaybeSync(doSync bool) {
 	if l == nil {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.flushAndSyncLocked(doSync)
+	l.flushAndMaybeSyncLocked(doSync)
 }
 
-// flushAndSync flushes the current log and, if doSync is set,
+// flushAndMaybeSyncLocked flushes the current log and, if doSync is set,
 // attempts to sync its data to disk.
 //
 // l.mu is held.
-func (l *fileSink) flushAndSyncLocked(doSync bool) {
+func (l *fileSink) flushAndMaybeSyncLocked(doSync bool) {
 	if l.mu.file == nil {
 		return
 	}
@@ -243,7 +242,12 @@ func (l *fileSink) flushAndSyncLocked(doSync bool) {
 	// If we can't flush or sync within this duration, exit the process.
 	t := time.AfterFunc(maxSyncDuration, func() {
 		// NB: the disk-stall-detected roachtest matches on this message.
-		Shoutf(context.Background(), severity.FATAL,
+		//
+		// NB2: it is important to log this on the Ops channel to avoid a
+		// recursive back-and-forth between the copy of FATAL events to
+		// OPS and disk slowness detection here. (See the implementation
+		// of logfDepth for details.)
+		Ops.Shoutf(context.Background(), severity.FATAL,
 			"disk stall detected: unable to sync log files within %s", maxSyncDuration,
 		)
 	})
@@ -251,7 +255,8 @@ func (l *fileSink) flushAndSyncLocked(doSync bool) {
 	// If we can't flush sync within this duration, print a warning to the log and to
 	// stderr.
 	t2 := time.AfterFunc(syncWarnDuration, func() {
-		Shoutf(context.Background(), severity.WARNING,
+		// See the comment above about why we use the OPS channel here.
+		Ops.Shoutf(context.Background(), severity.WARNING,
 			"disk slowness detected: unable to sync log files within %s", syncWarnDuration,
 		)
 	})
@@ -262,52 +267,6 @@ func (l *fileSink) flushAndSyncLocked(doSync bool) {
 		_ = l.mu.file.Sync() // ignore error
 	}
 }
-
-// DirName overrides (if non-empty) the choice of directory in
-// which to write logs.
-type DirName string
-
-var _ flag.Value = (*DirName)(nil)
-
-// Set implements the flag.Value interface.
-func (l *DirName) Set(dir string) error {
-	if len(dir) > 0 && dir[0] == '~' {
-		return fmt.Errorf("log directory cannot start with '~': %s", dir)
-	}
-	if len(dir) > 0 {
-		absDir, err := filepath.Abs(dir)
-		if err != nil {
-			return err
-		}
-		dir = absDir
-	}
-	*l = DirName(dir)
-	return nil
-}
-
-// Type implements the flag.Value interface.
-func (l *DirName) Type() string {
-	return "string"
-}
-
-// String implements the flag.Value interface.
-func (l *DirName) String() string {
-	return string(*l)
-}
-
-func (l *DirName) get() (dirName string, isSet bool) {
-	return string(*l), *l != ""
-}
-
-// IsSet returns true iff the directory name is set.
-func (l *DirName) IsSet() bool {
-	res := *l != ""
-	return res
-}
-
-// DirSet returns true iff the log directory has been changed from the
-// command line.
-func DirSet() bool { return logging.logDir.IsSet() }
 
 var (
 	pid      = os.Getpid()

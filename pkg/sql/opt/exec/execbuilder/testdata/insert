@@ -81,7 +81,7 @@ output row: ['a' 'b']
 output row: ['c' 'd']
 output row: ['e' 'f']
 
-statement error pgcode 23505 duplicate key value \(v\)=\('f'\) violates unique constraint "a"
+statement error pgcode 23505 duplicate key value violates unique constraint "a"\nDETAIL: Key \(v\)=\('f'\) already exists\.
 INSERT INTO kv VALUES ('h', 'f')
 
 statement ok
@@ -208,7 +208,7 @@ output row: ['c' 'd']
 output row: ['e' 'f']
 output row: ['f' 'g']
 
-statement error duplicate key value \(v\)=\('g'\) violates unique constraint "a"
+statement error duplicate key value violates unique constraint "a"\nDETAIL: Key \(v\)=\('g'\) already exists\.
 INSERT INTO kv VALUES ('h', 'g')
 
 statement ok
@@ -306,7 +306,7 @@ query T
 EXPLAIN (VERBOSE) INSERT INTO insert_t TABLE select_t ORDER BY v DESC LIMIT 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert
 │ columns: ()
@@ -317,9 +317,9 @@ vectorized: false
 └── • render
     │ columns: (x, v, column11)
     │ estimated row count: 10 (missing stats)
-    │ render 0: unique_rowid()
-    │ render 1: x
-    │ render 2: v
+    │ render column11: unique_rowid()
+    │ render x: x
+    │ render v: v
     │
     └── • limit
         │ columns: (x, v)
@@ -329,12 +329,12 @@ vectorized: false
         └── • sort
             │ columns: (x, v)
             │ ordering: -v
-            │ estimated row count: 1000 (missing stats)
+            │ estimated row count: 1,000 (missing stats)
             │ order: -v
             │
             └── • scan
                   columns: (x, v)
-                  estimated row count: 1000 (missing stats)
+                  estimated row count: 1,000 (missing stats)
                   table: select_t@primary
                   spans: FULL SCAN
 
@@ -343,7 +343,7 @@ query T
 EXPLAIN (VERBOSE) INSERT INTO insert_t SELECT * FROM select_t LIMIT 1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert
 │ columns: ()
@@ -354,9 +354,9 @@ vectorized: false
 └── • render
     │ columns: (x, v, column11)
     │ estimated row count: 1 (missing stats)
-    │ render 0: unique_rowid()
-    │ render 1: x
-    │ render 2: v
+    │ render column11: unique_rowid()
+    │ render x: x
+    │ render v: v
     │
     └── • scan
           columns: (x, v)
@@ -370,7 +370,7 @@ query T
 EXPLAIN (PLAN) INSERT INTO insert_t VALUES (1,1), (2,2) LIMIT 1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert
 │ into: insert_t(x, v, rowid)
@@ -388,7 +388,7 @@ query T
 EXPLAIN (PLAN) INSERT INTO insert_t VALUES (1,1), (2,2) ORDER BY 2 LIMIT 1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert
 │ into: insert_t(x, v, rowid)
@@ -409,7 +409,7 @@ query T
 EXPLAIN (PLAN) INSERT INTO insert_t (VALUES (1,1), (2,2) ORDER BY 2) LIMIT 1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert
 │ into: insert_t(x, v, rowid)
@@ -430,7 +430,7 @@ query T
 EXPLAIN (PLAN) INSERT INTO insert_t (VALUES (1,1), (2,2) ORDER BY 2 LIMIT 1)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert
 │ into: insert_t(x, v, rowid)
@@ -453,12 +453,12 @@ EXPLAIN (VERBOSE)
 INSERT INTO insert_t (SELECT length(k), 2 FROM kv ORDER BY k || v LIMIT 10) RETURNING x+v
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • render
 │ columns: ("?column?")
 │ estimated row count: 10 (missing stats)
-│ render 0: x + v
+│ render ?column?: x + v
 │
 └── • insert
     │ columns: (x, v, rowid)
@@ -468,9 +468,9 @@ vectorized: false
     └── • render
         │ columns: (length, "?column?", column13)
         │ estimated row count: 10 (missing stats)
-        │ render 0: unique_rowid()
-        │ render 1: length
-        │ render 2: "?column?"
+        │ render column13: unique_rowid()
+        │ render length: length
+        │ render ?column?: "?column?"
         │
         └── • limit
             │ columns: (length, "?column?", column12)
@@ -480,19 +480,19 @@ vectorized: false
             └── • sort
                 │ columns: (length, "?column?", column12)
                 │ ordering: +column12
-                │ estimated row count: 1000 (missing stats)
+                │ estimated row count: 1,000 (missing stats)
                 │ order: +column12
                 │
                 └── • render
                     │ columns: (length, "?column?", column12)
-                    │ estimated row count: 1000 (missing stats)
-                    │ render 0: length(k)
-                    │ render 1: 2
-                    │ render 2: k::STRING || v::STRING
+                    │ estimated row count: 1,000 (missing stats)
+                    │ render length: length(k)
+                    │ render ?column?: 2
+                    │ render column12: k::STRING || v::STRING
                     │
                     └── • scan
                           columns: (k, v)
-                          estimated row count: 1000 (missing stats)
+                          estimated row count: 1,000 (missing stats)
                           table: kv@primary
                           spans: FULL SCAN
 
@@ -511,7 +511,7 @@ query T
 EXPLAIN (VERBOSE) INSERT INTO mutation(x) VALUES (2) RETURNING *
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • project
 │ columns: (x)
@@ -537,7 +537,7 @@ query T
 EXPLAIN (VERBOSE) INSERT INTO mutation(x, y) VALUES (2, 2)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert fast path
   columns: ()
@@ -564,7 +564,7 @@ query T
 EXPLAIN (VERBOSE) SELECT * FROM [INSERT INTO xyz SELECT a, b, c FROM abc RETURNING z] ORDER BY z
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │ columns: (z)
@@ -572,12 +572,12 @@ vectorized: false
 ├── • sort
 │   │ columns: (z)
 │   │ ordering: +z
-│   │ estimated row count: 1000 (missing stats)
+│   │ estimated row count: 1,000 (missing stats)
 │   │ order: +z
 │   │
 │   └── • scan buffer
 │         columns: (z)
-│         estimated row count: 1000 (missing stats)
+│         estimated row count: 1,000 (missing stats)
 │         label: buffer 1
 │
 └── • subquery
@@ -591,24 +591,24 @@ vectorized: false
         │
         └── • project
             │ columns: (z)
-            │ estimated row count: 1000 (missing stats)
+            │ estimated row count: 1,000 (missing stats)
             │
             └── • insert
                 │ columns: (z, rowid)
-                │ estimated row count: 1000 (missing stats)
+                │ estimated row count: 1,000 (missing stats)
                 │ into: xyz(x, y, z, rowid)
                 │
                 └── • render
                     │ columns: (a, b, c, column13)
-                    │ estimated row count: 1000 (missing stats)
-                    │ render 0: unique_rowid()
-                    │ render 1: a
-                    │ render 2: b
-                    │ render 3: c
+                    │ estimated row count: 1,000 (missing stats)
+                    │ render column13: unique_rowid()
+                    │ render a: a
+                    │ render b: b
+                    │ render c: c
                     │
                     └── • scan
                           columns: (a, b, c)
-                          estimated row count: 1000 (missing stats)
+                          estimated row count: 1,000 (missing stats)
                           table: abc@primary
                           spans: FULL SCAN
 

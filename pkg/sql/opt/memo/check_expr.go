@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-// +build race
+// +build crdb_test
 
 package memo
 
@@ -22,16 +22,16 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// CheckExpr does sanity checking on an Expr. This code is called in testrace
-// builds (which gives us test/CI coverage but elides this code in regular
-// builds).
+// CheckExpr does sanity checking on an Expr. This function is only defined in
+// crdb_test builds so that checks are run for tests while keeping the check
+// code out of non-test builds, since it can be expensive to run.
 //
 // This function does not assume that the expression has been fully normalized.
-//
-// This function is only defined in race builds, so that checks are run on every
-// PR (as part of make testrace) while keeping the check code out of non-test
-// builds, since it can be expensive to run.
 func (m *Memo) CheckExpr(e opt.Expr) {
+	if m.disableCheckExpr {
+		return
+	}
+
 	// Check properties.
 	switch t := e.(type) {
 	case RelExpr:
@@ -78,6 +78,12 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 		}
 
 	case *ProjectExpr:
+		if !t.Passthrough.SubsetOf(t.Input.Relational().OutputCols) {
+			panic(errors.AssertionFailedf(
+				"projection passes through columns not in input: %v",
+				t.Input.Relational().OutputCols.Difference(t.Passthrough),
+			))
+		}
 		for _, item := range t.Projections {
 			// Check that column id is set.
 			if item.Col == 0 {
@@ -100,6 +106,30 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 
 	case *SelectExpr:
 		checkFilters(t.Filters)
+
+	case *UnionExpr, *UnionAllExpr:
+		setPrivate := t.Private().(*SetPrivate)
+		outColSet := setPrivate.OutCols.ToSet()
+
+		// Check that columns on the left side of the union are not reused in
+		// the output.
+		leftColSet := setPrivate.LeftCols.ToSet()
+		if outColSet.Intersects(leftColSet) {
+			panic(errors.AssertionFailedf(
+				"union reuses columns in left input: %v",
+				outColSet.Intersection(leftColSet),
+			))
+		}
+
+		// Check that columns on the right side of the union are not reused in
+		// the output.
+		rightColSet := setPrivate.RightCols.ToSet()
+		if outColSet.Intersects(rightColSet) {
+			panic(errors.AssertionFailedf(
+				"union reuses columns in right input: %v",
+				outColSet.Intersection(rightColSet),
+			))
+		}
 
 	case *AggregationsExpr:
 		var checkAggs func(scalar opt.ScalarExpr)
@@ -207,8 +237,13 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 			if (kind == cat.Ordinary || kind == cat.WriteOnly) && t.InsertCols[i] == 0 {
 				panic(errors.AssertionFailedf("insert values not provided for all table columns"))
 			}
-			if (kind == cat.System || kind.IsVirtual()) && t.InsertCols[i] != 0 {
-				panic(errors.AssertionFailedf("system or virtual column found in insertion columns"))
+			if t.InsertCols[i] != 0 {
+				switch kind {
+				case cat.System:
+					panic(errors.AssertionFailedf("system column found in insertion columns"))
+				case cat.VirtualInverted:
+					panic(errors.AssertionFailedf("virtual inverted column found in insertion columns"))
+				}
 			}
 		}
 
@@ -278,7 +313,7 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 	}
 }
 
-func (m *Memo) checkColListLen(colList opt.ColList, expectedLen int, listName string) {
+func (m *Memo) checkColListLen(colList opt.OptionalColList, expectedLen int, listName string) {
 	if len(colList) != expectedLen {
 		panic(errors.AssertionFailedf("column list %s expected length = %d, actual length = %d",
 			listName, log.Safe(expectedLen), len(colList)))

@@ -45,6 +45,7 @@ func DecodeIndexKeyToCols(
 	types []*types.T,
 	colDirs []descpb.IndexDescriptor_Direction,
 	key roachpb.Key,
+	invertedColIdx int,
 ) (remainingKey roachpb.Key, matches bool, foundNull bool, _ error) {
 	var decodedTableID descpb.ID
 	var decodedIndexID descpb.IndexID
@@ -76,7 +77,7 @@ func DecodeIndexKeyToCols(
 			var isNull bool
 			key, isNull, err = DecodeKeyValsToCols(
 				da, vecs, idx, indexColIdx[:length], types[:length],
-				colDirs[:length], nil /* unseen */, key,
+				colDirs[:length], nil /* unseen */, key, invertedColIdx,
 			)
 			if err != nil {
 				return nil, false, false, err
@@ -111,7 +112,7 @@ func DecodeIndexKeyToCols(
 
 	var isNull bool
 	key, isNull, err = DecodeKeyValsToCols(
-		da, vecs, idx, indexColIdx, types, colDirs, nil /* unseen */, key,
+		da, vecs, idx, indexColIdx, types, colDirs, nil /* unseen */, key, invertedColIdx,
 	)
 	if err != nil {
 		return nil, false, false, err
@@ -148,6 +149,7 @@ func DecodeKeyValsToCols(
 	directions []descpb.IndexDescriptor_Direction,
 	unseen *util.FastIntSet,
 	key []byte,
+	invertedColIdx int,
 ) ([]byte, bool, error) {
 	foundNull := false
 	for j := range types {
@@ -165,7 +167,8 @@ func DecodeKeyValsToCols(
 				unseen.Remove(i)
 			}
 			var isNull bool
-			key, isNull, err = decodeTableKeyToCol(da, vecs[i], idx, types[j], key, enc)
+			isVirtualInverted := invertedColIdx == i
+			key, isNull, err = decodeTableKeyToCol(da, vecs[i], idx, types[j], key, enc, isVirtualInverted)
 			foundNull = isNull || foundNull
 		}
 		if err != nil {
@@ -186,6 +189,7 @@ func decodeTableKeyToCol(
 	valType *types.T,
 	key []byte,
 	dir descpb.IndexDescriptor_Direction,
+	isVirtualInverted bool,
 ) ([]byte, bool, error) {
 	if (dir != descpb.IndexDescriptor_ASC) && (dir != descpb.IndexDescriptor_DESC) {
 		return nil, false, errors.AssertionFailedf("invalid direction: %d", log.Safe(dir))
@@ -200,6 +204,17 @@ func decodeTableKeyToCol(
 	// value here.
 	vec.Nulls().UnsetNull(idx)
 
+	// Virtual inverted columns should not be decoded, but should instead be
+	// passed on as a DBytes datum.
+	if isVirtualInverted {
+		keyLen, err := encoding.PeekLength(key)
+		if err != nil {
+			return nil, false, err
+		}
+		vec.Bytes().Set(idx, key[:keyLen])
+		return key[keyLen:], false, nil
+	}
+
 	var rkey []byte
 	var err error
 	switch valType.Family() {
@@ -211,7 +226,7 @@ func decodeTableKeyToCol(
 			rkey, i, err = encoding.DecodeVarintDescending(key)
 		}
 		vec.Bool()[idx] = i != 0
-	case types.IntFamily, types.DateFamily, types.OidFamily:
+	case types.IntFamily, types.DateFamily:
 		var i int64
 		if dir == descpb.IndexDescriptor_ASC {
 			rkey, i, err = encoding.DecodeVarintAscending(key)
@@ -319,7 +334,7 @@ func UnmarshalColumnValueToCol(
 		var v []byte
 		v, err = value.GetBytes()
 		vec.Bytes().Set(idx, v)
-	case types.DateFamily, types.OidFamily:
+	case types.DateFamily:
 		var v int64
 		v, err = value.GetInt()
 		vec.Int64()[idx] = v

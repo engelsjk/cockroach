@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
@@ -65,7 +66,9 @@ var supportedZoneConfigOptions = map[tree.Name]struct {
 }{
 	"range_min_bytes": {types.Int, func(c *zonepb.ZoneConfig, d tree.Datum) { c.RangeMinBytes = proto.Int64(int64(tree.MustBeDInt(d))) }},
 	"range_max_bytes": {types.Int, func(c *zonepb.ZoneConfig, d tree.Datum) { c.RangeMaxBytes = proto.Int64(int64(tree.MustBeDInt(d))) }},
+	"global_reads":    {types.Bool, func(c *zonepb.ZoneConfig, d tree.Datum) { c.GlobalReads = proto.Bool(bool(tree.MustBeDBool(d))) }},
 	"num_replicas":    {types.Int, func(c *zonepb.ZoneConfig, d tree.Datum) { c.NumReplicas = proto.Int32(int32(tree.MustBeDInt(d))) }},
+	"num_voters":      {types.Int, func(c *zonepb.ZoneConfig, d tree.Datum) { c.NumVoters = proto.Int32(int32(tree.MustBeDInt(d))) }},
 	"gc.ttlseconds": {types.Int, func(c *zonepb.ZoneConfig, d tree.Datum) {
 		c.GC = &zonepb.GCPolicy{TTLSeconds: int32(tree.MustBeDInt(d))}
 	}},
@@ -77,6 +80,15 @@ var supportedZoneConfigOptions = map[tree.Name]struct {
 		loadYAML(&constraintsList, string(tree.MustBeDString(d)))
 		c.Constraints = constraintsList.Constraints
 		c.InheritedConstraints = false
+	}},
+	"voter_constraints": {types.String, func(c *zonepb.ZoneConfig, d tree.Datum) {
+		voterConstraintsList := zonepb.ConstraintsList{
+			Constraints: c.VoterConstraints,
+			Inherited:   c.InheritedVoterConstraints,
+		}
+		loadYAML(&voterConstraintsList, string(tree.MustBeDString(d)))
+		c.VoterConstraints = voterConstraintsList.Constraints
+		c.InheritedVoterConstraints = false
 	}},
 	"lease_preferences": {types.String, func(c *zonepb.ZoneConfig, d tree.Datum) {
 		loadYAML(&c.LeasePreferences, string(tree.MustBeDString(d)))
@@ -104,7 +116,8 @@ func loadYAML(dst interface{}, yamlString string) {
 
 func (p *planner) SetZoneConfig(ctx context.Context, n *tree.SetZoneConfig) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"CONFIGURE ZONE",
 	); err != nil {
 		return nil, err
@@ -199,7 +212,8 @@ func checkPrivilegeForSetZoneConfig(ctx context.Context, p *planner, zs tree.Zon
 		if zs.Database == "system" {
 			return p.RequireAdminRole(ctx, "alter the system database")
 		}
-		dbDesc, err := p.ResolveUncachedDatabaseByName(ctx, string(zs.Database), true)
+		_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
+			string(zs.Database), tree.DatabaseLookupFlags{Required: true})
 		if err != nil {
 			return err
 		}
@@ -273,7 +287,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		// We'll add back the missing newline below.
 		yamlConfig = strings.TrimSpace(yamlConfig)
 	}
-	var optionStr strings.Builder
+	var optionsStr []string
 	var copyFromParentList []tree.Name
 	if n.options != nil {
 		// Set from var = value attributes.
@@ -295,10 +309,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 			inheritVal, expr := val.inheritValue, val.explicitValue
 			if inheritVal {
 				copyFromParentList = append(copyFromParentList, *name)
-				if optionStr.Len() > 0 {
-					optionStr.WriteString(", ")
-				}
-				fmt.Fprintf(&optionStr, "%s = COPY FROM PARENT", name)
+				optionsStr = append(optionsStr, fmt.Sprintf("%s = COPY FROM PARENT", name))
 				continue
 			}
 			datum, err := expr.Eval(params.EvalContext())
@@ -311,11 +322,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 			}
 			setter := supportedZoneConfigOptions[*name].setter
 			setters = append(setters, func(c *zonepb.ZoneConfig) { setter(c, datum) })
-			if optionStr.Len() > 0 {
-				optionStr.WriteString(", ")
-			}
-			fmt.Fprintf(&optionStr, "%s = %s", name, datum)
-
+			optionsStr = append(optionsStr, fmt.Sprintf("%s = %s", name, datum))
 		}
 	}
 
@@ -336,12 +343,19 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		// Backward compatibility for ALTER PARTITION ... OF TABLE. Determine which
 		// index has the specified partition.
 		partitionName := string(n.zoneSpecifier.Partition)
-		indexes := table.FindIndexesWithPartition(partitionName)
+
+		var indexes []catalog.Index
+		for _, idx := range table.NonDropIndexes() {
+			if tabledesc.FindIndexPartitionByName(idx.IndexDesc(), partitionName) != nil {
+				indexes = append(indexes, idx)
+			}
+		}
+
 		switch len(indexes) {
 		case 0:
 			return fmt.Errorf("partition %q does not exist on table %q", partitionName, table.GetName())
 		case 1:
-			n.zoneSpecifier.TableOrIndex.Index = tree.UnrestrictedName(indexes[0].Name)
+			n.zoneSpecifier.TableOrIndex.Index = tree.UnrestrictedName(indexes[0].GetName())
 		default:
 			err := fmt.Errorf(
 				"partition %q exists on multiple indexes of table %q", partitionName, table.GetName())
@@ -357,10 +371,10 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 	var specifiers []tree.ZoneSpecifier
 	if n.zoneSpecifier.TargetsPartition() && n.allIndexes {
 		sqltelemetry.IncrementPartitioningCounter(sqltelemetry.AlterAllPartitions)
-		for _, idx := range table.AllNonDropIndexes() {
-			if p := tabledesc.FindIndexPartitionByName(idx, string(n.zoneSpecifier.Partition)); p != nil {
+		for _, idx := range table.NonDropIndexes() {
+			if p := tabledesc.FindIndexPartitionByName(idx.IndexDesc(), string(n.zoneSpecifier.Partition)); p != nil {
 				zs := n.zoneSpecifier
-				zs.TableOrIndex.Index = tree.UnrestrictedName(idx.Name)
+				zs.TableOrIndex.Index = tree.UnrestrictedName(idx.GetName())
 				specifiers = append(specifiers, zs)
 			}
 		}
@@ -652,8 +666,11 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 			// require from changes made to parent zones. The extra protections are:
 			//
 			// RangeMinBytes and RangeMaxBytes must be set together
-			// LeasePreferences cannot be set unless Constraints are explicitly set
-			// Per-replica constraints cannot be set unless num_replicas is explicitly set
+			// LeasePreferences cannot be set unless Constraints/VoterConstraints are
+			// explicitly set
+			// Per-replica constraints cannot be set unless num_replicas is explicitly
+			// set
+			// Per-voter constraints cannot be set unless num_voters is explicitly set
 			if err := finalZone.ValidateTandemFields(); err != nil {
 				err = errors.Wrap(err, "could not validate zone config")
 				err = pgerror.WithCandidateCode(err, pgcode.InvalidParameterValue)
@@ -676,31 +693,18 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		}
 
 		// Record that the change has occurred for auditing.
-		var eventLogType EventLogType
-		info := struct {
-			Target  string
-			Config  string `json:",omitempty"`
-			Options string `json:",omitempty"`
-			User    string
-		}{
+		eventDetails := eventpb.CommonZoneConfigDetails{
 			Target:  tree.AsStringWithFQNames(&zs, params.Ann()),
 			Config:  strings.TrimSpace(yamlConfig),
-			Options: optionStr.String(),
-			User:    params.p.User().Normalized(),
+			Options: optionsStr,
 		}
+		var info eventpb.EventPayload
 		if deleteZone {
-			eventLogType = EventLogRemoveZoneConfig
+			info = &eventpb.RemoveZoneConfig{CommonZoneConfigDetails: eventDetails}
 		} else {
-			eventLogType = EventLogSetZoneConfig
+			info = &eventpb.SetZoneConfig{CommonZoneConfigDetails: eventDetails}
 		}
-		return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			params.ctx,
-			params.p.txn,
-			eventLogType,
-			int32(targetID),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			info,
-		)
+		return params.p.logEvent(params.ctx, targetID, info)
 	}
 	for _, zs := range specifiers {
 		// Note(solon): Currently the zone configurations are applied serially for
@@ -730,7 +734,14 @@ type nodeGetter func(context.Context, *serverpb.NodesRequest) (*serverpb.NodesRe
 // will be rejected. Additionally, invalid constraints such as
 // [+region=us-east1, -region=us-east1] will also be rejected.
 func validateNoRepeatKeysInZone(zone *zonepb.ZoneConfig) error {
-	for _, constraints := range zone.Constraints {
+	if err := validateNoRepeatKeysInConjunction(zone.Constraints); err != nil {
+		return err
+	}
+	return validateNoRepeatKeysInConjunction(zone.VoterConstraints)
+}
+
+func validateNoRepeatKeysInConjunction(conjunctions []zonepb.ConstraintsConjunction) error {
+	for _, constraints := range conjunctions {
 		// Because we expect to have a small number of constraints, a nested
 		// loop is probably better than allocating a map.
 		for i, curr := range constraints.Constraints {
@@ -778,7 +789,7 @@ func validateNoRepeatKeysInZone(zone *zonepb.ZoneConfig) error {
 func validateZoneAttrsAndLocalities(
 	ctx context.Context, getNodes nodeGetter, zone *zonepb.ZoneConfig,
 ) error {
-	if len(zone.Constraints) == 0 && len(zone.LeasePreferences) == 0 {
+	if len(zone.Constraints) == 0 && len(zone.VoterConstraints) == 0 && len(zone.LeasePreferences) == 0 {
 		return nil
 	}
 
@@ -804,6 +815,11 @@ func validateZoneAttrsAndLocalities(
 		}
 	}
 	for _, constraints := range zone.Constraints {
+		for _, constraint := range constraints.Constraints {
+			addToValidate(constraint)
+		}
+	}
+	for _, constraints := range zone.VoterConstraints {
 		for _, constraint := range constraints.Constraints {
 			addToValidate(constraint)
 		}

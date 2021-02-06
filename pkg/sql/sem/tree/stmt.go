@@ -69,6 +69,7 @@ const (
 type Statement interface {
 	fmt.Stringer
 	NodeFormatter
+
 	StatementType() StatementType
 	// StatementTag is a short string identifying the type of statement
 	// (usually a single verb). This is different than the Stringer output,
@@ -111,26 +112,6 @@ func CanWriteData(stmt Statement) bool {
 	return false
 }
 
-// IsStmtParallelized determines if a given statement's execution should be
-// parallelized. This means that its results should be mocked out, and that
-// it should be run asynchronously and in parallel with other statements that
-// are independent.
-func IsStmtParallelized(stmt Statement) bool {
-	parallelizedRetClause := func(ret ReturningClause) bool {
-		_, ok := ret.(*ReturningNothing)
-		return ok
-	}
-	switch s := stmt.(type) {
-	case *Delete:
-		return parallelizedRetClause(s.Returning)
-	case *Insert:
-		return parallelizedRetClause(s.Returning)
-	case *Update:
-		return parallelizedRetClause(s.Returning)
-	}
-	return false
-}
-
 // HiddenFromShowQueries is a pseudo-interface to be implemented
 // by statements that should not show up in SHOW QUERIES (and are hence
 // not cancellable using CANCEL QUERIES either). Usually implemented by
@@ -169,6 +150,7 @@ var _ CCLOnlyStatement = &CreateChangefeed{}
 var _ CCLOnlyStatement = &Import{}
 var _ CCLOnlyStatement = &Export{}
 var _ CCLOnlyStatement = &ScheduledBackup{}
+var _ CCLOnlyStatement = &StreamIngestion{}
 
 // StatementType implements the Statement interface.
 func (*AlterDatabaseOwner) StatementType() StatementType { return DDL }
@@ -227,12 +209,20 @@ func (*AlterTable) StatementTag() string { return "ALTER TABLE" }
 func (*AlterTable) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
-func (*AlterTableRegionalAffinity) StatementType() StatementType { return DDL }
+func (*AlterTableLocality) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*AlterTableRegionalAffinity) StatementTag() string { return "ALTER TABLE REGIONAL AFFINITY" }
+func (*AlterTableLocality) StatementTag() string { return "ALTER TABLE SET LOCALITY" }
 
-func (*AlterTableRegionalAffinity) hiddenFromShowQueries() {}
+func (*AlterTableLocality) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterTableOwner) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterTableOwner) StatementTag() string { return "ALTER TABLE OWNER" }
+
+func (*AlterTableOwner) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
 func (*AlterTableSetSchema) StatementType() StatementType { return DDL }
@@ -885,7 +875,7 @@ func (*ShowPartitions) StatementTag() string { return "SHOW PARTITIONS" }
 func (*ShowQueries) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*ShowQueries) StatementTag() string { return "SHOW QUERIES" }
+func (*ShowQueries) StatementTag() string { return "SHOW STATEMENTS" }
 
 // StatementType implements the Statement interface.
 func (*ShowJobs) StatementType() StatementType { return Rows }
@@ -986,6 +976,12 @@ func (*ShowRangeForRow) StatementType() StatementType { return Rows }
 func (*ShowRangeForRow) StatementTag() string { return "SHOW RANGE FOR ROW" }
 
 // StatementType implements the Statement interface.
+func (*ShowSurvivalGoal) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowSurvivalGoal) StatementTag() string { return "SHOW SURVIVAL GOAL" }
+
+// StatementType implements the Statement interface.
 func (*ShowRegions) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -1032,6 +1028,14 @@ func (*Split) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*Split) StatementTag() string { return "SPLIT" }
+
+// StatementType implements the Statement interface.
+func (*StreamIngestion) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*StreamIngestion) StatementTag() string { return "RESTORE FROM REPLICATION STREAM" }
+
+func (*StreamIngestion) cclOnlyStatement() {}
 
 // StatementType implements the Statement interface.
 func (*Unsplit) StatementType() StatementType { return Rows }
@@ -1082,9 +1086,10 @@ func (n *AlterTableDropColumn) String() string           { return AsString(n) }
 func (n *AlterTableDropConstraint) String() string       { return AsString(n) }
 func (n *AlterTableDropNotNull) String() string          { return AsString(n) }
 func (n *AlterTableDropStored) String() string           { return AsString(n) }
-func (n *AlterTableRegionalAffinity) String() string     { return AsString(n) }
+func (n *AlterTableLocality) String() string             { return AsString(n) }
 func (n *AlterTableSetDefault) String() string           { return AsString(n) }
 func (n *AlterTableSetNotNull) String() string           { return AsString(n) }
+func (n *AlterTableOwner) String() string                { return AsString(n) }
 func (n *AlterTableSetSchema) String() string            { return AsString(n) }
 func (n *AlterType) String() string                      { return AsString(n) }
 func (n *AlterRole) String() string                      { return AsString(n) }
@@ -1180,6 +1185,7 @@ func (n *ShowJobs) String() string                       { return AsString(n) }
 func (n *ShowQueries) String() string                    { return AsString(n) }
 func (n *ShowRanges) String() string                     { return AsString(n) }
 func (n *ShowRangeForRow) String() string                { return AsString(n) }
+func (n *ShowSurvivalGoal) String() string               { return AsString(n) }
 func (n *ShowRegions) String() string                    { return AsString(n) }
 func (n *ShowRoleGrants) String() string                 { return AsString(n) }
 func (n *ShowRoles) String() string                      { return AsString(n) }
@@ -1200,6 +1206,7 @@ func (n *ShowVar) String() string                        { return AsString(n) }
 func (n *ShowZoneConfig) String() string                 { return AsString(n) }
 func (n *ShowFingerprints) String() string               { return AsString(n) }
 func (n *Split) String() string                          { return AsString(n) }
+func (n *StreamIngestion) String() string                { return AsString(n) }
 func (n *Unsplit) String() string                        { return AsString(n) }
 func (n *Truncate) String() string                       { return AsString(n) }
 func (n *UnionClause) String() string                    { return AsString(n) }

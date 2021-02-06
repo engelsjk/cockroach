@@ -27,11 +27,11 @@ import (
 
 const flowDoneChanSize = 8
 
-var settingMaxRunningFlows = settings.RegisterPublicIntSetting(
+var settingMaxRunningFlows = settings.RegisterIntSetting(
 	"sql.distsql.max_running_flows",
 	"maximum number of concurrent flows that can be run on a node",
 	500,
-)
+).WithPublic()
 
 // FlowScheduler manages running flows and decides when to queue and when to
 // start flows. The main interface it presents is ScheduleFlows, which passes a
@@ -146,7 +146,9 @@ func (fs *FlowScheduler) ScheduleFlow(ctx context.Context, f Flow) error {
 // Start launches the main loop of the scheduler.
 func (fs *FlowScheduler) Start() {
 	ctx := fs.AnnotateCtx(context.Background())
-	fs.stopper.RunWorker(ctx, func(context.Context) {
+	// TODO(radu): we may end up with a few flows in the queue that will
+	// never be processed. Is that an issue?
+	_ = fs.stopper.RunAsyncTask(ctx, "flow-scheduler", func(context.Context) {
 		stopped := false
 		fs.mu.Lock()
 		defer fs.mu.Unlock()
@@ -188,7 +190,7 @@ func (fs *FlowScheduler) Start() {
 					atomic.AddInt32(&fs.atomics.numRunning, -1)
 				}
 
-			case <-fs.stopper.ShouldStop():
+			case <-fs.stopper.ShouldQuiesce():
 				fs.mu.Lock()
 				stopped = true
 			}

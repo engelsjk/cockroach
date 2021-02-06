@@ -292,7 +292,8 @@ type mvccClearTimeRangeOp struct {
 
 func (m mvccClearTimeRangeOp) run(ctx context.Context) string {
 	writer := m.m.getReadWriter(m.writer)
-	span, err := storage.MVCCClearTimeRange(ctx, writer, nil, m.key, m.endKey, m.startTime, m.endTime, math.MaxInt64)
+	span, err := storage.MVCCClearTimeRange(ctx, writer, &enginepb.MVCCStats{}, m.key, m.endKey,
+		m.startTime, m.endTime, math.MaxInt64, true /* useTBI */)
 	if err != nil {
 		return fmt.Sprintf("error: %s", err)
 	}
@@ -589,7 +590,7 @@ type clearRangeOp struct {
 func (c clearRangeOp) run(ctx context.Context) string {
 	// ClearRange calls in Cockroach usually happen with boundaries demarcated
 	// using unversioned keys, so mimic the same behavior here.
-	err := c.m.engine.ClearRawRange(c.key, c.endKey)
+	err := c.m.engine.ClearMVCCRangeAndIntents(c.key, c.endKey)
 	if err != nil {
 		return fmt.Sprintf("error: %s", err.Error())
 	}

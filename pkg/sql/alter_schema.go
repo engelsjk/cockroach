@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -40,7 +41,8 @@ var _ planNode = &alterSchemaNode{n: nil}
 
 func (p *planner) AlterSchema(ctx context.Context, n *tree.AlterSchema) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"ALTER SCHEMA",
 	); err != nil {
 		return nil, err
@@ -50,7 +52,8 @@ func (p *planner) AlterSchema(ctx context.Context, n *tree.AlterSchema) (planNod
 	if n.Schema.ExplicitCatalog {
 		dbName = n.Schema.Catalog()
 	}
-	db, err := p.ResolveMutableDatabaseDescriptor(ctx, dbName, true /* required */)
+	_, db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, dbName,
+		tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return nil, err
 	}
@@ -90,43 +93,32 @@ func (p *planner) AlterSchema(ctx context.Context, n *tree.AlterSchema) (planNod
 func (n *alterSchemaNode) startExec(params runParams) error {
 	switch t := n.n.Cmd.(type) {
 	case *tree.AlterSchemaRename:
-		oldName := n.desc.Name
 		newName := string(t.NewName)
+
+		oldQualifiedSchemaName, err := params.p.getQualifiedSchemaName(params.ctx, n.desc)
+		if err != nil {
+			return err
+		}
+
 		if err := params.p.renameSchema(
 			params.ctx, n.db, n.desc, newName, tree.AsStringWithFQNames(n.n, params.Ann()),
 		); err != nil {
 			return err
 		}
-		return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			params.ctx,
-			params.p.txn,
-			EventLogRenameSchema,
-			int32(n.desc.ID),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			struct {
-				SchemaName    string
-				NewSchemaName string
-				User          string
-			}{oldName, newName, params.p.User().Normalized()},
-		)
-	case *tree.AlterSchemaOwner:
-		newOwner := t.Owner
-		if err := params.p.alterSchemaOwner(
-			params.ctx, n.desc, newOwner, tree.AsStringWithFQNames(n.n, params.Ann()),
-		); err != nil {
+
+		newQualifiedSchemaName, err := params.p.getQualifiedSchemaName(params.ctx, n.desc)
+		if err != nil {
 			return err
 		}
-		return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			params.ctx,
-			params.p.txn,
-			EventLogAlterSchemaOwner,
-			int32(n.desc.ID),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			struct {
-				SchemaName string
-				Owner      string
-				User       string
-			}{n.desc.Name, newOwner.Normalized(), params.p.User().Normalized()},
+
+		return params.p.logEvent(params.ctx, n.desc.ID, &eventpb.RenameSchema{
+			SchemaName:    oldQualifiedSchemaName.String(),
+			NewSchemaName: newQualifiedSchemaName.String(),
+		})
+	case *tree.AlterSchemaOwner:
+		newOwner := t.Owner
+		return params.p.alterSchemaOwner(
+			params.ctx, n.desc, newOwner, tree.AsStringWithFQNames(n.n, params.Ann()),
 		)
 	default:
 		return errors.AssertionFailedf("unknown schema cmd %T", t)
@@ -175,7 +167,17 @@ func (p *planner) checkCanAlterSchemaAndSetNewOwner(
 	privs := scDesc.GetPrivileges()
 	privs.SetOwner(newOwner)
 
-	return nil
+	qualifiedSchemaName, err := p.getQualifiedSchemaName(ctx, scDesc)
+	if err != nil {
+		return err
+	}
+
+	return p.logEvent(ctx,
+		scDesc.GetID(),
+		&eventpb.AlterSchemaOwner{
+			SchemaName: qualifiedSchemaName.String(),
+			Owner:      newOwner.Normalized(),
+		})
 }
 
 func (p *planner) renameSchema(

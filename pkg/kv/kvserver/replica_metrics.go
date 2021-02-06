@@ -50,11 +50,11 @@ type ReplicaMetrics struct {
 
 // Metrics returns the current metrics for the replica.
 func (r *Replica) Metrics(
-	ctx context.Context, now hlc.Timestamp, livenessMap liveness.IsLiveMap, clusterNodes int,
+	ctx context.Context, now hlc.ClockTimestamp, livenessMap liveness.IsLiveMap, clusterNodes int,
 ) ReplicaMetrics {
 	r.mu.RLock()
 	raftStatus := r.raftStatusRLocked()
-	leaseStatus := r.leaseStatus(ctx, *r.mu.state.Lease, now, r.mu.minLeaseProposedTS)
+	leaseStatus := r.leaseStatusAtRLocked(ctx, now)
 	quiescent := r.mu.quiescent || r.mu.internalRaftGroup == nil
 	desc := r.mu.state.Desc
 	zone := r.mu.zone
@@ -70,7 +70,7 @@ func (r *Replica) Metrics(
 
 	return calcReplicaMetrics(
 		ctx,
-		now,
+		now.ToTimestamp(),
 		&r.store.cfg.RaftConfig,
 		zone,
 		livenessMap,
@@ -110,7 +110,7 @@ func calcReplicaMetrics(
 
 	var leaseOwner bool
 	m.LeaseStatus = leaseStatus
-	if leaseStatus.State == kvserverpb.LeaseState_VALID {
+	if leaseStatus.IsValid() {
 		m.LeaseValid = true
 		leaseOwner = leaseStatus.Lease.OwnedBy(storeID)
 		m.LeaseType = leaseStatus.Lease.Type()
@@ -164,7 +164,7 @@ func calcRangeCounter(
 	// It seems unlikely that a learner replica would be the first live one, but
 	// there's no particular reason to exclude them. Note that `All` returns the
 	// voters first.
-	for _, rd := range desc.Replicas().All() {
+	for _, rd := range desc.Replicas().Descriptors() {
 		if livenessMap[rd.NodeID].IsLive {
 			rangeCounter = rd.StoreID == storeID
 			break
@@ -193,7 +193,7 @@ func calcRangeCounter(
 // considered.
 func calcLiveVoterReplicas(desc *roachpb.RangeDescriptor, livenessMap liveness.IsLiveMap) int {
 	var live int
-	for _, rd := range desc.Replicas().Voters() {
+	for _, rd := range desc.Replicas().VoterDescriptors() {
 		if livenessMap[rd.NodeID].IsLive {
 			live++
 		}
@@ -207,7 +207,7 @@ func calcBehindCount(
 	raftStatus *raft.Status, desc *roachpb.RangeDescriptor, livenessMap liveness.IsLiveMap,
 ) int64 {
 	var behindCount int64
-	for _, rd := range desc.Replicas().All() {
+	for _, rd := range desc.Replicas().Descriptors() {
 		if progress, ok := raftStatus.Progress[uint64(rd.ReplicaID)]; ok {
 			if progress.Match > 0 &&
 				progress.Match < raftStatus.Commit {

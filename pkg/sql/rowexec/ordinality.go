@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // ordinalityProcessor is the processor of the WITH ORDINALITY operator, which
@@ -67,7 +66,7 @@ func newOrdinalityProcessor(
 		return nil, err
 	}
 
-	if sp := tracing.SpanFromContext(ctx); sp != nil && sp.IsRecording() {
+	if execinfra.ShouldCollectStats(ctx, flowCtx) {
 		o.input = newInputStatCollector(o.input)
 		o.ExecStatsForTrace = o.execStatsForTrace
 	}
@@ -114,8 +113,7 @@ func (o *ordinalityProcessor) ConsumerClosed() {
 	o.InternalClose()
 }
 
-// execStatsForTrace outputs the collected distinct stats to the trace. Will
-// fail silently if the Distinct processor is not collecting stats.
+// execStatsForTrace implements ProcessorBase.ExecStatsForTrace.
 func (o *ordinalityProcessor) execStatsForTrace() *execinfrapb.ComponentStats {
 	is, ok := getInputStats(o.input)
 	if !ok {

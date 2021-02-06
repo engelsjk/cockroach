@@ -12,7 +12,6 @@ package roachpb
 
 import (
 	"fmt"
-	"sort"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -20,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // UserPriority is a custom type for transaction's user priority.
@@ -53,6 +53,8 @@ const (
 
 // RequiresReadLease returns whether the ReadConsistencyType requires
 // that a read-only request be performed on an active valid leaseholder.
+// TODO(aayush): Rename the method since we no longer require a replica to be a
+// leaseholder to serve a consistent read.
 func (rc ReadConsistencyType) RequiresReadLease() bool {
 	switch rc {
 	case CONSISTENT:
@@ -328,7 +330,6 @@ func (rh *ResponseHeader) combine(otherRH ResponseHeader) error {
 	rh.ResumeReason = otherRH.ResumeReason
 	rh.NumKeys += otherRH.NumKeys
 	rh.NumBytes += otherRH.NumBytes
-	rh.DeprecatedRangeInfos = append(rh.DeprecatedRangeInfos, otherRH.DeprecatedRangeInfos...)
 	return nil
 }
 
@@ -532,23 +533,6 @@ func (h *BatchResponse_Header) combine(o BatchResponse_Header) error {
 	}
 	h.Now.Forward(o.Now)
 	h.CollectedSpans = append(h.CollectedSpans, o.CollectedSpans...)
-	// Deduplicate the RangeInfos and maintain them in sorted order.
-	//
-	// TODO(andrei): stop merging RangeInfos once everybody but the DistSender
-	// stops using them.
-	for _, ri := range o.RangeInfos {
-		id := ri.Desc.RangeID
-		i := sort.Search(len(h.RangeInfos), func(i int) bool {
-			return h.RangeInfos[i].Desc.RangeID >= id
-		})
-		if i < len(h.RangeInfos) && h.RangeInfos[i].Desc.RangeID == id {
-			continue
-		}
-		// Insert ri in the middle.
-		h.RangeInfos = append(h.RangeInfos, RangeInfo{})
-		copy(h.RangeInfos[i+1:], h.RangeInfos[i:])
-		h.RangeInfos[i] = ri
-	}
 	return nil
 }
 
@@ -710,6 +694,9 @@ func (*AdminScatterRequest) Method() Method { return AdminScatter }
 
 // Method implements the Request interface.
 func (*AddSSTableRequest) Method() Method { return AddSSTable }
+
+// Method implements the Request interface.
+func (*MigrateRequest) Method() Method { return Migrate }
 
 // Method implements the Request interface.
 func (*RecomputeStatsRequest) Method() Method { return RecomputeStats }
@@ -958,6 +945,12 @@ func (r *AddSSTableRequest) ShallowCopy() Request {
 }
 
 // ShallowCopy implements the Request interface.
+func (r *MigrateRequest) ShallowCopy() Request {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
 func (r *RecomputeStatsRequest) ShallowCopy() Request {
 	shallowCopy := *r
 	return &shallowCopy
@@ -993,12 +986,15 @@ func (r *AdminVerifyProtectedTimestampRequest) ShallowCopy() Request {
 	return &shallowCopy
 }
 
-// NewGet returns a Request initialized to get the value at key.
-func NewGet(key Key) Request {
+// NewGet returns a Request initialized to get the value at key. If
+// forUpdate is true, an unreplicated, exclusive lock is acquired on on
+// the key, if it exists.
+func NewGet(key Key, forUpdate bool) Request {
 	return &GetRequest{
 		RequestHeader: RequestHeader{
 			Key: key,
 		},
+		KeyLocking: scanLockStrength(forUpdate),
 	}
 }
 
@@ -1061,6 +1057,37 @@ func NewConditionalPut(key Key, value Value, expValue []byte, allowNotExist bool
 		DeprecatedExpValue:  expValueVal,
 		ExpBytes:            expValue,
 		AllowIfDoesNotExist: allowNotExist,
+	}
+}
+
+// NewConditionalPutInline returns a Request initialized to put an inline value
+// at key if the existing value at key equals expValue.
+//
+// The callee takes ownership of value's underlying bytes and it will mutate
+// them. The caller retains ownership of expVal; NewConditionalPut will copy it
+// into the request.
+//
+// Callers should check the version gate clusterversion.CPutInline to make
+// sure this is supported.
+func NewConditionalPutInline(key Key, value Value, expValue []byte, allowNotExist bool) Request {
+	value.InitChecksum(key)
+	// Compatibility with 20.1 servers.
+	var expValueVal *Value
+	if expValue != nil {
+		expValueVal = &Value{}
+		expValueVal.SetTagAndData(expValue)
+		// The expected value does not need a checksum, so we don't initialize it.
+	}
+
+	return &ConditionalPutRequest{
+		RequestHeader: RequestHeader{
+			Key: key,
+		},
+		Value:               value,
+		DeprecatedExpValue:  expValueVal,
+		ExpBytes:            expValue,
+		AllowIfDoesNotExist: allowNotExist,
+		Inline:              true,
 	}
 }
 
@@ -1134,8 +1161,16 @@ func scanLockStrength(forUpdate bool) lock.Strength {
 	return lock.None
 }
 
-func (*GetRequest) flags() int {
-	return isRead | isTxn | updatesTSCache | needsRefresh
+func flagForLockStrength(l lock.Strength) int {
+	if l != lock.None {
+		return isLocking
+	}
+	return 0
+}
+
+func (gr *GetRequest) flags() int {
+	maybeLocking := flagForLockStrength(gr.KeyLocking)
+	return isRead | isTxn | maybeLocking | updatesTSCache | needsRefresh
 }
 
 func (*PutRequest) flags() int {
@@ -1209,18 +1244,12 @@ func (*ClearRangeRequest) flags() int { return isWrite | isRange | isAlone }
 func (*RevertRangeRequest) flags() int { return isWrite | isRange }
 
 func (sr *ScanRequest) flags() int {
-	maybeLocking := 0
-	if sr.KeyLocking != lock.None {
-		maybeLocking = isLocking
-	}
+	maybeLocking := flagForLockStrength(sr.KeyLocking)
 	return isRead | isRange | isTxn | maybeLocking | updatesTSCache | needsRefresh
 }
 
 func (rsr *ReverseScanRequest) flags() int {
-	maybeLocking := 0
-	if rsr.KeyLocking != lock.None {
-		maybeLocking = isLocking
-	}
+	maybeLocking := flagForLockStrength(rsr.KeyLocking)
 	return isRead | isRange | isReverse | isTxn | maybeLocking | updatesTSCache | needsRefresh
 }
 
@@ -1286,6 +1315,7 @@ func (*AdminVerifyProtectedTimestampRequest) flags() int { return isAdmin | isRa
 func (*AddSSTableRequest) flags() int {
 	return isWrite | isRange | isAlone | isUnsplittable | canBackpressure
 }
+func (*MigrateRequest) flags() int { return isWrite | isRange | isAlone }
 
 // RefreshRequest and RefreshRangeRequest both determine which timestamp cache
 // they update based on their Write parameter.
@@ -1477,4 +1507,14 @@ func (r *JoinNodeResponse) CreateStoreIdent() (StoreIdent, error) {
 		StoreID:   storeID,
 	}
 	return sIdent, nil
+}
+
+// SafeFormat implements redact.SafeFormatter.
+func (c *ContentionEvent) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("conflicted with %s on %s for %.2fs", c.TxnMeta.ID, c.Key, c.Duration.Seconds())
+}
+
+// String implements fmt.Stringer.
+func (c *ContentionEvent) String() string {
+	return redact.StringWithoutMarkers(c)
 }

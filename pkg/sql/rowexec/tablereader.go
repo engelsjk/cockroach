@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -25,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -59,7 +59,7 @@ var _ execinfra.RowSource = &tableReader{}
 var _ execinfrapb.MetadataSource = &tableReader{}
 var _ execinfra.Releasable = &tableReader{}
 var _ execinfra.OpNode = &tableReader{}
-var _ execinfra.IOReader = &tableReader{}
+var _ execinfra.KVReader = &tableReader{}
 
 const tableReaderProcName = "table reader"
 
@@ -91,9 +91,12 @@ func newTableReader(
 	tr.maxTimestampAge = time.Duration(spec.MaxTimestampAgeNanos)
 
 	tableDesc := tabledesc.NewImmutable(spec.Table)
-	returnMutations := spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic
-	resultTypes := tableDesc.ColumnTypesWithMutations(returnMutations)
-	columnIdxMap := tableDesc.ColumnIdxMapWithMutations(returnMutations)
+	cols := tableDesc.PublicColumns()
+	if spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic {
+		cols = tableDesc.AllColumns()
+	}
+	columnIdxMap := catalog.ColumnIDToOrdinalMap(cols)
+	resultTypes := catalog.ColumnTypesWithVirtualCol(cols, spec.VirtualColumn)
 
 	// Add all requested system columns to the output.
 	var sysColDescs []descpb.ColumnDescriptor
@@ -144,6 +147,7 @@ func newTableReader(
 		spec.LockingStrength,
 		spec.LockingWaitPolicy,
 		sysColDescs,
+		spec.VirtualColumn,
 	); err != nil {
 		return nil, err
 	}
@@ -158,7 +162,7 @@ func newTableReader(
 		tr.spans[i] = s.Span
 	}
 
-	if sp := tracing.SpanFromContext(flowCtx.EvalCtx.Ctx()); sp != nil && sp.IsRecording() {
+	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
 		tr.fetcher = newRowFetcherStatCollector(&fetcher)
 		tr.ExecStatsForTrace = tr.execStatsForTrace
 	} else {
@@ -187,15 +191,16 @@ func (tr *tableReader) Start(ctx context.Context) context.Context {
 	var err error
 	if tr.maxTimestampAge == 0 {
 		err = tr.fetcher.StartScan(
-			ctx, tr.FlowCtx.Txn, tr.spans,
-			limitBatches, tr.limitHint, tr.FlowCtx.TraceKV,
+			ctx, tr.FlowCtx.Txn, tr.spans, limitBatches, tr.limitHint,
+			tr.FlowCtx.TraceKV,
+			tr.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 		)
 	} else {
 		initialTS := tr.FlowCtx.Txn.ReadTimestamp()
 		err = tr.fetcher.StartInconsistentScan(
-			ctx, tr.FlowCtx.Cfg.DB, initialTS,
-			tr.maxTimestampAge, tr.spans,
+			ctx, tr.FlowCtx.Cfg.DB, initialTS, tr.maxTimestampAge, tr.spans,
 			limitBatches, tr.limitHint, tr.FlowCtx.TraceKV,
+			tr.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 		)
 	}
 
@@ -279,22 +284,28 @@ func (tr *tableReader) execStatsForTrace() *execinfrapb.ComponentStats {
 	}
 	return &execinfrapb.ComponentStats{
 		KV: execinfrapb.KVStats{
-			TuplesRead: is.NumTuples,
-			BytesRead:  optional.MakeUint(uint64(tr.GetBytesRead())),
-			KVTime:     is.WaitTime,
+			TuplesRead:     is.NumTuples,
+			BytesRead:      optional.MakeUint(uint64(tr.GetBytesRead())),
+			KVTime:         is.WaitTime,
+			ContentionTime: optional.MakeTimeValue(tr.GetCumulativeContentionTime()),
 		},
 		Output: tr.Out.Stats(),
 	}
 }
 
-// GetBytesRead is part of the execinfra.IOReader interface.
+// GetBytesRead is part of the execinfra.KVReader interface.
 func (tr *tableReader) GetBytesRead() int64 {
 	return tr.fetcher.GetBytesRead()
 }
 
-// GetRowsRead is part of the execinfra.IOReader interface.
+// GetRowsRead is part of the execinfra.KVReader interface.
 func (tr *tableReader) GetRowsRead() int64 {
 	return tr.rowsRead
+}
+
+// GetCumulativeContentionTime is part of the execinfra.KVReader interface.
+func (tr *tableReader) GetCumulativeContentionTime() time.Duration {
+	return getCumulativeContentionTime(tr.fetcher.GetContentionEvents())
 }
 
 func (tr *tableReader) generateMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
@@ -316,6 +327,10 @@ func (tr *tableReader) generateMeta(ctx context.Context) []execinfrapb.ProducerM
 	meta.Metrics = execinfrapb.GetMetricsMeta()
 	meta.Metrics.BytesRead, meta.Metrics.RowsRead = tr.GetBytesRead(), tr.GetRowsRead()
 	trailingMeta = append(trailingMeta, *meta)
+
+	if contentionEvents := tr.fetcher.GetContentionEvents(); len(contentionEvents) != 0 {
+		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{ContentionEvents: contentionEvents})
+	}
 	return trailingMeta
 }
 

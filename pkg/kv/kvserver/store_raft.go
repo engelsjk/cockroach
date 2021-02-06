@@ -296,9 +296,9 @@ func (s *Store) processRaftSnapshotRequest(
 			defer s.mu.Unlock()
 			placeholder, err := s.canApplySnapshotLocked(ctx, snapHeader)
 			if err != nil {
-				// If the storage cannot accept the snapshot, return an
-				// error before passing it to RawNode.Step, since our
-				// error handling options past that point are limited.
+				// If we cannot accept the snapshot, return an error before
+				// passing it to RawNode.Step, since our error handling options
+				// past that point are limited.
 				log.Infof(ctx, "cannot apply snapshot: %s", err)
 				return err
 			}
@@ -331,12 +331,30 @@ func (s *Store) processRaftSnapshotRequest(
 				}
 			}()
 		}
+
+		if snapHeader.RaftMessageRequest.Message.From == snapHeader.RaftMessageRequest.Message.To {
+			// This is a special case exercised during recovery from loss of quorum.
+			// In this case, a forged snapshot will be sent to the replica and will
+			// hit this code path (if we make up a non-existent follower, Raft will
+			// drop the message, hence we are forced to make the receiver the sender).
+			//
+			// Unfortunately, at the time of writing, Raft assumes that a snapshot
+			// is always received from the leader (of the given term), which plays
+			// poorly with these forged snapshots. However, a zero sender works just
+			// fine as the value zero represents "no known leader".
+			//
+			// We prefer not to introduce a zero origin of the message as throughout
+			// our code we rely on it being present. Instead, we reset the origin
+			// that raft looks at just before handing the message off.
+			snapHeader.RaftMessageRequest.Message.From = 0
+		}
 		// NB: we cannot get errRemoved here because we're promised by
 		// withReplicaForRequest that this replica is not currently being removed
 		// and we've been holding the raftMu the entire time.
 		if err := r.stepRaftGroup(&snapHeader.RaftMessageRequest); err != nil {
 			return roachpb.NewError(err)
 		}
+
 		_, expl, err := r.handleRaftReadyRaftMuLocked(ctx, inSnap)
 		maybeFatalOnRaftReadyErr(ctx, expl, err)
 		removePlaceholder = false
@@ -590,10 +608,12 @@ func (s *Store) processRaft(ctx context.Context) {
 
 	s.scheduler.Start(ctx, s.stopper)
 	// Wait for the scheduler worker goroutines to finish.
-	s.stopper.RunWorker(ctx, s.scheduler.Wait)
+	if err := s.stopper.RunAsyncTask(ctx, "sched-wait", s.scheduler.Wait); err != nil {
+		s.scheduler.Wait(ctx)
+	}
 
-	s.stopper.RunWorker(ctx, s.raftTickLoop)
-	s.stopper.RunWorker(ctx, s.coalescedHeartbeatsLoop)
+	_ = s.stopper.RunAsyncTask(ctx, "sched-tick-loop", s.raftTickLoop)
+	_ = s.stopper.RunAsyncTask(ctx, "coalesced-hb-loop", s.coalescedHeartbeatsLoop)
 	s.stopper.AddCloser(stop.CloserFn(func() {
 		s.cfg.Transport.Stop(s.StoreID())
 	}))
@@ -628,7 +648,7 @@ func (s *Store) raftTickLoop(ctx context.Context) {
 			s.scheduler.EnqueueRaftTicks(rangeIDs...)
 			s.metrics.RaftTicks.Inc(1)
 
-		case <-s.stopper.ShouldStop():
+		case <-s.stopper.ShouldQuiesce():
 			return
 		}
 	}
@@ -671,7 +691,7 @@ func (s *Store) coalescedHeartbeatsLoop(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			s.sendQueuedHeartbeats(ctx)
-		case <-s.stopper.ShouldStop():
+		case <-s.stopper.ShouldQuiesce():
 			return
 		}
 	}

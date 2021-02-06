@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 )
@@ -76,8 +77,10 @@ func (l *loggerT) exitLocked(err error, code exit.Code) {
 // This assumes l.outputMu is held, but l.fileSink.mu is not held.
 func (l *loggerT) reportErrorEverywhereLocked(ctx context.Context, err error) {
 	// Make a valid log entry for this error.
-	entry := MakeEntry(
-		ctx, severity.ERROR, 2 /* depth */, true, /* redactable */
+	entry := makeUnstructuredEntry(
+		ctx, severity.ERROR, channel.OPS,
+		2,    /* depth */
+		true, /* redactable */
 		"logging error: %v", err)
 
 	// Either stderr or our log file is broken. Try writing the error to both
@@ -94,7 +97,7 @@ func (l *loggerT) reportErrorEverywhereLocked(ctx context.Context, err error) {
 	for _, s := range l.sinkInfos {
 		sink := s.sink
 		if logpb.Severity_ERROR >= s.threshold && sink.active() {
-			buf := s.formatter.formatEntry(entry, nil /*stack*/)
+			buf := s.formatter.formatEntry(entry)
 			sink.emergencyOutput(buf.Bytes())
 			putBuffer(buf)
 		}

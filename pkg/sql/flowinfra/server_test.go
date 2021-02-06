@@ -58,7 +58,6 @@ func TestServer(t *testing.T) {
 		Spans:    []execinfrapb.TableReaderSpan{{Span: td.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 	}
 	post := execinfrapb.PostProcessSpec{
-		Filter:        execinfrapb.Expression{Expr: "@1 != 2"}, // a != 2
 		Projection:    true,
 		OutputColumns: []uint32{0, 1}, // a
 	}
@@ -109,11 +108,12 @@ func TestServer(t *testing.T) {
 	}
 	metas = ignoreLeafTxnState(metas)
 	metas = ignoreMetricsMeta(metas)
+	metas = ignoreTraceData(metas)
 	if len(metas) != 0 {
 		t.Errorf("unexpected metadata: %v", metas)
 	}
 	str := rows.String(rowenc.TwoIntCols)
-	expected := "[[1 10] [3 30]]"
+	expected := "[[1 10] [2 20] [3 30]]"
 	if str != expected {
 		t.Errorf("invalid results: %s, expected %s'", str, expected)
 	}

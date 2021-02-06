@@ -9,7 +9,9 @@ query IT
 SELECT node_id, name FROM crdb_internal.leases ORDER BY name
 ----
 0  role_members
+0  role_options
 0  test
+0  users
 
 query error database "crdb_internal" does not exist
 ALTER DATABASE crdb_internal RENAME TO not_crdb_internal
@@ -20,51 +22,53 @@ CREATE TABLE crdb_internal.t (x INT)
 query error database "crdb_internal" does not exist
 DROP DATABASE crdb_internal
 
-query TTTTI
+query TTTTIT
 SHOW TABLES FROM crdb_internal
 ----
-crdb_internal  backward_dependencies        table  NULL  NULL
-crdb_internal  builtin_functions            table  NULL  NULL
-crdb_internal  cluster_queries              table  NULL  NULL
-crdb_internal  cluster_sessions             table  NULL  NULL
-crdb_internal  cluster_settings             table  NULL  NULL
-crdb_internal  cluster_transactions         table  NULL  NULL
-crdb_internal  create_statements            table  NULL  NULL
-crdb_internal  create_type_statements       table  NULL  NULL
-crdb_internal  databases                    table  NULL  NULL
-crdb_internal  feature_usage                table  NULL  NULL
-crdb_internal  forward_dependencies         table  NULL  NULL
-crdb_internal  gossip_alerts                table  NULL  NULL
-crdb_internal  gossip_liveness              table  NULL  NULL
-crdb_internal  gossip_network               table  NULL  NULL
-crdb_internal  gossip_nodes                 table  NULL  NULL
-crdb_internal  index_columns                table  NULL  NULL
-crdb_internal  invalid_objects              table  NULL  NULL
-crdb_internal  jobs                         table  NULL  NULL
-crdb_internal  kv_node_status               table  NULL  NULL
-crdb_internal  kv_store_status              table  NULL  NULL
-crdb_internal  leases                       table  NULL  NULL
-crdb_internal  node_build_info              table  NULL  NULL
-crdb_internal  node_metrics                 table  NULL  NULL
-crdb_internal  node_queries                 table  NULL  NULL
-crdb_internal  node_runtime_info            table  NULL  NULL
-crdb_internal  node_sessions                table  NULL  NULL
-crdb_internal  node_statement_statistics    table  NULL  NULL
-crdb_internal  node_transaction_statistics  table  NULL  NULL
-crdb_internal  node_transactions            table  NULL  NULL
-crdb_internal  node_txn_stats               table  NULL  NULL
-crdb_internal  partitions                   table  NULL  NULL
-crdb_internal  predefined_comments          table  NULL  NULL
-crdb_internal  ranges                       view   NULL  NULL
-crdb_internal  ranges_no_leases             table  NULL  NULL
-crdb_internal  schema_changes               table  NULL  NULL
-crdb_internal  session_trace                table  NULL  NULL
-crdb_internal  session_variables            table  NULL  NULL
-crdb_internal  table_columns                table  NULL  NULL
-crdb_internal  table_indexes                table  NULL  NULL
-crdb_internal  table_row_statistics         table  NULL  NULL
-crdb_internal  tables                       table  NULL  NULL
-crdb_internal  zones                        table  NULL  NULL
+crdb_internal  backward_dependencies        table  NULL  NULL  NULL
+crdb_internal  builtin_functions            table  NULL  NULL  NULL
+crdb_internal  cluster_database_privileges  table  NULL  NULL  NULL
+crdb_internal  cluster_queries              table  NULL  NULL  NULL
+crdb_internal  cluster_sessions             table  NULL  NULL  NULL
+crdb_internal  cluster_settings             table  NULL  NULL  NULL
+crdb_internal  cluster_transactions         table  NULL  NULL  NULL
+crdb_internal  create_statements            table  NULL  NULL  NULL
+crdb_internal  create_type_statements       table  NULL  NULL  NULL
+crdb_internal  databases                    table  NULL  NULL  NULL
+crdb_internal  feature_usage                table  NULL  NULL  NULL
+crdb_internal  forward_dependencies         table  NULL  NULL  NULL
+crdb_internal  gossip_alerts                table  NULL  NULL  NULL
+crdb_internal  gossip_liveness              table  NULL  NULL  NULL
+crdb_internal  gossip_network               table  NULL  NULL  NULL
+crdb_internal  gossip_nodes                 table  NULL  NULL  NULL
+crdb_internal  index_columns                table  NULL  NULL  NULL
+crdb_internal  invalid_objects              table  NULL  NULL  NULL
+crdb_internal  jobs                         table  NULL  NULL  NULL
+crdb_internal  kv_node_status               table  NULL  NULL  NULL
+crdb_internal  kv_store_status              table  NULL  NULL  NULL
+crdb_internal  leases                       table  NULL  NULL  NULL
+crdb_internal  node_build_info              table  NULL  NULL  NULL
+crdb_internal  node_inflight_trace_spans    table  NULL  NULL  NULL
+crdb_internal  node_metrics                 table  NULL  NULL  NULL
+crdb_internal  node_queries                 table  NULL  NULL  NULL
+crdb_internal  node_runtime_info            table  NULL  NULL  NULL
+crdb_internal  node_sessions                table  NULL  NULL  NULL
+crdb_internal  node_statement_statistics    table  NULL  NULL  NULL
+crdb_internal  node_transaction_statistics  table  NULL  NULL  NULL
+crdb_internal  node_transactions            table  NULL  NULL  NULL
+crdb_internal  node_txn_stats               table  NULL  NULL  NULL
+crdb_internal  partitions                   table  NULL  NULL  NULL
+crdb_internal  predefined_comments          table  NULL  NULL  NULL
+crdb_internal  ranges                       view   NULL  NULL  NULL
+crdb_internal  ranges_no_leases             table  NULL  NULL  NULL
+crdb_internal  schema_changes               table  NULL  NULL  NULL
+crdb_internal  session_trace                table  NULL  NULL  NULL
+crdb_internal  session_variables            table  NULL  NULL  NULL
+crdb_internal  table_columns                table  NULL  NULL  NULL
+crdb_internal  table_indexes                table  NULL  NULL  NULL
+crdb_internal  table_row_statistics         table  NULL  NULL  NULL
+crdb_internal  tables                       table  NULL  NULL  NULL
+crdb_internal  zones                        table  NULL  NULL  NULL
 
 statement ok
 CREATE DATABASE testdb; CREATE TABLE testdb.foo(x INT)
@@ -236,10 +240,10 @@ SELECT * FROM crdb_internal.table_indexes WHERE descriptor_name = ''
 ----
 descriptor_id  descriptor_name  index_id  index_name  index_type  is_unique  is_inverted
 
-query ITITTITT colnames
+query ITITTITTB colnames
 SELECT * FROM crdb_internal.index_columns WHERE descriptor_name = ''
 ----
-descriptor_id  descriptor_name  index_id  index_name  column_type  column_id  column_name  column_direction
+descriptor_id  descriptor_name  index_id  index_name  column_type  column_id  column_name  column_direction  implicit
 
 query ITIIITITT colnames
 SELECT * FROM crdb_internal.backward_dependencies WHERE descriptor_name = ''
@@ -256,6 +260,11 @@ SELECT * FROM crdb_internal.zones WHERE false
 ----
 zone_id  subzone_id  target  range_name  database_name  table_name  index_name  partition_name
 raw_config_yaml  raw_config_sql  raw_config_protobuf full_config_yaml full_config_sql
+
+query IIIITTT colnames
+SELECT * FROM crdb_internal.node_inflight_trace_spans WHERE span_id < 0
+----
+trace_id  parent_span_id  span_id  goroutine_id  start_time  duration  operation
 
 statement error not fully contained in tenant keyspace
 SELECT * FROM crdb_internal.ranges WHERE range_id < 0
@@ -334,11 +343,11 @@ CREATE TABLE foo (a INT PRIMARY KEY, INDEX idx(a)); INSERT INTO foo VALUES(1)
 statement error unsupported in multi-tenancy mode
 ALTER TABLE foo SPLIT AT VALUES(2)
 
-# Cluster ID is unset for tenants.
+# Make sure that the cluster id isn't unset.
 query B
 select crdb_internal.cluster_id() != '00000000-0000-0000-0000-000000000000' FROM foo
 ----
-false
+true
 
 # Check that privileged builtins are only allowed for 'root'
 user testuser

@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -40,7 +41,8 @@ var _ planNode = &dropSchemaNode{n: nil}
 
 func (p *planner) DropSchema(ctx context.Context, n *tree.DropSchema) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"DROP SCHEMA",
 	); err != nil {
 		return nil, err
@@ -61,7 +63,8 @@ func (p *planner) DropSchema(ctx context.Context, n *tree.DropSchema) (planNode,
 		}
 		scName := schema.Schema()
 
-		db, err := p.ResolveMutableDatabaseDescriptor(ctx, dbName, true /* required */)
+		_, db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, dbName,
+			tree.DatabaseLookupFlags{Required: true})
 		if err != nil {
 			return nil, err
 		}
@@ -166,18 +169,16 @@ func (n *dropSchemaNode) startExec(params runParams) error {
 	// in the same transaction as table descriptor update.
 	for _, schemaToDelete := range n.d.schemasToDelete {
 		sc := schemaToDelete.schema
-		if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			ctx,
-			p.txn,
-			EventLogDropSchema,
-			int32(sc.ID),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			struct {
-				SchemaName string
-				Statement  string
-				User       string
-			}{sc.Name, n.n.String(), p.User().Normalized()},
-		); err != nil {
+		qualifiedSchemaName, err := p.getQualifiedSchemaName(params.ctx, sc.Desc)
+		if err != nil {
+			return err
+		}
+
+		if err := params.p.logEvent(params.ctx,
+			sc.ID,
+			&eventpb.DropSchema{
+				SchemaName: qualifiedSchemaName.String(),
+			}); err != nil {
 			return err
 		}
 	}
@@ -219,7 +220,7 @@ func (p *planner) createDropSchemaJob(
 		typeIDs = append(typeIDs, t.ID)
 	}
 
-	_, err := p.extendedEvalCtx.QueueJob(jobs.Record{
+	_, err := p.extendedEvalCtx.QueueJob(p.EvalContext().Ctx(), jobs.Record{
 		Description:   jobDesc,
 		Username:      p.User(),
 		DescriptorIDs: schemas,

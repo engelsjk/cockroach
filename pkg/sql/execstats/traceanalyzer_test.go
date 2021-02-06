@@ -13,13 +13,14 @@ package execstats_test
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -28,7 +29,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -42,7 +46,7 @@ func TestTraceAnalyzer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	const (
-		testStmt = "SELECT * FROM test.foo"
+		testStmt = "SELECT * FROM test.foo ORDER BY v"
 		numNodes = 3
 	)
 
@@ -59,18 +63,12 @@ func TestTraceAnalyzer(t *testing.T) {
 							return func(map[roachpb.NodeID]*execinfrapb.FlowSpec) error { return nil }
 						}
 						return func(flows map[roachpb.NodeID]*execinfrapb.FlowSpec) error {
-							analyzer := execstats.NewTraceAnalyzer(flows)
+							flowMetadata := execstats.NewFlowMetadata(flows)
+							analyzer := execstats.MakeTraceAnalyzer(flowMetadata)
 							analyzerChan <- analyzer
 							return nil
 						}
 					},
-				},
-				DistSQL: &execinfra.TestingKnobs{
-					// DeterministicStats are set to eliminate variability when
-					// calculating expected results. Note that this sets some fields to 0
-					// (such as execution time), so a more dynamic approach might be
-					// needed for those kinds of tests.
-					DeterministicStats: true,
 				},
 			},
 		}})
@@ -105,7 +103,7 @@ func TestTraceAnalyzer(t *testing.T) {
 	)
 	for _, vectorizeMode := range []sessiondatapb.VectorizeExecMode{sessiondatapb.VectorizeOff, sessiondatapb.VectorizeOn} {
 		var sp *tracing.Span
-		ctx, sp = tracing.StartSnowballTrace(ctx, execCfg.AmbientCtx.Tracer, t.Name())
+		ctx, sp = tracing.StartVerboseTrace(ctx, execCfg.AmbientCtx.Tracer, t.Name())
 		ie := execCfg.InternalExecutor
 		ie.SetSessionData(
 			&sessiondata.SessionData{
@@ -128,7 +126,8 @@ func TestTraceAnalyzer(t *testing.T) {
 		require.NoError(t, err)
 		trace := sp.GetRecording()
 		analyzer := <-analyzerChan
-		require.NoError(t, analyzer.AddTrace(trace))
+		require.NoError(t, analyzer.AddTrace(trace, true /* makeDeterministic */))
+		require.NoError(t, analyzer.ProcessStats())
 		switch vectorizeMode {
 		case sessiondatapb.VectorizeOff:
 			rowexecTraceAnalyzer = analyzer
@@ -139,39 +138,140 @@ func TestTraceAnalyzer(t *testing.T) {
 		}
 	}
 
-	t.Run("NetworkBytesSent", func(t *testing.T) {
-		for _, tc := range []struct {
-			analyzer *execstats.TraceAnalyzer
-			// expectedBytes are defined as a range in order to not have to change
-			// this test too often if the wire format changes.
-			expectedBytesRange [2]int64
-		}{
-			{
-				analyzer:           rowexecTraceAnalyzer,
-				expectedBytesRange: [2]int64{32, 128},
-			},
-			{
-				analyzer: colexecTraceAnalyzer,
-				// Note that the expectedBytes in the colexec case is larger than the
-				// rowexec case because the DeterministicStats flag behaves differently
-				// in each case. In rowexec, the outbox row bytes are returned. In
-				// colexec, an artificial number proportional to the number of tuples is
-				// returned.
-				expectedBytesRange: [2]int64{128, 256},
-			},
-		} {
-			networkBytesGroupedByNode, err := tc.analyzer.GetNetworkBytesSent()
-			require.NoError(t, err)
+	for _, tc := range []struct {
+		name                string
+		analyzer            *execstats.TraceAnalyzer
+		expectedMaxMemUsage int64
+	}{
+		{
+			name:                "RowExec",
+			analyzer:            rowexecTraceAnalyzer,
+			expectedMaxMemUsage: int64(20480),
+		},
+		{
+			name:                "ColExec",
+			analyzer:            colexecTraceAnalyzer,
+			expectedMaxMemUsage: int64(51200),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nodeLevelStats := tc.analyzer.GetNodeLevelStats()
 			require.Equal(
-				t, numNodes-1, len(networkBytesGroupedByNode), "expected all nodes minus the gateway node to have sent bytes",
+				t, numNodes-1, len(nodeLevelStats.NetworkBytesSentGroupedByNode), "expected all nodes minus the gateway node to have sent bytes",
+			)
+			require.Equal(
+				t, numNodes, len(nodeLevelStats.MaxMemoryUsageGroupedByNode), "expected all nodes to have specified maximum memory usage",
 			)
 
-			var actualBytes int64
-			for _, bytes := range networkBytesGroupedByNode {
-				actualBytes += bytes
-			}
-			require.GreaterOrEqual(t, actualBytes, tc.expectedBytesRange[0])
-			require.LessOrEqual(t, actualBytes, tc.expectedBytesRange[1])
-		}
-	})
+			queryLevelStats := tc.analyzer.GetQueryLevelStats()
+
+			// The stats don't count the actual bytes, but they are a synthetic value
+			// based on the number of tuples. In this test 21 tuples flow over the
+			// network.
+			require.Equal(t, int64(21*8), queryLevelStats.NetworkBytesSent)
+
+			require.Equal(t, tc.expectedMaxMemUsage, queryLevelStats.MaxMemUsage)
+
+			require.Equal(t, int64(30), queryLevelStats.KVRowsRead)
+			// For tests, the bytes read is based on the number of rows read, rather
+			// than actual bytes read.
+			require.Equal(t, int64(30*8), queryLevelStats.KVBytesRead)
+
+			// For tests, network messages is a synthetic value based on the number of
+			// network tuples. In this test 21 tuples flow over the network.
+			require.Equal(t, int64(21/2), queryLevelStats.NetworkMessages)
+		})
+	}
+}
+
+func TestTraceAnalyzerProcessStats(t *testing.T) {
+	const (
+		node1Time      = 3 * time.Second
+		node2Time      = 5 * time.Second
+		cumulativeTime = node1Time + node2Time
+	)
+	a := &execstats.TraceAnalyzer{FlowMetadata: &execstats.FlowMetadata{}}
+	a.AddComponentStats(
+		1, /* nodeID */
+		&execinfrapb.ComponentStats{
+			Component: execinfrapb.ProcessorComponentID(
+				execinfrapb.FlowID{UUID: uuid.MakeV4()},
+				1, /* processorID */
+			),
+			KV: execinfrapb.KVStats{
+				KVTime:         optional.MakeTimeValue(node1Time),
+				ContentionTime: optional.MakeTimeValue(node1Time),
+			},
+		},
+	)
+
+	a.AddComponentStats(
+		2, /* nodeID */
+		&execinfrapb.ComponentStats{
+			Component: execinfrapb.ProcessorComponentID(
+				execinfrapb.FlowID{UUID: uuid.MakeV4()},
+				2, /* processorID */
+			),
+			KV: execinfrapb.KVStats{
+				KVTime:         optional.MakeTimeValue(node2Time),
+				ContentionTime: optional.MakeTimeValue(node2Time),
+			},
+		},
+	)
+
+	expected := execstats.QueryLevelStats{
+		KVTime:         cumulativeTime,
+		ContentionTime: cumulativeTime,
+	}
+
+	assert.NoError(t, a.ProcessStats())
+	if got := a.GetQueryLevelStats(); !reflect.DeepEqual(got, expected) {
+		t.Errorf("ProcessStats() = %v, want %v", got, expected)
+	}
+}
+
+func TestQueryLevelStatsAccumulate(t *testing.T) {
+	a := execstats.QueryLevelStats{
+		NetworkBytesSent: 1,
+		MaxMemUsage:      2,
+		KVBytesRead:      3,
+		KVRowsRead:       4,
+		KVTime:           5 * time.Second,
+		NetworkMessages:  6,
+		ContentionTime:   7 * time.Second,
+	}
+	b := execstats.QueryLevelStats{
+		NetworkBytesSent: 8,
+		MaxMemUsage:      9,
+		KVBytesRead:      10,
+		KVRowsRead:       11,
+		KVTime:           12 * time.Second,
+		NetworkMessages:  13,
+		ContentionTime:   14 * time.Second,
+	}
+	expected := execstats.QueryLevelStats{
+		NetworkBytesSent: 9,
+		MaxMemUsage:      9,
+		KVBytesRead:      13,
+		KVRowsRead:       15,
+		KVTime:           17 * time.Second,
+		NetworkMessages:  19,
+		ContentionTime:   21 * time.Second,
+	}
+
+	aCopy := a
+	a.Accumulate(b)
+	require.Equal(t, expected, a)
+
+	reflectedAccumulatedStats := reflect.ValueOf(a)
+	reflectedOriginalStats := reflect.ValueOf(aCopy)
+	for i := 0; i < reflectedAccumulatedStats.NumField(); i++ {
+		require.NotEqual(
+			t,
+			reflectedAccumulatedStats.Field(i).Interface(),
+			reflectedOriginalStats.Field(i).Interface(),
+			"no struct field should be the same after accumulation in this test but %s was unchanged, did you forget to update Accumulate?",
+			reflectedAccumulatedStats.Type().Field(i).Name,
+		)
+	}
 }

@@ -140,6 +140,7 @@ var _ planNode = &alterIndexNode{}
 var _ planNode = &alterSchemaNode{}
 var _ planNode = &alterSequenceNode{}
 var _ planNode = &alterTableNode{}
+var _ planNode = &alterTableOwnerNode{}
 var _ planNode = &alterTableSetSchemaNode{}
 var _ planNode = &alterTypeNode{}
 var _ planNode = &bufferNode{}
@@ -167,7 +168,6 @@ var _ planNode = &dropTypeNode{}
 var _ planNode = &DropRoleNode{}
 var _ planNode = &dropViewNode{}
 var _ planNode = &errorIfRowsNode{}
-var _ planNode = &explainDistSQLNode{}
 var _ planNode = &explainVecNode{}
 var _ planNode = &filterNode{}
 var _ planNode = &GrantRoleNode{}
@@ -228,6 +228,7 @@ var _ planNodeReadingOwnWrites = &alterTableNode{}
 var _ planNodeReadingOwnWrites = &alterTypeNode{}
 var _ planNodeReadingOwnWrites = &createIndexNode{}
 var _ planNodeReadingOwnWrites = &createSequenceNode{}
+var _ planNodeReadingOwnWrites = &createDatabaseNode{}
 var _ planNodeReadingOwnWrites = &createTableNode{}
 var _ planNodeReadingOwnWrites = &createTypeNode{}
 var _ planNodeReadingOwnWrites = &createViewNode{}
@@ -266,10 +267,8 @@ var _ planNodeSpooled = &spoolNode{}
 type flowInfo struct {
 	typ     planComponentType
 	diagram execinfrapb.FlowDiagram
-	// analyzer is a TraceAnalyzer that has been initialized with the
-	// corresponding flow. Users of this field will want to add a corresponding
-	// trace in order to calculate statistics.
-	analyzer *execstats.TraceAnalyzer
+	// FlowMetadata stores metadata from flows that will be used by TraceAnalyzer.
+	flowMetadata *execstats.FlowMetadata
 }
 
 // planTop is the struct that collects the properties
@@ -467,14 +466,6 @@ func (p *planTop) savePlanInfo(ctx context.Context) {
 	p.instrumentation.RecordPlanInfo(distribution, vectorized)
 }
 
-// formatOptPlan returns a visual representation of the optimizer plan that was
-// used.
-func (p *planTop) formatOptPlan(flags memo.ExprFmtFlags) string {
-	f := memo.MakeExprFmtCtx(flags, p.mem, p.catalog)
-	f.FormatExpr(p.mem.RootExpr())
-	return f.Buffer.String()
-}
-
 // startExec calls startExec() on each planNode using a depth-first, post-order
 // traversal.  The subqueries, if any, are also started.
 //
@@ -489,7 +480,7 @@ func startExec(params runParams, plan planNode) error {
 	o := planObserver{
 		enterNode: func(ctx context.Context, _ string, p planNode) (bool, error) {
 			switch p.(type) {
-			case *explainDistSQLNode, *explainVecNode:
+			case *explainVecNode, *explainDDLNode:
 				// Do not recurse: we're not starting the plan if we just show its structure with EXPLAIN.
 				return false, nil
 			case *showTraceNode:
@@ -525,14 +516,6 @@ func (p *planner) maybePlanHook(ctx context.Context, stmt tree.Statement) (planN
 			return &hookFnNode{f: fn, header: header, subplans: subplans}, nil
 		}
 	}
-	for _, planHook := range wrappedPlanHooks {
-		if node, err := planHook(ctx, stmt, p); err != nil {
-			return nil, err
-		} else if node != nil {
-			return node, err
-		}
-	}
-
 	return nil, nil
 }
 

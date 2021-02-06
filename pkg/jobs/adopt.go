@@ -21,10 +21,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
+
+const claimableStatusTupleString = `(` +
+	`'` + string(StatusRunning) + `', ` +
+	`'` + string(StatusPending) + `', ` +
+	`'` + string(StatusCancelRequested) + `', ` +
+	`'` + string(StatusPauseRequested) + `', ` +
+	`'` + string(StatusReverting) + `'` +
+	`)`
 
 // claimJobs places a claim with the given SessionID to job rows that are
 // available.
@@ -35,14 +42,11 @@ func (r *Registry) claimJobs(ctx context.Context, s sqlliveness.Session) error {
    UPDATE system.jobs
       SET claim_session_id = $1, claim_instance_id = $2
     WHERE claim_session_id IS NULL
-      AND status NOT IN ($3, $4, $5)
+      AND status IN `+claimableStatusTupleString+`
  ORDER BY created DESC
-    LIMIT $6
+    LIMIT $3
 RETURNING id;`,
-			s.ID().UnsafeBytes(), r.ID(),
-			// Don't touch terminal jobs.
-			StatusSucceeded, StatusCanceled, StatusFailed,
-			maxAdoptionsPerLoop,
+			s.ID().UnsafeBytes(), r.ID(), maxAdoptionsPerLoop,
 		)
 		if err != nil {
 			return errors.Wrap(err, "could not query jobs table")
@@ -182,28 +186,17 @@ FROM system.jobs WHERE id = $1 AND claim_session_id = $2`,
 		return err
 	}
 	resumeCtx, cancel := r.makeCtx()
-	resultsCh := make(chan tree.Datums)
 
-	errCh := make(chan error, 1)
 	aj := &adoptedJob{sid: s.ID(), cancel: cancel}
 	r.addAdoptedJob(jobID, aj)
 	if err := r.stopper.RunAsyncTask(ctx, job.taskName(), func(ctx context.Context) {
-		r.runJob(resumeCtx, resumer, resultsCh, errCh, job, status, job.taskName(), nil)
+		// Wait for the job to finish. No need to print the error because if there
+		// was one it's been set in the job status already.
+		_ = r.runJob(resumeCtx, resumer, job, status, job.taskName())
 	}); err != nil {
 		r.removeAdoptedJob(jobID)
 		return err
 	}
-	go func() {
-		// Drain and ignore results.
-		for range resultsCh {
-		}
-	}()
-	go func() {
-		// Wait for the job to finish. No need to print the error because if there
-		// was one it's been set in the job status already.
-		<-errCh
-		close(resultsCh)
-	}()
 	return nil
 }
 
@@ -220,19 +213,8 @@ func (r *Registry) addAdoptedJob(jobID int64, aj *adoptedJob) {
 }
 
 func (r *Registry) runJob(
-	ctx context.Context,
-	resumer Resumer,
-	resultsCh chan<- tree.Datums,
-	errCh chan<- error,
-	job *Job,
-	status Status,
-	taskName string,
-	onDone func(),
-) {
-	if onDone != nil {
-		defer onDone()
-	}
-
+	ctx context.Context, resumer Resumer, job *Job, status Status, taskName string,
+) error {
 	job.mu.Lock()
 	var finalResumeError error
 	if job.mu.payload.FinalResumeError != nil {
@@ -251,21 +233,15 @@ func (r *Registry) runJob(
 	defer span.Finish()
 
 	// Run the actual job.
-	err := r.stepThroughStateMachine(ctx, execCtx, resumer, resultsCh, job, status, finalResumeError)
-	if err != nil {
-		// TODO (lucy): This needs to distinguish between assertion errors in
-		// the job registry and assertion errors in job execution returned from
-		// Resume() or OnFailOrCancel(), and only fail on the former. We have
-		// tests that purposely introduce bad state in order to produce
-		// assertion errors, which shouldn't cause the test to panic. For now,
-		// comment this out.
-		// if errors.HasAssertionFailure(err) {
-		// 	logcrash.ReportOrPanic(ctx, nil, err.Error())
-		// }
+	err := r.stepThroughStateMachine(ctx, execCtx, resumer, job, status, finalResumeError)
+	// If the context has been canceled, disregard errors for the sake of logging
+	// as presumably they are due to the context cancellation which commonly
+	// happens during shutdown.
+	if err != nil && ctx.Err() == nil {
 		log.Errorf(ctx, "job %d: adoption completed with error %v", *job.ID(), err)
 	}
 	r.unregister(*job.ID())
-	errCh <- err
+	return err
 }
 
 func (r *Registry) servePauseAndCancelRequests(ctx context.Context, s sqlliveness.Session) error {
@@ -291,7 +267,8 @@ RETURNING id, status`,
 		for _, row := range rows {
 			id := int64(*row[0].(*tree.DInt))
 			job := &Job{id: &id, registry: r}
-			switch Status(*row[1].(*tree.DString)) {
+			statusString := *row[1].(*tree.DString)
+			switch Status(statusString) {
 			case StatusPaused:
 				r.unregister(id)
 				log.Infof(ctx, "job %d, session %s: paused", id, s.ID())
@@ -309,7 +286,7 @@ RETURNING id, status`,
 				log.Infof(ctx, "job %d, session id: %s canceled: the job is now reverting",
 					id, s.ID())
 			default:
-				logcrash.ReportOrPanic(ctx, nil, "unexpected job status")
+				return errors.AssertionFailedf("unexpected job status %s: %v", statusString, job)
 			}
 		}
 		return nil

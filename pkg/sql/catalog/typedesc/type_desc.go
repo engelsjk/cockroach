@@ -201,6 +201,31 @@ func (desc *Immutable) DescriptorProto() *descpb.Descriptor {
 	}
 }
 
+// PrimaryRegionName returns the primary region for a multi-region enum.
+func (desc *Immutable) PrimaryRegionName() (descpb.RegionName, error) {
+	if desc.Kind != descpb.TypeDescriptor_MULTIREGION_ENUM {
+		return "", errors.AssertionFailedf(
+			"can not get primary region of a non multi-region enum")
+	}
+	return desc.RegionConfig.PrimaryRegion, nil
+}
+
+// RegionNames returns all the regions on the multi-region enum.
+// This includes regions that are in `READ_ONLY` state as well, if they've just
+// been added or are in the process of being removed (pre-validation).
+func (desc *Immutable) RegionNames() (descpb.RegionNames, error) {
+	if desc.Kind != descpb.TypeDescriptor_MULTIREGION_ENUM {
+		return nil, errors.AssertionFailedf(
+			"can not get regions of a non multi-region enum %d", desc.ID,
+		)
+	}
+	var regions descpb.RegionNames
+	for _, member := range desc.EnumMembers {
+		regions = append(regions, descpb.RegionName(member.LogicalRepresentation))
+	}
+	return regions, nil
+}
+
 // SetDrainingNames implements the MutableDescriptor interface.
 func (desc *Mutable) SetDrainingNames(names []descpb.NameInfo) {
 	desc.DrainingNames = names
@@ -282,6 +307,20 @@ func (desc *Mutable) SetOffline(reason string) {
 	desc.OfflineReason = reason
 }
 
+// DropEnumValue removes an enum member from the type.
+// DropEnumValue assumes that the type is an enum and that the value being
+// removed is in the prerequisite state to remove.
+func (desc *Mutable) DropEnumValue(value tree.EnumValue) {
+	for i := range desc.EnumMembers {
+		member := &desc.EnumMembers[i]
+		if member.LogicalRepresentation == string(value) {
+			member.Capability = descpb.TypeDescriptor_EnumMember_READ_ONLY
+			member.Direction = descpb.TypeDescriptor_EnumMember_REMOVE
+			break
+		}
+	}
+}
+
 // AddEnumValue adds an enum member to the type.
 // AddEnumValue assumes that the type is an enum, and that the new value
 // doesn't exist already in the enum.
@@ -327,6 +366,7 @@ func (desc *Mutable) AddEnumValue(node *tree.AlterTypeAddValue) error {
 		LogicalRepresentation:  string(node.NewVal),
 		PhysicalRepresentation: newPhysicalRep,
 		Capability:             descpb.TypeDescriptor_EnumMember_READ_ONLY,
+		Direction:              descpb.TypeDescriptor_EnumMember_ADD,
 	}
 
 	// Now, insert the new member.
@@ -404,7 +444,21 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 	}
 
 	switch desc.Kind {
-	case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_MULTIREGION_ENUM:
+	case descpb.TypeDescriptor_MULTIREGION_ENUM:
+		// In the case of the multi-region enum, we also keep the logical descriptors
+		// sorted. Validate that's the case.
+		for i := 0; i < len(desc.EnumMembers)-1; i++ {
+			if desc.EnumMembers[i].LogicalRepresentation > desc.EnumMembers[i+1].LogicalRepresentation {
+				return errors.AssertionFailedf(
+					"multi-region enum is out of order %q > %q",
+					desc.EnumMembers[i].LogicalRepresentation,
+					desc.EnumMembers[i+1].LogicalRepresentation,
+				)
+			}
+		}
+		// Now do all of the checking for ordinary enums, which also apply to multi-region enums.
+		fallthrough
+	case descpb.TypeDescriptor_ENUM:
 		// All of the enum members should be in sorted order.
 		if !sort.IsSorted(EnumMembers(desc.EnumMembers)) {
 			return errors.AssertionFailedf("enum members are not sorted %v", desc.EnumMembers)
@@ -425,6 +479,23 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 			members[desc.EnumMembers[i].LogicalRepresentation] = struct{}{}
 		}
 
+		// Ensure the sanity of enum capabilities and transition directions.
+		for _, member := range desc.EnumMembers {
+			switch member.Capability {
+			case descpb.TypeDescriptor_EnumMember_READ_ONLY:
+				if member.Direction == descpb.TypeDescriptor_EnumMember_NONE {
+					return errors.AssertionFailedf(
+						"read only capability member must have transition direction set")
+				}
+			case descpb.TypeDescriptor_EnumMember_ALL:
+				if member.Direction != descpb.TypeDescriptor_EnumMember_NONE {
+					return errors.AssertionFailedf("public enum member can not have transition direction set")
+				}
+			default:
+				return errors.AssertionFailedf("invalid member capability %s", member.Capability)
+			}
+		}
+
 		// Validate the Privileges of the descriptor.
 		if err := desc.Privileges.Validate(desc.ID, privilege.Type); err != nil {
 			return err
@@ -437,6 +508,22 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 		return errors.AssertionFailedf("invalid desc kind %s", desc.Kind.String())
 	}
 
+	switch desc.Kind {
+	case descpb.TypeDescriptor_MULTIREGION_ENUM:
+		if desc.RegionConfig == nil {
+			return errors.AssertionFailedf("no region config on %s type desc", desc.Kind.String())
+		}
+	default:
+		if desc.RegionConfig != nil {
+			return errors.AssertionFailedf("found region config on %s type desc", desc.Kind.String())
+		}
+	}
+
+	// Don't validate cross-references for dropped descriptors.
+	if desc.Dropped() {
+		return nil
+	}
+
 	// Validate all cross references on the descriptor.
 
 	// Buffer all the requested requests and error checks together to run at once.
@@ -444,16 +531,74 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 	var reqs []descpb.ID
 
 	// Validate the parentID.
-	// TODO(#multiregion): This is hacky and in reality we should be checking the parentID
-	// exists regardless of what the type descriptor kind is. For now, I have this
-	// here because the multi region enum can't read the database descriptor that
-	// was created as part of the same txn.
-	// See https://github.com/cockroachdb/cockroach/issues/57087
-	if desc.Kind != descpb.TypeDescriptor_MULTIREGION_ENUM {
+	reqs = append(reqs, desc.ParentID)
+	checks = append(checks, func(got catalog.Descriptor) error {
+		if _, isDB := got.(catalog.DatabaseDescriptor); !isDB {
+			return errors.AssertionFailedf("parentID %d does not exist", errors.Safe(desc.ParentID))
+		}
+		return nil
+	})
+
+	switch desc.Kind {
+	case descpb.TypeDescriptor_MULTIREGION_ENUM:
+		// Validate regions on the parent database and the type descriptor are
+		// consistent.
 		reqs = append(reqs, desc.ParentID)
 		checks = append(checks, func(got catalog.Descriptor) error {
-			if _, isDB := got.(catalog.DatabaseDescriptor); !isDB {
+			dbDesc, isDB := got.(catalog.DatabaseDescriptor)
+			if !isDB {
 				return errors.AssertionFailedf("parentID %d does not exist", errors.Safe(desc.ParentID))
+			}
+			// Parent database must be a multi-region database if it includes a
+			// multi-region enum.
+
+			if !dbDesc.IsMultiRegion() {
+				return errors.AssertionFailedf("parent database is not a multi-region database")
+			}
+			dbRegions, err := dbDesc.RegionNames()
+			if err != nil {
+				return err
+			}
+
+			if len(desc.EnumMembers) != len(dbRegions) {
+				return errors.AssertionFailedf(
+					"unexpected number of regions on db desc: %d expected %d",
+					len(dbRegions), len(desc.EnumMembers))
+			}
+
+			regions := make(map[descpb.RegionName]struct{}, len(dbRegions))
+			for _, region := range dbRegions {
+				regions[region] = struct{}{}
+			}
+
+			for i := range desc.EnumMembers {
+				enumRegion := descpb.RegionName(desc.EnumMembers[i].LogicalRepresentation)
+				if _, ok := regions[enumRegion]; !ok {
+					return errors.AssertionFailedf("did not find %q region on database descriptor", enumRegion)
+				}
+			}
+			return nil
+		})
+
+		// Validate the primary region on the parent database and the type
+		// descriptor is consistent.
+		reqs = append(reqs, desc.ParentID)
+		checks = append(checks, func(got catalog.Descriptor) error {
+			dbDesc, isDB := got.(catalog.DatabaseDescriptor)
+			if !isDB {
+				return errors.AssertionFailedf("parentID %d does not exist", errors.Safe(desc.ParentID))
+			}
+			dbPrimaryRegion, err := dbDesc.PrimaryRegionName()
+			if err != nil {
+				return err
+			}
+			primaryRegion, err := desc.PrimaryRegionName()
+			if err != nil {
+				return err
+			}
+			if dbPrimaryRegion != primaryRegion {
+				return errors.AssertionFailedf("unexpected primary region on db desc: %q expected %q",
+					dbPrimaryRegion, primaryRegion)
 			}
 			return nil
 		})
@@ -471,22 +616,18 @@ func (desc *Immutable) Validate(ctx context.Context, dg catalog.DescGetter) erro
 	}
 
 	switch desc.Kind {
-	case descpb.TypeDescriptor_ENUM:
+	case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_MULTIREGION_ENUM:
 		// Ensure that the referenced array type exists.
 		reqs = append(reqs, desc.ArrayTypeID)
 		checks = append(checks, func(got catalog.Descriptor) error {
 			if _, isType := got.(catalog.TypeDescriptor); !isType {
-				return errors.AssertionFailedf("arrayTypeID %d does not exist", errors.Safe(desc.ArrayTypeID))
+				return errors.AssertionFailedf("arrayTypeID %d does not exist for %q", errors.Safe(desc.ArrayTypeID), desc.Kind.String())
 			}
 			return nil
 		})
 	case descpb.TypeDescriptor_ALIAS:
 		if desc.ArrayTypeID != descpb.InvalidID {
 			return errors.AssertionFailedf("ALIAS type desc has array type ID %d", desc.ArrayTypeID)
-		}
-	case descpb.TypeDescriptor_MULTIREGION_ENUM:
-		if desc.ArrayTypeID != descpb.InvalidID {
-			return errors.AssertionFailedf("MULTIREGION_ENUM type desc has array type ID %d", desc.ArrayTypeID)
 		}
 	default:
 		return errors.New("unknown type descriptor type")

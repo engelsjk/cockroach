@@ -19,13 +19,14 @@ go_library(
         "//pkg/geo",
         "//pkg/geo/geopb",
         "//pkg/roachpb",
+        "//pkg/sql/inverted",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/util/encoding",
         "//pkg/util/syncutil",
         "//pkg/util/unique",
-        "//vendor/github.com/cockroachdb/apd/v2:apd",
-        "//vendor/github.com/cockroachdb/errors",
+        "@com_github_cockroachdb_apd_v2//:apd",
+        "@com_github_cockroachdb_errors//:errors",
     ],
 )
 
@@ -38,12 +39,13 @@ go_test(
     data = glob(["testdata/**"]),
     embed = [":json"],
     deps = [
+        "//pkg/sql/inverted",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/util/encoding",
         "//pkg/util/randutil",
         "//pkg/util/timeutil",
         "//pkg/util/unique",
-        "//vendor/github.com/cockroachdb/apd/v2:apd",
-        "//vendor/github.com/stretchr/testify/require",
+        "@com_github_cockroachdb_apd_v2//:apd",
+        "@com_github_stretchr_testify//require",
     ],
 )

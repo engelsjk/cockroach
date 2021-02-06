@@ -17,6 +17,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -25,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
@@ -37,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
@@ -92,27 +95,31 @@ type extendedEvalContext struct {
 	schemaAccessors *schemaInterface
 
 	sqlStatsCollector *sqlStatsCollector
+
+	SchemaChangerState *SchemaChangerState
 }
 
 // copy returns a deep copy of ctx.
-func (ctx *extendedEvalContext) copy() *extendedEvalContext {
-	cpy := *ctx
-	cpy.EvalContext = *ctx.EvalContext.Copy()
+func (evalCtx *extendedEvalContext) copy() *extendedEvalContext {
+	cpy := *evalCtx
+	cpy.EvalContext = *evalCtx.EvalContext.Copy()
 	return &cpy
 }
 
 // QueueJob creates a new job from record and queues it for execution after
 // the transaction commits.
-func (ctx *extendedEvalContext) QueueJob(record jobs.Record) (*jobs.Job, error) {
-	job, err := ctx.ExecCfg.JobRegistry.CreateJobWithTxn(
-		ctx.Context,
+func (evalCtx *extendedEvalContext) QueueJob(
+	ctx context.Context, record jobs.Record,
+) (*jobs.Job, error) {
+	job, err := evalCtx.ExecCfg.JobRegistry.CreateJobWithTxn(
+		ctx,
 		record,
-		ctx.Txn,
+		evalCtx.Txn,
 	)
 	if err != nil {
 		return nil, err
 	}
-	*ctx.Jobs = append(*ctx.Jobs, *job.ID())
+	*evalCtx.Jobs = append(*evalCtx.Jobs, *job.ID())
 	return job, nil
 }
 
@@ -217,8 +224,8 @@ type planner struct {
 	contextDatabaseID descpb.ID
 }
 
-func (ctx *extendedEvalContext) setSessionID(sessionID ClusterWideID) {
-	ctx.SessionID = sessionID
+func (evalCtx *extendedEvalContext) setSessionID(sessionID ClusterWideID) {
+	evalCtx.SessionID = sessionID
 }
 
 // noteworthyInternalMemoryUsageBytes is the minimum size tracked by each
@@ -466,10 +473,10 @@ func (p *planner) DistSQLPlanner() *DistSQLPlanner {
 	return p.extendedEvalCtx.DistSQLPlanner
 }
 
-// ParseType implements the tree.EvalPlanner interface.
+// GetTypeFromValidSQLSyntax implements the tree.EvalPlanner interface.
 // We define this here to break the dependency from eval.go to the parser.
-func (p *planner) ParseType(sql string) (*types.T, error) {
-	ref, err := parser.ParseType(sql)
+func (p *planner) GetTypeFromValidSQLSyntax(sql string) (*types.T, error) {
+	ref, err := parser.GetTypeFromValidSQLSyntax(sql)
 	if err != nil {
 		return nil, err
 	}
@@ -492,7 +499,7 @@ func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tre
 	if err != nil {
 		return 0, err
 	}
-	return tree.ID(desc.ID), nil
+	return tree.ID(desc.GetID()), nil
 }
 
 // LookupTableByID looks up a table, by the given descriptor ID. Based on the
@@ -502,12 +509,12 @@ func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tre
 //  of having its own logic for lookups.
 func (p *planner) LookupTableByID(
 	ctx context.Context, tableID descpb.ID,
-) (*tabledesc.Immutable, error) {
+) (catalog.TableDescriptor, error) {
 	if entry, err := p.getVirtualTabler().getVirtualTableEntryByID(tableID); err == nil {
 		return entry.desc, nil
 	}
 	flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{AvoidCached: p.avoidCachedDescriptors}}
-	table, err := p.Descriptors().GetTableVersionByID(ctx, p.txn, tableID, flags)
+	table, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, tableID, flags)
 	if err != nil {
 		return nil, err
 	}
@@ -713,4 +720,27 @@ type txnModesSetter interface {
 	// transaction.
 	// asOfTs, if not empty, is the evaluation of modes.AsOf.
 	setTransactionModes(modes tree.TransactionModes, asOfTs hlc.Timestamp) error
+}
+
+// CompactEngineSpan is part of the EvalPlanner interface.
+func (p *planner) CompactEngineSpan(
+	ctx context.Context, nodeID int32, storeID int32, startKey []byte, endKey []byte,
+) error {
+	if !p.ExecCfg().Codec.ForSystemTenant() {
+		return errorutil.UnsupportedWithMultiTenancy(errorutil.FeatureNotAvailableToNonSystemTenantsIssue)
+	}
+	conn, err := p.ExecCfg().DistSender.NodeDialer().Dial(ctx, roachpb.NodeID(nodeID), rpc.DefaultClass)
+	if err != nil {
+		return errors.Wrapf(err, "could not dial node ID %d", nodeID)
+	}
+	client := kvserver.NewPerStoreClient(conn)
+	req := &kvserver.CompactEngineSpanRequest{
+		StoreRequestHeader: kvserver.StoreRequestHeader{
+			NodeID:  roachpb.NodeID(nodeID),
+			StoreID: roachpb.StoreID(storeID),
+		},
+		Span: roachpb.Span{Key: roachpb.Key(startKey), EndKey: roachpb.Key(endKey)},
+	}
+	_, err = client.CompactEngineSpan(ctx, req)
+	return err
 }

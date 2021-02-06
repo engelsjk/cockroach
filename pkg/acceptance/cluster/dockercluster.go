@@ -150,7 +150,7 @@ func CreateDocker(
 	ctx context.Context, cfg TestConfig, volumesDir string, stopper *stop.Stopper,
 ) *DockerCluster {
 	select {
-	case <-stopper.ShouldStop():
+	case <-stopper.ShouldQuiesce():
 		// The stopper was already closed, exit early.
 		os.Exit(1)
 	default:
@@ -538,6 +538,10 @@ func (l *DockerCluster) processEvent(ctx context.Context, event events.Message) 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// Logging everything we get from Docker in service of finding the root
+	// cause of #58955.
+	log.Infof(ctx, "processing event from Docker: %+v", event)
+
 	// If there's currently a oneshot container, ignore any die messages from
 	// it because those are expected.
 	if l.oneshot != nil && event.ID == l.oneshot.id && event.Status == eventDie {
@@ -563,7 +567,7 @@ func (l *DockerCluster) processEvent(ctx context.Context, event events.Message) 
 
 	// An event on any other container is unexpected. Die.
 	select {
-	case <-l.stopper.ShouldStop():
+	case <-l.stopper.ShouldQuiesce():
 	case <-l.monitorCtx.Done():
 	default:
 		// There is a very tiny race here: the signal handler might be closing the
@@ -698,7 +702,7 @@ func (l *DockerCluster) AssertAndStop(ctx context.Context, t testing.TB) {
 func (l *DockerCluster) stop(ctx context.Context) {
 	if *waitOnStop {
 		log.Infof(ctx, "waiting for interrupt")
-		<-l.stopper.ShouldStop()
+		<-l.stopper.ShouldQuiesce()
 	}
 
 	log.Infof(ctx, "stopping")

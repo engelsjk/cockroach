@@ -227,7 +227,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 		targetColMeta := mb.md.ColumnMeta(targetColID)
 		desiredType := targetColMeta.Type
 		texpr := inScope.resolveType(expr, desiredType)
-		scopeCol := mb.b.addColumn(projectionsScope, targetColMeta.Alias+"_new", texpr)
+		scopeCol := projectionsScope.addColumn(targetColMeta.Alias+"_new", texpr)
 		mb.b.buildScalar(texpr, inScope, projectionsScope, scopeCol, nil)
 
 		checkCol(scopeCol, targetColID)
@@ -304,13 +304,7 @@ func (mb *mutationBuilder) addSynthesizedColsForUpdate() {
 	// table. These are not visible to queries, and will always be updated to
 	// their default values. This is necessary because they may not yet have been
 	// set by the backfiller.
-	mb.addSynthesizedCols(
-		mb.updateColIDs,
-		func(colOrd int) bool {
-			col := mb.tab.Column(colOrd)
-			return !col.IsComputed() && col.IsMutation()
-		},
-	)
+	mb.addSynthesizedDefaultCols(mb.updateColIDs, false /* includeOrdinary */)
 
 	// Possibly round DECIMAL-related columns containing update values. Do
 	// this before evaluating computed expressions, since those may depend on
@@ -322,10 +316,7 @@ func (mb *mutationBuilder) addSynthesizedColsForUpdate() {
 	mb.disambiguateColumns()
 
 	// Add all computed columns in case their values have changed.
-	mb.addSynthesizedCols(
-		mb.updateColIDs,
-		func(colOrd int) bool { return mb.tab.Column(colOrd).IsComputed() },
-	)
+	mb.addSynthesizedComputedCols(mb.updateColIDs, true /* restrict */)
 
 	// Possibly round DECIMAL-related computed columns.
 	mb.roundDecimalValues(mb.updateColIDs, true /* roundComputedCols */)
@@ -345,8 +336,15 @@ func (mb *mutationBuilder) buildUpdate(returning tree.ReturningExprs) {
 
 	mb.addCheckConstraintCols()
 
-	// Add partial index put boolean columns to the input.
-	mb.projectPartialIndexPutCols(preCheckScope)
+	// Add the partial index predicate expressions to the table metadata.
+	// These expressions are used to prune fetch columns during
+	// normalization.
+	mb.b.addPartialIndexPredicatesForTable(mb.md.TableMeta(mb.tabID), nil /* scan */)
+
+	// Project partial index PUT and DEL boolean columns.
+	mb.projectPartialIndexPutAndDelCols(preCheckScope, mb.fetchScope)
+
+	mb.buildUniqueChecksForUpdate()
 
 	mb.buildFKChecksForUpdate()
 

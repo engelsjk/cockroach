@@ -162,11 +162,11 @@ func alterColumnTypeGeneral(
 	// general alter column type conversions.
 	if !params.p.ExecCfg().Settings.Version.IsActive(
 		params.ctx,
-		clusterversion.VersionAlterColumnTypeGeneral,
+		clusterversion.AlterColumnTypeGeneral,
 	) {
 		return pgerror.Newf(pgcode.FeatureNotSupported,
 			"version %v must be finalized to run this alter column type",
-			clusterversion.VersionAlterColumnTypeGeneral)
+			clusterversion.AlterColumnTypeGeneral)
 	}
 	if !params.SessionData().AlterColumnTypeGeneralEnabled {
 		return pgerror.WithCandidateCode(
@@ -186,7 +186,8 @@ func alterColumnTypeGeneral(
 		return colOwnsSequenceNotSupportedErr
 	}
 
-	// Disallow ALTER COLUMN TYPE general for columns that have a constraint.
+	// Disallow ALTER COLUMN TYPE general for columns that have a check
+	// constraint.
 	for i := range tableDesc.Checks {
 		uses, err := tableDesc.CheckConstraintUsesColumn(tableDesc.Checks[i], col.ID)
 		if err != nil {
@@ -197,6 +198,18 @@ func alterColumnTypeGeneral(
 		}
 	}
 
+	// Disallow ALTER COLUMN TYPE general for columns that have a
+	// UNIQUE WITHOUT INDEX constraint.
+	for _, uc := range tableDesc.AllActiveAndInactiveUniqueWithoutIndexConstraints() {
+		for _, id := range uc.ColumnIDs {
+			if col.ID == id {
+				return colWithConstraintNotSupportedErr
+			}
+		}
+	}
+
+	// Disallow ALTER COLUMN TYPE general for columns that have a foreign key
+	// constraint.
 	for _, fk := range tableDesc.AllActiveAndInactiveForeignKeys() {
 		for _, id := range append(fk.OriginColumnIDs, fk.ReferencedColumnIDs...) {
 			if col.ID == id {
@@ -207,9 +220,14 @@ func alterColumnTypeGeneral(
 
 	// Disallow ALTER COLUMN TYPE general for columns that are
 	// part of indexes.
-	for _, idx := range tableDesc.AllNonDropIndexes() {
-		for _, id := range append(idx.ColumnIDs, idx.ExtraColumnIDs...) {
-			if col.ID == id {
+	for _, idx := range tableDesc.NonDropIndexes() {
+		for i := 0; i < idx.NumColumns(); i++ {
+			if idx.GetColumnID(i) == col.ID {
+				return colInIndexNotSupportedErr
+			}
+		}
+		for i := 0; i < idx.NumExtraColumns(); i++ {
+			if idx.GetExtraColumnID(i) == col.ID {
 				return colInIndexNotSupportedErr
 			}
 		}
@@ -236,7 +254,7 @@ func alterColumnTypeGeneral(
 	}
 
 	nameExists := func(name string) bool {
-		_, _, err := tableDesc.FindColumnByName(tree.Name(name))
+		_, err := tableDesc.FindColumnWithName(tree.Name(name))
 		return err == nil
 	}
 

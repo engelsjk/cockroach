@@ -33,7 +33,7 @@ query T
 EXPLAIN (PLAN, VERBOSE) SELECT 1 a
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • values
   columns: (a)
@@ -44,7 +44,7 @@ query T
 EXPLAIN (VERBOSE,PLAN) SELECT 1 a
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • values
   columns: (a)
@@ -56,7 +56,7 @@ query T
 EXPLAIN (TYPES) SELECT 1 a
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • values
   columns: (a int)
@@ -90,7 +90,7 @@ query T
 EXPLAIN CREATE DATABASE foo
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • create database
 
@@ -98,7 +98,7 @@ query T
 EXPLAIN CREATE TABLE foo (x INT)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • create table
 
@@ -109,7 +109,7 @@ query T
 EXPLAIN CREATE INDEX a ON foo(x)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • create index
 
@@ -120,7 +120,7 @@ query T
 EXPLAIN DROP DATABASE foo
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • drop database
 
@@ -131,7 +131,7 @@ query T
 SELECT * FROM [EXPLAIN SHOW JOBS] WHERE info NOT LIKE '%size%' AND info NOT LIKE '%filter%'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • sort
 │ order: -column18,-started
@@ -149,7 +149,7 @@ query T
 EXPLAIN DROP INDEX foo@a
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • drop index
 
@@ -157,7 +157,7 @@ query T
 EXPLAIN ALTER TABLE foo ADD COLUMN y INT
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • alter table
 
@@ -165,7 +165,7 @@ query T
 EXPLAIN (VERBOSE) ALTER TABLE foo SPLIT AT VALUES (42)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • split
 │ columns: (key, pretty, split_enforced_until)
@@ -180,7 +180,7 @@ query T
 EXPLAIN DROP TABLE foo
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • drop table
 
@@ -188,7 +188,7 @@ query T
 EXPLAIN SHOW DATABASES
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • sort
 │ order: +name
@@ -200,7 +200,7 @@ query T
 SELECT * FROM [EXPLAIN SHOW TABLES] WHERE info NOT LIKE '%size%'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • sort
 │ order: +nspname,+relname
@@ -208,49 +208,48 @@ vectorized: false
 └── • render
     │
     └── • hash join (left outer)
-        │ equality: (column59) = (table_id)
+        │ equality: (column72) = (table_id)
         │
         ├── • render
         │   │
-        │   └── • hash join (right outer)
-        │       │ equality: (oid) = (relowner)
+        │   └── • hash join (left outer)
+        │       │ equality: (column54) = (table_id)
         │       │
-        │       ├── • virtual table
-        │       │     table: pg_roles@primary
+        │       ├── • render
+        │       │   │
+        │       │   └── • hash join (right outer)
+        │       │       │ equality: (oid) = (relowner)
+        │       │       │
+        │       │       ├── • virtual table
+        │       │       │     table: pg_roles@primary
+        │       │       │
+        │       │       └── • hash join
+        │       │           │ equality: (oid) = (relnamespace)
+        │       │           │
+        │       │           ├── • filter
+        │       │           │   │ filter: nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
+        │       │           │   │
+        │       │           │   └── • virtual table
+        │       │           │         table: pg_namespace@primary
+        │       │           │
+        │       │           └── • filter
+        │       │               │ filter: relkind IN ('S', 'm', 'r', 'v')
+        │       │               │
+        │       │               └── • virtual table
+        │       │                     table: pg_class@primary
         │       │
-        │       └── • hash join
-        │           │ equality: (oid) = (relnamespace)
-        │           │
-        │           ├── • filter
-        │           │   │ filter: nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
-        │           │   │
-        │           │   └── • virtual table
-        │           │         table: pg_namespace@primary
-        │           │
-        │           └── • hash join (left outer)
-        │               │ equality: (oid) = (objoid)
-        │               │
-        │               ├── • filter
-        │               │   │ filter: relkind IN ('S', 'm', 'r', 'v')
-        │               │   │
-        │               │   └── • virtual table
-        │               │         table: pg_class@primary
-        │               │
-        │               └── • filter
-        │                   │ filter: objsubid = 0
-        │                   │
-        │                   └── • virtual table
-        │                         table: pg_description@primary
+        │       └── • virtual table
+        │             table: table_row_statistics@primary
         │
         └── • virtual table
-              table: table_row_statistics@primary
+              table: tables@primary
 
 
 query T
 SELECT * FROM [EXPLAIN SHOW TABLES WITH COMMENT] WHERE info NOT LIKE '%size%'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • sort
 │ order: +nspname,+relname
@@ -258,48 +257,56 @@ vectorized: false
 └── • render
     │
     └── • hash join (left outer)
-        │ equality: (column59) = (table_id)
+        │ equality: (column77) = (table_id)
         │
         ├── • render
         │   │
-        │   └── • hash join (right outer)
-        │       │ equality: (oid) = (relowner)
+        │   └── • hash join (left outer)
+        │       │ equality: (column59) = (table_id)
         │       │
-        │       ├── • virtual table
-        │       │     table: pg_roles@primary
+        │       ├── • render
+        │       │   │
+        │       │   └── • hash join (right outer)
+        │       │       │ equality: (oid) = (relowner)
+        │       │       │
+        │       │       ├── • virtual table
+        │       │       │     table: pg_roles@primary
+        │       │       │
+        │       │       └── • hash join
+        │       │           │ equality: (oid) = (relnamespace)
+        │       │           │
+        │       │           ├── • filter
+        │       │           │   │ filter: nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
+        │       │           │   │
+        │       │           │   └── • virtual table
+        │       │           │         table: pg_namespace@primary
+        │       │           │
+        │       │           └── • hash join (left outer)
+        │       │               │ equality: (oid) = (objoid)
+        │       │               │
+        │       │               ├── • filter
+        │       │               │   │ filter: relkind IN ('S', 'm', 'r', 'v')
+        │       │               │   │
+        │       │               │   └── • virtual table
+        │       │               │         table: pg_class@primary
+        │       │               │
+        │       │               └── • filter
+        │       │                   │ filter: objsubid = 0
+        │       │                   │
+        │       │                   └── • virtual table
+        │       │                         table: pg_description@primary
         │       │
-        │       └── • hash join
-        │           │ equality: (oid) = (relnamespace)
-        │           │
-        │           ├── • filter
-        │           │   │ filter: nspname NOT IN ('crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension')
-        │           │   │
-        │           │   └── • virtual table
-        │           │         table: pg_namespace@primary
-        │           │
-        │           └── • hash join (left outer)
-        │               │ equality: (oid) = (objoid)
-        │               │
-        │               ├── • filter
-        │               │   │ filter: relkind IN ('S', 'm', 'r', 'v')
-        │               │   │
-        │               │   └── • virtual table
-        │               │         table: pg_class@primary
-        │               │
-        │               └── • filter
-        │                   │ filter: objsubid = 0
-        │                   │
-        │                   └── • virtual table
-        │                         table: pg_description@primary
+        │       └── • virtual table
+        │             table: table_row_statistics@primary
         │
         └── • virtual table
-              table: table_row_statistics@primary
+              table: tables@primary
 
 query T
 SELECT * FROM [EXPLAIN SHOW DATABASE] WHERE info NOT LIKE '%size%'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • filter
 │ filter: variable = 'database'
@@ -311,7 +318,7 @@ query T
 SELECT * FROM [EXPLAIN SHOW SCHEMAS] WHERE info NOT LIKE '%size%'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • sort
 │ order: +nspname
@@ -338,7 +345,7 @@ query T
 SELECT * FROM [EXPLAIN SHOW TIME ZONE] WHERE info NOT LIKE '%size%'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • filter
 │ filter: variable = 'timezone'
@@ -350,7 +357,7 @@ query T
 SELECT * FROM [EXPLAIN SHOW DEFAULT_TRANSACTION_ISOLATION] WHERE info NOT LIKE '%size%'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • filter
 │ filter: variable = 'default_transaction_isolation'
@@ -362,7 +369,7 @@ query T
 SELECT * FROM [EXPLAIN SHOW DEFAULT_TRANSACTION_PRIORITY] WHERE info NOT LIKE '%size%'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • filter
 │ filter: variable = 'default_transaction_priority'
@@ -371,10 +378,22 @@ vectorized: false
       table: session_variables@primary
 
 query T
+SELECT * FROM [EXPLAIN SHOW DEFAULT_TRANSACTION_USE_FOLLOWER_READS] WHERE info NOT LIKE '%size%'
+----
+distribution: local
+vectorized: true
+·
+• filter
+│ filter: variable = 'default_transaction_use_follower_reads'
+│
+└── • virtual table
+      table: session_variables@primary
+
+query T
 SELECT * FROM [EXPLAIN SHOW TRANSACTION ISOLATION LEVEL] WHERE info NOT LIKE '%size%'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • filter
 │ filter: variable = 'transaction_isolation'
@@ -386,7 +405,7 @@ query T
 SELECT * FROM [EXPLAIN SHOW TRANSACTION PRIORITY] WHERE info NOT LIKE '%size%'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • filter
 │ filter: variable = 'transaction_priority'
@@ -398,37 +417,38 @@ query T
 EXPLAIN SHOW COLUMNS FROM foo
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
-• render
+• sort
+│ order: +ordinal_position,+column_name,+crdb_sql_type,+is_nullable,+column_default,+generation_expression,+indices,+is_hidden
 │
-└── • group
-    │ group by: column_name, ordinal_position, column_default, is_nullable, generation_expression, is_hidden, crdb_sql_type
-    │ ordered: +ordinal_position
+└── • render
     │
-    └── • sort
-        │ order: +ordinal_position
+    └── • group
+        │ group by: column_name, ordinal_position, column_default, is_nullable, generation_expression, is_hidden, crdb_sql_type
         │
-        └── • hash join (left outer)
-            │ equality: (column_name) = (column_name)
+        └── • window
             │
-            ├── • filter
-            │   │ filter: ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
-            │   │
-            │   └── • virtual table
-            │         table: columns@primary
-            │
-            └── • filter
-                │ filter: ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+            └── • hash join (left outer)
+                │ equality: (column_name) = (column_name)
                 │
-                └── • virtual table
-                      table: statistics@primary
+                ├── • filter
+                │   │ filter: ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+                │   │
+                │   └── • virtual table
+                │         table: columns@primary
+                │
+                └── • filter
+                    │ filter: ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+                    │
+                    └── • virtual table
+                          table: statistics@primary
 
 query T
 SELECT * FROM [EXPLAIN SHOW GRANTS ON foo] WHERE info NOT LIKE '%size%'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • sort
 │ order: +grantee,+privilege_type
@@ -443,24 +463,27 @@ query T
 EXPLAIN SHOW INDEX FROM foo
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
-• render
+• sort
+│ order: +index_name,+non_unique,+seq_in_index,+column_name,+direction,+storing,+implicit
 │
-└── • filter
-    │ filter: ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+└── • render
     │
-    └── • virtual table
-          table: statistics@primary
+    └── • filter
+        │ filter: ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+        │
+        └── • virtual table
+              table: statistics@primary
 
 query T
 EXPLAIN SHOW CONSTRAINTS FROM foo
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • sort
-│ order: +conname
+│ order: +conname,+constraint_type,+condef,+convalidated
 │
 └── • render
     │
@@ -538,7 +561,7 @@ query T
 EXPLAIN (VERBOSE) SELECT * FROM select_test
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • sequence select
   columns: (last_value, log_cnt, is_called)
@@ -548,12 +571,12 @@ query T
 EXPLAIN (VERBOSE) SELECT @1 FROM select_test
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • render
 │ columns: ("?column?")
 │ estimated row count: 1
-│ render 0: last_value
+│ render ?column?: last_value
 │
 └── • sequence select
       columns: (last_value, log_cnt, is_called)
@@ -570,7 +593,7 @@ query T
 EXPLAIN INSERT INTO t VALUES (1, 2)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert fast path
   into: t(k, v)
@@ -599,7 +622,7 @@ vectorized: true
 ·
 • scan
   columns: (k, v)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: t@primary
   spans: FULL SCAN
 
@@ -646,7 +669,7 @@ vectorized: true
 │
 └── • scan
       columns: (k, v)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: t@primary
       spans: FULL SCAN
 
@@ -654,7 +677,7 @@ query T
 EXPLAIN VALUES (1, 2, 3), (4, 5, 6)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • values
   size: 3 columns, 2 rows
@@ -663,7 +686,7 @@ query T
 EXPLAIN VALUES (1)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • values
   size: 1 column, 1 row
@@ -727,7 +750,7 @@ vectorized: true
         │
         └── • scan
               columns: (v)
-              estimated row count: 1000 (missing stats)
+              estimated row count: 1,000 (missing stats)
               table: t@primary
               spans: FULL SCAN
 
@@ -762,7 +785,7 @@ query T
 EXPLAIN (TYPES) INSERT INTO t VALUES (1, 2)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert fast path
   columns: ()
@@ -777,7 +800,7 @@ query T
 EXPLAIN (TYPES) SELECT 42 AS a
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • values
   columns: (a int)
@@ -792,7 +815,7 @@ vectorized: true
 ·
 • scan
   columns: (k int, v int)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: t@primary
   spans: FULL SCAN
 
@@ -804,7 +827,7 @@ vectorized: true
 ·
 • scan
   columns: (k int)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: t@primary
   spans: FULL SCAN
 
@@ -821,7 +844,7 @@ vectorized: true
 │
 └── • scan
       columns: (k int, v int)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: t@primary
       spans: FULL SCAN
 
@@ -829,7 +852,7 @@ query T
 EXPLAIN (TYPES) VALUES (1, 2, 3), (4, 5, 6)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • values
   columns: (column1 int, column2 int, column3 int)
@@ -850,8 +873,8 @@ vectorized: true
 • render
 │ columns: (z int, v int)
 │ estimated row count: 0
-│ render 0: ((count)[int] * (2)[int])[int]
-│ render 1: (v)[int]
+│ render z: ((count)[int] * (2)[int])[int]
+│ render v: (v)[int]
 │
 └── • norows
       columns: (v int, count int)
@@ -860,7 +883,7 @@ query T
 EXPLAIN (TYPES) DELETE FROM t WHERE v > 1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • delete
 │ columns: ()
@@ -878,7 +901,7 @@ vectorized: false
         │
         └── • scan
               columns: (k int, v int)
-              estimated row count: 1000 (missing stats)
+              estimated row count: 1,000 (missing stats)
               table: t@primary
               spans: FULL SCAN
 
@@ -886,7 +909,7 @@ query T
 EXPLAIN (TYPES) UPDATE t SET v = k + 1 WHERE v > 123
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ columns: ()
@@ -898,9 +921,9 @@ vectorized: false
 └── • render
     │ columns: (k int, v int, v_new int)
     │ estimated row count: 333 (missing stats)
-    │ render 0: ((k)[int] + (1)[int])[int]
-    │ render 1: (k)[int]
-    │ render 2: (v)[int]
+    │ render v_new: ((k)[int] + (1)[int])[int]
+    │ render k: (k)[int]
+    │ render v: (v)[int]
     │
     └── • filter
         │ columns: (k int, v int)
@@ -909,7 +932,7 @@ vectorized: false
         │
         └── • scan
               columns: (k int, v int)
-              estimated row count: 1000 (missing stats)
+              estimated row count: 1,000 (missing stats)
               table: t@primary
               spans: FULL SCAN
 
@@ -917,7 +940,7 @@ query T
 EXPLAIN (TYPES) VALUES (1) UNION VALUES (2)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • union
 │ columns: (column1 int)
@@ -941,7 +964,7 @@ vectorized: true
 ·
 • scan
   columns: (k int)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: t@primary
   spans: FULL SCAN
 
@@ -954,12 +977,12 @@ vectorized: true
 • sort
 │ columns: (v int)
 │ ordering: +v
-│ estimated row count: 1000 (missing stats)
+│ estimated row count: 1,000 (missing stats)
 │ order: +v
 │
 └── • scan
       columns: (v int)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: t@primary
       spans: FULL SCAN
 
@@ -992,7 +1015,7 @@ vectorized: true
 │
 └── • scan
       columns: (x int, y int)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: tt@primary
       spans: FULL SCAN
 
@@ -1008,7 +1031,7 @@ query T
 EXPLAIN (TYPES) SELECT abs(2-3) AS a
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • values
   columns: (a int)
@@ -1020,7 +1043,7 @@ query T
 EXPLAIN (TYPES) SELECT x[1] FROM (SELECT ARRAY[1,2,3] AS x)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • values
   columns: (x int)
@@ -1284,7 +1307,7 @@ query T
 EXPLAIN SELECT string_agg(x, y) FROM (VALUES ('foo', 'foo'), ('bar', 'bar')) t(x, y)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • group (scalar)
 │
@@ -1325,22 +1348,12 @@ query T
 EXPLAIN EXPLAIN SELECT 1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • explain
 
-query T
-EXPLAIN (VERBOSE) EXPLAIN ANALYZE SELECT 1
-----
-distribution: local
-vectorized: false
-·
-• project
-│ columns: (automatic, url)
-│
-└── • explain
-      columns: (automatic, url, json)
-      estimated row count: 10 (missing stats)
+statement error EXPLAIN ANALYZE can only be used as a top-level statement
+EXPLAIN (VERBOSE) EXPLAIN ANALYZE (DISTSQL) SELECT 1
 
 # Test a case with many spans.
 query T
@@ -1369,7 +1382,7 @@ query T
 EXPLAIN UPSERT INTO u VALUES (1, 1)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • upsert
 │ into: u(k, v)
@@ -1391,30 +1404,50 @@ query T
 EXPLAIN INSERT INTO u VALUES (1, 1) ON CONFLICT DO NOTHING
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert
 │ into: u(k, v)
 │ auto commit
 │ arbiter indexes: primary, u_v_key
 │
-└── • filter
-    │ filter: k IS NULL
+└── • lookup join (anti)
+    │ table: u@u_v_key
+    │ equality: (column2) = (v)
+    │ equality cols are key
     │
-    └── • lookup join (left outer)
-        │ table: u@u_v_key
-        │ equality: (column2) = (v)
-        │ equality cols are key
+    └── • cross join (anti)
         │
-        └── • filter
-            │ filter: k IS NULL
-            │
-            └── • cross join (left outer)
-                │
-                ├── • values
-                │     size: 2 columns, 1 row
-                │
-                └── • scan
-                      missing stats
-                      table: u@primary
-                      spans: [/1 - /1]
+        ├── • values
+        │     size: 2 columns, 1 row
+        │
+        └── • scan
+              missing stats
+              table: u@primary
+              spans: [/1 - /1]
+
+# Make sure EXPLAIN (VERBOSE) works when there is a constrained scan of a
+# virtual table (#58193).
+statement ok
+CREATE TABLE ab (a INT, b INT)
+
+query T
+EXPLAIN (VERBOSE) SELECT attnum FROM pg_attribute WHERE attrelid = 'ab'::regclass AND attname = 'b';
+----
+distribution: local
+vectorized: true
+·
+• project
+│ columns: (attnum)
+│ estimated row count: 1 (missing stats)
+│
+└── • filter
+    │ columns: (attrelid, attname, attnum)
+    │ estimated row count: 1 (missing stats)
+    │ filter: attname = 'b'
+    │
+    └── • virtual table
+          columns: (attrelid, attname, attnum)
+          estimated row count: 10 (missing stats)
+          table: pg_attribute@pg_attribute_attrelid_idx
+          spans: [/ab - /ab]

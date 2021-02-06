@@ -25,9 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -653,7 +653,7 @@ func TestJoinReader(t *testing.T) {
 	)
 	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
-	for i, td := range []*tabledesc.Immutable{tdSecondary, tdFamily, tdInterleaved} {
+	for i, td := range []catalog.TableDescriptor{tdSecondary, tdFamily, tdInterleaved} {
 		for _, c := range testCases {
 			for _, reqOrdering := range []bool{true, false} {
 				// Small and large batches exercise different paths of interest for
@@ -922,9 +922,9 @@ func TestJoinReaderDrain(t *testing.T) {
 	}
 	defer tempEngine.Close()
 
-	// Run the flow in a snowball trace so that we can test for tracing info.
+	// Run the flow in a verbose trace so that we can test for tracing info.
 	tracer := tracing.NewTracer()
-	ctx, sp := tracing.StartSnowballTrace(context.Background(), tracer, "test flow ctx")
+	ctx, sp := tracing.StartVerboseTrace(context.Background(), tracer, "test flow ctx")
 	defer sp.Finish()
 
 	evalCtx := tree.MakeTestingEvalContext(st)
@@ -1083,33 +1083,6 @@ func TestIndexJoiner(t *testing.T) {
 				{v[0], v[5], v[5]},
 				{v[1], v[0], v[1]},
 				{v[1], v[5], v[6]},
-			},
-		},
-		{
-			description: "Test a filter in the post process spec and using a secondary index",
-			desc:        td.TableDesc(),
-			post: execinfrapb.PostProcessSpec{
-				Filter:        execinfrapb.Expression{Expr: "@3 <= 5"}, // sum <= 5
-				Projection:    true,
-				OutputColumns: []uint32{3},
-			},
-			input: rowenc.EncDatumRows{
-				{v[0], v[1]},
-				{v[2], v[5]},
-				{v[0], v[5]},
-				{v[2], v[1]},
-				{v[3], v[4]},
-				{v[1], v[3]},
-				{v[5], v[1]},
-				{v[5], v[0]},
-			},
-			outputTypes: []*types.T{types.String},
-			expected: rowenc.EncDatumRows{
-				{rowenc.StrEncDatum("one")},
-				{rowenc.StrEncDatum("five")},
-				{rowenc.StrEncDatum("two-one")},
-				{rowenc.StrEncDatum("one-three")},
-				{rowenc.StrEncDatum("five-zero")},
 			},
 		},
 		{
@@ -1300,18 +1273,14 @@ func BenchmarkJoinReader(b *testing.B) {
 							// Get the table descriptor and find the index that will provide us with
 							// the expected match ratio.
 							tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", tableName)
-							indexIdx := uint32(0)
-							for i := range tableDesc.Indexes {
-								require.Equal(b, 1, len(tableDesc.Indexes[i].ColumnNames), "all indexes created in this benchmark should only contain one column")
-								if tableDesc.Indexes[i].ColumnNames[0] == columnDef.name {
-									// Found indexIdx.
-									indexIdx = uint32(i + 1)
-									break
-								}
-							}
-							if indexIdx == 0 {
+							foundIndex := catalog.FindPublicNonPrimaryIndex(tableDesc, func(idx catalog.Index) bool {
+								require.Equal(b, 1, idx.NumColumns(), "all indexes created in this benchmark should only contain one column")
+								return idx.GetColumnName(0) == columnDef.name
+							})
+							if foundIndex == nil {
 								b.Fatalf("failed to find secondary index for column %s", columnDef.name)
 							}
+							indexIdx := uint32(foundIndex.Ordinal())
 							input := newRowGeneratingSource(rowenc.OneIntCol, sqlutils.ToRowFn(func(rowIdx int) tree.Datum {
 								// Convert to 0-based.
 								return tree.NewDInt(tree.DInt(rowIdx - 1))

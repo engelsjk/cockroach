@@ -15,17 +15,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/errors"
 )
 
 type distSQLSpecExecFactory struct {
@@ -234,7 +236,9 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 		Spans:            trSpec.Spans[:0],
 		HasSystemColumns: scanContainsSystemColumns(&colCfg),
 		NeededColumns:    colCfg.wantedColumnsOrdinals,
+		VirtualColumn:    getVirtualColumn(colCfg.virtualColumn, cols),
 	}
+
 	trSpec.IndexIdx, err = getIndexIdx(indexDesc, tabDesc)
 	if err != nil {
 		return nil, err
@@ -330,7 +334,7 @@ func (e *distSQLSpecExecFactory) ConstructFilter(
 // ConstructInvertedFilter is part of the exec.Factory interface.
 func (e *distSQLSpecExecFactory) ConstructInvertedFilter(
 	n exec.Node,
-	invFilter *invertedexpr.SpanExpression,
+	invFilter *inverted.SpanExpression,
 	preFiltererExpr tree.TypedExpr,
 	preFiltererType *types.T,
 	invColumn exec.NodeColumnOrdinal,
@@ -569,14 +573,14 @@ func (e *distSQLSpecExecFactory) ConstructDistinct(
 	errorOnDup string,
 ) (exec.Node, error) {
 	physPlan, plan := getPhysPlan(input)
-	spec := createDistinctSpec(
-		distinctCols,
-		orderedCols,
+	spec := e.dsp.createDistinctSpec(
+		convertFastIntSetToUint32Slice(distinctCols),
+		convertFastIntSetToUint32Slice(orderedCols),
 		nullsAreDistinct,
 		errorOnDup,
-		physPlan.PlanToStreamColMap,
+		e.dsp.convertOrdering(ReqOrdering(reqOrdering), physPlan.PlanToStreamColMap),
 	)
-	e.dsp.addDistinctProcessors(physPlan, spec, ReqOrdering(reqOrdering))
+	e.dsp.addDistinctProcessors(physPlan, spec)
 	// Since addition of distinct processors doesn't change any properties of
 	// the physical plan, we don't need to update any of those.
 	return plan, nil
@@ -637,12 +641,13 @@ func (e *distSQLSpecExecFactory) ConstructInvertedJoin(
 	input exec.Node,
 	table cat.Table,
 	index cat.Index,
+	prefixEqCols []exec.NodeColumnOrdinal,
 	lookupCols exec.TableColumnOrdinalSet,
 	onCond tree.TypedExpr,
 	isFirstJoinInPairedJoiner bool,
 	reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
-	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: geo lookup join")
+	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: inverted join")
 }
 
 func (e *distSQLSpecExecFactory) ConstructZigzagJoin(
@@ -741,28 +746,40 @@ func (e *distSQLSpecExecFactory) ConstructExplainOpt(
 }
 
 func (e *distSQLSpecExecFactory) ConstructExplain(
-	options *tree.ExplainOptions, analyze bool, stmtType tree.StatementType, plan exec.Plan,
+	options *tree.ExplainOptions, stmtType tree.StatementType, buildFn exec.BuildPlanForExplainFn,
 ) (exec.Node, error) {
-	// We cannot create the explained plan in the same PlanInfrastructure with the
-	// "outer" plan. Create a new PlanningCtx for the rest of the plan.
-	// TODO(radu): this is a hack and won't work if the result of the explain
-	// feeds into a join or union (on the right-hand side). Move to a model like
-	// ConstructExplainPlan, where we can build the inner plan using a separate
-	// factory instance.
-	planCtxCopy := *e.planCtx
-	planCtxCopy.infra = physicalplan.MakePhysicalInfrastructure(e.planCtx.infra.FlowID, e.planCtx.infra.GatewayNodeID)
-	e.planCtx = &planCtxCopy
+	if options.Flags[tree.ExplainFlagEnv] {
+		return nil, errors.New("ENV only supported with (OPT) option")
+	}
 
-	// TODO(yuzefovich): make sure to return the same nice error in some
-	// variants of EXPLAIN when subqueries are present as we do in the old path.
-	// TODO(yuzefovich): make sure that local plan nodes that create
-	// distributed jobs are shown as "distributed". See distSQLExplainable.
-	p := plan.(*planComponents)
-	explain, err := constructExplainDistSQLOrVecNode(options, analyze, stmtType, p, e.planner)
+	// We cannot create the explained plan in the same PlanInfrastructure with the
+	// "outer" plan. Create a separate factory.
+	explainFactory := explain.NewFactory(newDistSQLSpecExecFactory(e.planner, e.planningMode))
+	plan, err := buildFn(explainFactory)
 	if err != nil {
 		return nil, err
 	}
-	explainNode := explain.(planNode)
+
+	p := plan.(*explain.Plan).WrappedPlan.(*planComponents)
+	var explainNode planNode
+	if options.Mode == tree.ExplainVec {
+		explainNode = &explainVecNode{
+			options: options,
+			plan:    *p,
+		}
+	} else if options.Mode == tree.ExplainDDL {
+		explainNode = &explainDDLNode{
+			options: options,
+			plan:    *p,
+		}
+	} else {
+		explainNode = &explainPlanNode{
+			options: options,
+			flags:   explain.MakeFlags(options),
+			plan:    plan.(*explain.Plan),
+		}
+	}
+
 	physPlan, err := e.dsp.wrapPlan(e.getPlanCtx(cannotDistribute), explainNode)
 	if err != nil {
 		return nil, err
@@ -776,12 +793,6 @@ func (e *distSQLSpecExecFactory) ConstructExplain(
 	return makePlanMaybePhysical(physPlan, []planNode{explainNode}), nil
 }
 
-func (e *distSQLSpecExecFactory) ConstructExplainPlan(
-	options *tree.ExplainOptions, buildFn exec.BuildPlanForExplainFn,
-) (exec.Node, error) {
-	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: explain plan")
-}
-
 func (e *distSQLSpecExecFactory) ConstructShowTrace(
 	typ tree.ShowTraceType, compact bool,
 ) (exec.Node, error) {
@@ -791,7 +802,8 @@ func (e *distSQLSpecExecFactory) ConstructShowTrace(
 func (e *distSQLSpecExecFactory) ConstructInsert(
 	input exec.Node,
 	table cat.Table,
-	arbiters cat.IndexOrdinals,
+	arbiterIndexes cat.IndexOrdinals,
+	arbiterConstraints cat.UniqueOrdinals,
 	insertCols exec.TableColumnOrdinalSet,
 	returnCols exec.TableColumnOrdinalSet,
 	checkCols exec.CheckOrdinalSet,
@@ -828,7 +840,8 @@ func (e *distSQLSpecExecFactory) ConstructUpdate(
 func (e *distSQLSpecExecFactory) ConstructUpsert(
 	input exec.Node,
 	table cat.Table,
-	arbiters cat.IndexOrdinals,
+	arbiterIndexes cat.IndexOrdinals,
+	arbiterConstraints cat.UniqueOrdinals,
 	canaryCol exec.NodeColumnOrdinal,
 	insertCols exec.TableColumnOrdinalSet,
 	fetchCols exec.TableColumnOrdinalSet,
@@ -975,6 +988,12 @@ func (e *distSQLSpecExecFactory) ConstructCancelSessions(
 	input exec.Node, ifExists bool,
 ) (exec.Node, error) {
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: cancel sessions")
+}
+
+func (e *distSQLSpecExecFactory) ConstructCreateStatistics(
+	cs *tree.CreateStats,
+) (exec.Node, error) {
+	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: create statistics")
 }
 
 func (e *distSQLSpecExecFactory) ConstructExport(

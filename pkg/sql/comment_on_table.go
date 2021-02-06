@@ -15,15 +15,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type commentOnTableNode struct {
 	n         *tree.CommentOnTable
-	tableDesc *tabledesc.Immutable
+	tableDesc catalog.TableDescriptor
 }
 
 // CommentOnTable add comment on a table.
@@ -32,7 +33,8 @@ type commentOnTableNode struct {
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) CommentOnTable(ctx context.Context, n *tree.CommentOnTable) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"COMMENT ON TABLE",
 	); err != nil {
 		return nil, err
@@ -59,7 +61,7 @@ func (n *commentOnTableNode) startExec(params runParams) error {
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			"UPSERT INTO system.comments VALUES ($1, $2, 0, $3)",
 			keys.TableCommentType,
-			n.tableDesc.ID,
+			n.tableDesc.GetID(),
 			*n.n.Comment)
 		if err != nil {
 			return err
@@ -72,30 +74,23 @@ func (n *commentOnTableNode) startExec(params runParams) error {
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=0",
 			keys.TableCommentType,
-			n.tableDesc.ID)
+			n.tableDesc.GetID())
 		if err != nil {
 			return err
 		}
 	}
 
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogCommentOnTable,
-		int32(n.tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			TableName string
-			Statement string
-			User      string
-			Comment   *string
-		}{
-			params.p.ResolvedName(n.n.Table).FQString(),
-			n.n.String(),
-			params.p.User().Normalized(),
-			n.n.Comment,
-		},
-	)
+	comment := ""
+	if n.n.Comment != nil {
+		comment = *n.n.Comment
+	}
+	return params.p.logEvent(params.ctx,
+		n.tableDesc.GetID(),
+		&eventpb.CommentOnTable{
+			TableName:   params.p.ResolvedName(n.n.Table).FQString(),
+			Comment:     comment,
+			NullComment: n.n.Comment == nil,
+		})
 }
 
 func (n *commentOnTableNode) Next(runParams) (bool, error) { return false, nil }

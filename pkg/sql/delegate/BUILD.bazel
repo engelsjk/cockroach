@@ -22,6 +22,7 @@ go_library(
         "show_schemas.go",
         "show_sequences.go",
         "show_sessions.go",
+        "show_survival_goal.go",
         "show_syntax.go",
         "show_table.go",
         "show_tables.go",
@@ -49,6 +50,6 @@ go_library(
         "//pkg/sql/sessiondata",
         "//pkg/sql/sqltelemetry",
         "//pkg/util/errorutil/unimplemented",
-        "//vendor/github.com/cockroachdb/errors",
+        "@com_github_cockroachdb_errors//:errors",
     ],
 )

@@ -26,10 +26,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 const (
@@ -144,8 +146,9 @@ func MakeSimpleTableDescriptor(
 	create.Defs = filteredDefs
 
 	evalCtx := tree.EvalContext{
-		Context:  ctx,
-		Sequence: &importSequenceOperators{},
+		Context:     ctx,
+		Sequence:    &importSequenceOperators{},
+		SessionData: &sessiondata.SessionData{},
 	}
 	affected := make(map[descpb.ID]*tabledesc.Mutable)
 
@@ -158,6 +161,7 @@ func MakeSimpleTableDescriptor(
 		parentID,
 		parentSchemaID,
 		tableID,
+		descpb.InvalidID,
 		hlc.Timestamp{WallTime: walltime},
 		descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()),
 		affected,
@@ -236,6 +240,13 @@ func (so *importSequenceOperators) IncrementSequence(
 }
 
 // Implements the tree.SequenceOperators interface.
+func (so *importSequenceOperators) IncrementSequenceByID(
+	ctx context.Context, seqID int64,
+) (int64, error) {
+	return 0, errSequenceOperators
+}
+
+// Implements the tree.SequenceOperators interface.
 func (so *importSequenceOperators) GetLatestValueInSessionForSequence(
 	ctx context.Context, seqName *tree.TableName,
 ) (int64, error) {
@@ -243,8 +254,22 @@ func (so *importSequenceOperators) GetLatestValueInSessionForSequence(
 }
 
 // Implements the tree.SequenceOperators interface.
+func (so *importSequenceOperators) GetLatestValueInSessionForSequenceByID(
+	ctx context.Context, seqID int64,
+) (int64, error) {
+	return 0, errSequenceOperators
+}
+
+// Implements the tree.SequenceOperators interface.
 func (so *importSequenceOperators) SetSequenceValue(
 	ctx context.Context, seqName *tree.TableName, newVal int64, isCalled bool,
+) error {
+	return errSequenceOperators
+}
+
+// Implements the tree.SequenceOperators interface.
+func (so *importSequenceOperators) SetSequenceValueByID(
+	ctx context.Context, seqID int64, newVal int64, isCalled bool,
 ) error {
 	return errSequenceOperators
 }
@@ -314,6 +339,18 @@ func (r fkResolver) LookupSchema(
 // Implements the sql.SchemaResolver interface.
 func (r fkResolver) LookupTableByID(
 	ctx context.Context, id descpb.ID,
-) (*tabledesc.Immutable, error) {
+) (catalog.TableDescriptor, error) {
+	return nil, errSchemaResolver
+}
+
+// Implements the sql.SchemaResolver interface.
+func (r fkResolver) ResolveTypeByOID(ctx context.Context, oid oid.Oid) (*types.T, error) {
+	return nil, errSchemaResolver
+}
+
+// Implements the sql.SchemaResolver interface.
+func (r fkResolver) ResolveType(
+	ctx context.Context, name *tree.UnresolvedObjectName,
+) (*types.T, error) {
 	return nil, errSchemaResolver
 }

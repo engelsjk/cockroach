@@ -15,14 +15,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
-	otlog "github.com/opentracing/opentracing-go/log"
 	"golang.org/x/net/trace"
 )
 
@@ -138,7 +137,7 @@ func eventInternal(sp *tracing.Span, el *ctxEventLog, isErr bool, entry logpb.En
 		msg = buf.String()
 
 		if entry.Redactable {
-			// This is true when eventInternal is called from addStructured(),
+			// This is true when eventInternal is called from logfDepth(),
 			// ie. a regular log call. In this case, the tags and message may contain
 			// redaction markers. We remove them here.
 			msg = redact.RedactableString(msg).StripMarkers()
@@ -146,9 +145,7 @@ func eventInternal(sp *tracing.Span, el *ctxEventLog, isErr bool, entry logpb.En
 	}
 
 	if sp != nil {
-		// TODO(radu): pass tags directly to sp.LogKV when LightStep supports
-		// that.
-		sp.LogFields(otlog.String(tracingpb.LogMessageField, msg))
+		sp.Record(msg)
 		// if isErr {
 		// 	// TODO(radu): figure out a way to signal that this is an error. We
 		// 	// could use a different "error" key (provided it shows up in
@@ -197,8 +194,9 @@ func Event(ctx context.Context, msg string) {
 	}
 
 	// Format the tracing event and add it to the trace.
-	entry := MakeEntry(ctx,
+	entry := MakeLegacyEntry(ctx,
 		severity.INFO, /* unused for trace events */
+		channel.DEV,   /* unused for trace events */
 		1,             /* depth */
 		// redactable is false because we want to flatten the data in traces
 		// -- we don't have infrastructure yet for trace redaction.
@@ -219,8 +217,9 @@ func Eventf(ctx context.Context, format string, args ...interface{}) {
 	}
 
 	// Format the tracing event and add it to the trace.
-	entry := MakeEntry(ctx,
+	entry := MakeLegacyEntry(ctx,
 		severity.INFO, /* unused for trace events */
+		channel.DEV,   /* unused for trace events */
 		1,             /* depth */
 		// redactable is false because we want to flatten the data in traces
 		// -- we don't have infrastructure yet for trace redaction.
@@ -238,15 +237,16 @@ func vEventf(
 		if isErr {
 			sev = severity.ERROR
 		}
-		logDepth(ctx, 1+depth, sev, format, args...)
+		logfDepth(ctx, 1+depth, sev, channel.DEV, format, args...)
 	} else {
 		sp, el, ok := getSpanOrEventLog(ctx)
 		if !ok {
 			// Nothing to log. Skip the work.
 			return
 		}
-		entry := MakeEntry(ctx,
+		entry := MakeLegacyEntry(ctx,
 			severity.INFO, /* unused for trace events */
+			channel.DEV,   /* unused for trace events */
 			depth+1,
 			// redactable is false because we want to flatten the data in traces
 			// -- we don't have infrastructure yet for trace redaction.
@@ -256,14 +256,14 @@ func vEventf(
 	}
 }
 
-// VEvent either logs a message to the log files (which also outputs to the
+// VEvent either logs a message to the DEV channel (which also outputs to the
 // active trace or event log) or to the trace/event log alone, depending on
 // whether the specified verbosity level is active.
 func VEvent(ctx context.Context, level Level, msg string) {
 	vEventf(ctx, false /* isErr */, 1, level, msg)
 }
 
-// VEventf either logs a message to the log files (which also outputs to the
+// VEventf either logs a message to the DEV channel (which also outputs to the
 // active trace or event log) or to the trace/event log alone, depending on
 // whether the specified verbosity level is active.
 func VEventf(ctx context.Context, level Level, format string, args ...interface{}) {
@@ -276,14 +276,14 @@ func VEventfDepth(ctx context.Context, depth int, level Level, format string, ar
 	vEventf(ctx, false /* isErr */, 1+depth, level, format, args...)
 }
 
-// VErrEvent either logs an error message to the log files (which also outputs
+// VErrEvent either logs an error message to the DEV channel (which also outputs
 // to the active trace or event log) or to the trace/event log alone, depending
 // on whether the specified verbosity level is active.
 func VErrEvent(ctx context.Context, level Level, msg string) {
 	vEventf(ctx, true /* isErr */, 1, level, msg)
 }
 
-// VErrEventf either logs an error message to the log files (which also outputs
+// VErrEventf either logs an error message to the DEV Channel (which also outputs
 // to the active trace or event log) or to the trace/event log alone, depending
 // on whether the specified verbosity level is active.
 func VErrEventf(ctx context.Context, level Level, format string, args ...interface{}) {

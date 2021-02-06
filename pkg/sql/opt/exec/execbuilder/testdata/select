@@ -2,8 +2,10 @@
 
 # Prepare a trace to be inspected below.
 
+# TODO(yuzefovich): clean up the tracing in the vectorized engine and remove
+# adjustment of vectorize mode (#55821).
 statement ok
-SET tracing = on; BEGIN; SELECT 1; COMMIT; SELECT 2; SET tracing = off
+SET vectorize=off; SET tracing = on; BEGIN; SELECT 1; COMMIT; SELECT 2; SET tracing = off; RESET vectorize
 
 # Inspect the trace: we exclude messages containing newlines as these
 # may contain non-deterministic txn object descriptions.
@@ -13,29 +15,31 @@ SET tracing = on; BEGIN; SELECT 1; COMMIT; SELECT 2; SET tracing = off
 # how many commands we ran in the session.
 query ITT
 SELECT
-  span, regexp_replace(message, 'pos:[0-9]*', 'pos:?'), operation
+  span, regexp_replace(regexp_replace(message, 'pos:[0-9]*', 'pos:?'), 'flowid: [0-9A-Fa-f-]*', 'flowid: ?'), operation
 FROM [SHOW TRACE FOR SESSION]
 WHERE message LIKE '%SPAN START%' OR message LIKE '%pos%executing%';
 ----
-0   === SPAN START: session recording ===                session recording
-1   === SPAN START: exec stmt ===                        exec stmt
-1   [NoTxn pos:?] executing ExecStmt: BEGIN TRANSACTION  exec stmt
-2   === SPAN START: sql txn ===                          sql txn
-3   === SPAN START: exec stmt ===                        exec stmt
-3   [Open pos:?] executing ExecStmt: SELECT 1            exec stmt
-4   === SPAN START: consuming rows ===                   consuming rows
-5   === SPAN START: flow ===                             flow
-6   === SPAN START: exec stmt ===                        exec stmt
-6   [Open pos:?] executing ExecStmt: COMMIT TRANSACTION  exec stmt
-7   === SPAN START: exec stmt ===                        exec stmt
-7   [NoTxn pos:?] executing ExecStmt: SELECT 2           exec stmt
-8   === SPAN START: sql txn ===                          sql txn
-9   === SPAN START: exec stmt ===                        exec stmt
-9   [Open pos:?] executing ExecStmt: SELECT 2            exec stmt
-10  === SPAN START: consuming rows ===                   consuming rows
-11  === SPAN START: flow ===                             flow
-12  === SPAN START: exec stmt ===                        exec stmt
-12  [NoTxn pos:?] executing ExecStmt: SET TRACING = off  exec stmt
+0                    === SPAN START: session recording ===                session recording
+1                    === SPAN START: exec stmt ===                        exec stmt
+1                    [NoTxn pos:?] executing ExecStmt: BEGIN TRANSACTION  exec stmt
+2                    === SPAN START: sql txn ===                          sql txn
+3                    === SPAN START: exec stmt ===                        exec stmt
+3                    [Open pos:?] executing ExecStmt: SELECT 1            exec stmt
+4                    === SPAN START: consuming rows ===                   consuming rows
+5                    === SPAN START: flow ===
+cockroach.flowid: ?  flow
+6                    === SPAN START: exec stmt ===                        exec stmt
+6                    [Open pos:?] executing ExecStmt: COMMIT TRANSACTION  exec stmt
+7                    === SPAN START: exec stmt ===                        exec stmt
+7                    [NoTxn pos:?] executing ExecStmt: SELECT 2           exec stmt
+8                    === SPAN START: sql txn ===                          sql txn
+9                    === SPAN START: exec stmt ===                        exec stmt
+9                    [Open pos:?] executing ExecStmt: SELECT 2            exec stmt
+10                   === SPAN START: consuming rows ===                   consuming rows
+11                   === SPAN START: flow ===
+cockroach.flowid: ?  flow
+12                   === SPAN START: exec stmt ===                        exec stmt
+12                   [NoTxn pos:?] executing ExecStmt: SET TRACING = off  exec stmt
 
 # ------------------------------------------------------------------------------
 # Numeric References Tests.
@@ -69,7 +73,7 @@ vectorized: true
 ·
 • scan
   columns: (p, d, c)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@primary
   spans: FULL SCAN
 
@@ -81,7 +85,7 @@ vectorized: true
 ·
 • scan
   columns: (c)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@primary
   spans: FULL SCAN
 
@@ -93,7 +97,7 @@ vectorized: true
 ·
 • scan
   columns: (p, c)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@primary
   spans: FULL SCAN
 
@@ -105,7 +109,7 @@ vectorized: true
 ·
 • scan
   columns: (p, d, c)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@primary
   spans: FULL SCAN
 
@@ -117,7 +121,7 @@ vectorized: true
 ·
 • scan
   columns: (c, d, p)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@primary
   spans: FULL SCAN
 
@@ -129,7 +133,7 @@ vectorized: true
 ·
 • scan
   columns: (col1, col2, col3)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@primary
   spans: FULL SCAN
 
@@ -141,7 +145,7 @@ vectorized: true
 ·
 • scan
   columns: (c, d, p)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@bc
   spans: FULL SCAN
 
@@ -153,7 +157,7 @@ vectorized: true
 ·
 • scan
   columns: (c)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@bc
   spans: FULL SCAN
 
@@ -165,7 +169,7 @@ vectorized: true
 ·
 • scan
   columns: (d)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@bc
   spans: FULL SCAN
 
@@ -177,7 +181,7 @@ vectorized: true
 ·
 • scan
   columns: (p)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@bc
   spans: FULL SCAN
 
@@ -189,7 +193,7 @@ vectorized: true
 ·
 • scan
   columns: (p)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@primary
   spans: FULL SCAN
 
@@ -201,7 +205,7 @@ vectorized: true
 ·
 • scan
   columns: (p)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@bc
   spans: FULL SCAN
 
@@ -213,7 +217,7 @@ vectorized: true
 ·
 • scan
   columns: (d)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@primary
   spans: FULL SCAN
 
@@ -225,7 +229,7 @@ vectorized: true
 ·
 • scan
   columns: (d)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@bc
   spans: FULL SCAN
 
@@ -237,7 +241,7 @@ vectorized: true
 ·
 • scan
   columns: (c)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@primary
   spans: FULL SCAN
 
@@ -249,7 +253,7 @@ vectorized: true
 ·
 • scan
   columns: (c)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref@bc
   spans: FULL SCAN
 
@@ -261,7 +265,7 @@ vectorized: true
 ·
 • scan
   columns: (a)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref_hidden@primary
   spans: FULL SCAN
 
@@ -273,7 +277,7 @@ vectorized: true
 ·
 • scan
   columns: ()
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref_hidden@primary
   spans: FULL SCAN
 
@@ -285,7 +289,7 @@ vectorized: true
 ·
 • scan
   columns: (rowid)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: num_ref_hidden@primary
   spans: FULL SCAN
 
@@ -341,7 +345,7 @@ vectorized: true
 │
 └── • scan
       columns: (x, y)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: a@primary
       spans: FULL SCAN
 
@@ -382,12 +386,12 @@ vectorized: true
 ·
 • render
 │ columns: (r)
-│ estimated row count: 1000 (missing stats)
-│ render 0: x + 1
+│ estimated row count: 1,000 (missing stats)
+│ render r: x + 1
 │
 └── • scan
       columns: (x)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: a@primary
       spans: FULL SCAN
 
@@ -399,16 +403,16 @@ vectorized: true
 ·
 • render
 │ columns: (a, b, y, c, d)
-│ estimated row count: 1000 (missing stats)
-│ render 0: x + 1
-│ render 1: y + 1
-│ render 2: x + y
-│ render 3: x
-│ render 4: y
+│ estimated row count: 1,000 (missing stats)
+│ render b: x + 1
+│ render c: y + 1
+│ render d: x + y
+│ render x: x
+│ render y: y
 │
 └── • scan
       columns: (x, y)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: a@primary
       spans: FULL SCAN
 
@@ -420,18 +424,18 @@ vectorized: true
 ·
 • render
 │ columns: (r)
-│ estimated row count: 1000 (missing stats)
-│ render 0: "?column?" + ("?column?" * "?column?")
+│ estimated row count: 1,000 (missing stats)
+│ render r: "?column?" + ("?column?" * "?column?")
 │
 └── • render
     │ columns: ("?column?", "?column?")
-    │ estimated row count: 1000 (missing stats)
-    │ render 0: x + 3
-    │ render 1: y + 10
+    │ estimated row count: 1,000 (missing stats)
+    │ render ?column?: x + 3
+    │ render ?column?: y + 10
     │
     └── • scan
           columns: (x, y)
-          estimated row count: 1000 (missing stats)
+          estimated row count: 1,000 (missing stats)
           table: a@primary
           spans: FULL SCAN
 
@@ -446,7 +450,7 @@ vectorized: true
 │
 └── • scan
       columns: (x, y)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: a@primary
       spans: FULL SCAN
 
@@ -459,8 +463,8 @@ vectorized: true
 • render
 │ columns: (a, b)
 │ estimated row count: 333 (missing stats)
-│ render 0: x + 1
-│ render 1: x + y
+│ render a: x + 1
+│ render b: x + y
 │
 └── • filter
     │ columns: (x, y)
@@ -469,7 +473,7 @@ vectorized: true
     │
     └── • scan
           columns: (x, y)
-          estimated row count: 1000 (missing stats)
+          estimated row count: 1,000 (missing stats)
           table: a@primary
           spans: FULL SCAN
 
@@ -490,7 +494,7 @@ vectorized: true
 ·
 • scan
   columns: (x, y)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: b@primary
   spans: FULL SCAN
 
@@ -527,7 +531,6 @@ query TTBITTBB colnames
 SHOW INDEXES FROM t
 ----
 table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit
-t           primary     false       1             a            ASC        false    false
 t           b_idx       true        1             b            ASC        false    false
 t           b_idx       true        2             c            N/A        true     false
 t           b_idx       true        3             d            N/A        true     false
@@ -536,6 +539,7 @@ t           c_idx       false       1             c            ASC        false 
 t           c_idx       false       2             b            N/A        true     false
 t           c_idx       false       3             d            N/A        true     false
 t           c_idx       false       4             a            ASC        false    true
+t           primary     false       1             a            ASC        false    false
 
 statement ok
 INSERT INTO t VALUES (1, 2, 3, 4)
@@ -714,12 +718,12 @@ vectorized: true
 ·
 • render
 │ columns: (a)
-│ estimated row count: 1000 (missing stats)
-│ render 0: 1
+│ estimated row count: 1,000 (missing stats)
+│ render a: 1
 │
 └── • scan
       columns: ()
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: nocols@primary
       spans: FULL SCAN
 
@@ -747,7 +751,7 @@ vectorized: true
 • scan
   columns: (a collatedstring{da}, b int)
   ordering: +a,+b
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: coll@primary
   spans: FULL SCAN
 
@@ -760,7 +764,7 @@ vectorized: true
 • scan
   columns: (b int, a collatedstring{da})
   ordering: +b,+a
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: coll@coll_b_a_idx
   spans: FULL SCAN
 
@@ -787,7 +791,7 @@ vectorized: true
 • scan
   columns: (b string)
   ordering: +b
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: computed@computed_b_idx
   spans: FULL SCAN
 
@@ -981,7 +985,7 @@ vectorized: true
 │
 └── • scan
       columns: (d decimal)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: dec2@primary
       spans: FULL SCAN
 
@@ -1034,7 +1038,7 @@ vectorized: true
 │
 └── • scan
       columns: (f float)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: flt@primary
       spans: FULL SCAN
 
@@ -1314,14 +1318,14 @@ vectorized: true
 └── • render
     │ columns: ("?column?", a)
     │ ordering: +a
-    │ estimated row count: 1000 (missing stats)
-    │ render 0: a + (b + c)
-    │ render 1: a
+    │ estimated row count: 1,000 (missing stats)
+    │ render ?column?: a + (b + c)
+    │ render a: a
     │
     └── • scan
           columns: (a, b, c)
           ordering: +a
-          estimated row count: 1000 (missing stats)
+          estimated row count: 1,000 (missing stats)
           table: abcd@primary
           spans: FULL SCAN
 
@@ -1337,18 +1341,18 @@ vectorized: true
 └── • sort
     │ columns: ("?column?", b)
     │ ordering: +b
-    │ estimated row count: 1000 (missing stats)
+    │ estimated row count: 1,000 (missing stats)
     │ order: +b
     │
     └── • render
         │ columns: ("?column?", b)
-        │ estimated row count: 1000 (missing stats)
-        │ render 0: a + (c + (a + b))
-        │ render 1: b
+        │ estimated row count: 1,000 (missing stats)
+        │ render ?column?: a + (c + (a + b))
+        │ render b: b
         │
         └── • scan
               columns: (a, b, c)
-              estimated row count: 1000 (missing stats)
+              estimated row count: 1,000 (missing stats)
               table: abcd@primary
               spans: FULL SCAN
 
@@ -1365,15 +1369,15 @@ vectorized: true
 └── • render
     │ columns: ("?column?", a, b)
     │ ordering: -a,-b
-    │ estimated row count: 1000 (missing stats)
-    │ render 0: a + (c + (a + b))
-    │ render 1: a
-    │ render 2: b
+    │ estimated row count: 1,000 (missing stats)
+    │ render ?column?: a + (c + (a + b))
+    │ render a: a
+    │ render b: b
     │
     └── • revscan
           columns: (a, b, c)
           ordering: -a,-b
-          estimated row count: 1000 (missing stats)
+          estimated row count: 1,000 (missing stats)
           table: abcd@primary
           spans: FULL SCAN
 
@@ -1393,7 +1397,7 @@ vectorized: true
 └── • scan
       columns: (a, b, c, d)
       ordering: +a
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: abcd@primary
       spans: FULL SCAN
 
@@ -1416,7 +1420,7 @@ vectorized: true
     │
     └── • scan
           columns: (a, b, c, d)
-          estimated row count: 1000 (missing stats)
+          estimated row count: 1,000 (missing stats)
           table: abcd@primary
           spans: FULL SCAN
 
@@ -1450,8 +1454,8 @@ vectorized: true
 │ columns: (a, x)
 │ ordering: +a
 │ estimated row count: 3 (missing stats)
-│ render 0: c + (a + b)
-│ render 1: a
+│ render x: c + (a + b)
+│ render a: a
 │
 └── • filter
     │ columns: (a, b, c)

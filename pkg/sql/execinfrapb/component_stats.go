@@ -12,26 +12,86 @@ package execinfrapb
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
-	"time"
 
-	optional "github.com/cockroachdb/cockroach/pkg/util/optional"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/optional"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/dustin/go-humanize"
+	"github.com/gogo/protobuf/types"
 )
 
-// Stats is part of SpanStats interface.
-func (s *ComponentStats) Stats() map[string]string {
+// ProcessorComponentID returns a ComponentID for the given processor in a flow.
+func ProcessorComponentID(flowID FlowID, processorID int32) ComponentID {
+	return ComponentID{
+		FlowID: flowID,
+		Type:   ComponentID_PROCESSOR,
+		ID:     processorID,
+	}
+}
+
+// StreamComponentID returns a ComponentID for the given stream in a flow.
+func StreamComponentID(flowID FlowID, streamID StreamID) ComponentID {
+	return ComponentID{
+		FlowID: flowID,
+		Type:   ComponentID_STREAM,
+		ID:     int32(streamID),
+	}
+}
+
+// FlowComponentID returns a ComponentID for the given flow.
+func FlowComponentID(nodeID roachpb.NodeID, flowID FlowID) ComponentID {
+	return ComponentID{
+		FlowID: flowID,
+		Type:   ComponentID_FLOW,
+		NodeID: nodeID,
+	}
+}
+
+// FlowIDTagKey is the key used for flow id tags in tracing spans.
+const (
+	FlowIDTagKey = tracing.TagPrefix + "flowid"
+
+	// StreamIDTagKey is the key used for stream id tags in tracing spans.
+	StreamIDTagKey = tracing.TagPrefix + "streamid"
+
+	// ProcessorIDTagKey is the key used for processor id tags in tracing spans.
+	ProcessorIDTagKey = tracing.TagPrefix + "processorid"
+
+	// StatTagPrefix is prefixed to all stats output in Span tags.
+	StatTagPrefix = tracing.TagPrefix + "stat."
+)
+
+// StatsTags is part of the tracing.SpanStats interface.
+func (s *ComponentStats) StatsTags() map[string]string {
 	result := make(map[string]string, 4)
+	if s.Component != (ComponentID{}) {
+		result[FlowIDTagKey] = s.Component.FlowID.String()
+		switch s.Component.Type {
+		case ComponentID_PROCESSOR:
+			result[ProcessorIDTagKey] = strconv.Itoa(int(s.Component.ID))
+		case ComponentID_STREAM:
+			result[StreamIDTagKey] = strconv.Itoa(int(s.Component.ID))
+		case ComponentID_FLOW:
+			// Nothing extra to set.
+		}
+	}
+
 	s.formatStats(func(key string, value interface{}) {
 		// The key becomes a tracing span tag. Replace spaces with dots and use
 		// only lowercase characters.
 		key = strings.ToLower(strings.ReplaceAll(key, " ", "."))
-		result[key] = fmt.Sprint(value)
+		result[StatTagPrefix+key] = fmt.Sprint(value)
 	})
 	return result
 }
 
-// StatsForQueryPlan is part of DistSQLSpanStats interface.
+// StatsForQueryPlan returns the statistics as a list of strings that can be
+// displayed in query plans and diagrams.
 func (s *ComponentStats) StatsForQueryPlan() []string {
 	result := make([]string, 0, 4)
 	s.formatStats(func(key string, value interface{}) {
@@ -44,60 +104,69 @@ func (s *ComponentStats) StatsForQueryPlan() []string {
 func (s *ComponentStats) formatStats(fn func(suffix string, value interface{})) {
 	// Network Rx stats.
 	if s.NetRx.Latency.HasValue() {
-		fn("network latency", s.NetRx.Latency.Value().Round(time.Microsecond))
+		fn("network latency", humanizeutil.Duration(s.NetRx.Latency.Value()))
 	}
 	if s.NetRx.WaitTime.HasValue() {
-		fn("network wait time", s.NetRx.WaitTime.Value().Round(time.Microsecond))
+		fn("network wait time", humanizeutil.Duration(s.NetRx.WaitTime.Value()))
 	}
 	if s.NetRx.DeserializationTime.HasValue() {
-		fn("deserialization time", s.NetRx.DeserializationTime.Value().Round(time.Microsecond))
+		fn("deserialization time", humanizeutil.Duration(s.NetRx.DeserializationTime.Value()))
 	}
 	if s.NetRx.TuplesReceived.HasValue() {
-		fn("network tuples received", s.NetRx.TuplesReceived.Value())
+		fn("network tuples received", humanizeutil.Count(s.NetRx.TuplesReceived.Value()))
 	}
 	if s.NetRx.BytesReceived.HasValue() {
 		fn("network bytes received", humanize.IBytes(s.NetRx.BytesReceived.Value()))
 	}
+	if s.NetRx.MessagesReceived.HasValue() {
+		fn("network messages received", humanizeutil.Count(s.NetRx.MessagesReceived.Value()))
+	}
 
 	// Network Tx stats.
 	if s.NetTx.TuplesSent.HasValue() {
-		fn("network tuples sent", s.NetTx.TuplesSent.Value())
+		fn("network tuples sent", humanizeutil.Count(s.NetTx.TuplesSent.Value()))
 	}
 	if s.NetTx.BytesSent.HasValue() {
 		fn("network bytes sent", humanize.IBytes(s.NetTx.BytesSent.Value()))
+	}
+	if s.NetTx.MessagesSent.HasValue() {
+		fn("network messages sent", humanizeutil.Count(s.NetTx.MessagesSent.Value()))
 	}
 
 	// Input stats.
 	switch len(s.Inputs) {
 	case 1:
 		if s.Inputs[0].NumTuples.HasValue() {
-			fn("input tuples", s.Inputs[0].NumTuples.Value())
+			fn("input tuples", humanizeutil.Count(s.Inputs[0].NumTuples.Value()))
 		}
 		if s.Inputs[0].WaitTime.HasValue() {
-			fn("input stall time", s.Inputs[0].WaitTime.Value().Round(time.Microsecond))
+			fn("input stall time", humanizeutil.Duration(s.Inputs[0].WaitTime.Value()))
 		}
 
 	case 2:
 		if s.Inputs[0].NumTuples.HasValue() {
-			fn("left tuples", s.Inputs[0].NumTuples.Value())
+			fn("left tuples", humanizeutil.Count(s.Inputs[0].NumTuples.Value()))
 		}
 		if s.Inputs[0].WaitTime.HasValue() {
-			fn("left stall time", s.Inputs[0].WaitTime.Value().Round(time.Microsecond))
+			fn("left stall time", humanizeutil.Duration(s.Inputs[0].WaitTime.Value()))
 		}
 		if s.Inputs[1].NumTuples.HasValue() {
-			fn("right tuples", s.Inputs[1].NumTuples.Value())
+			fn("right tuples", humanizeutil.Count(s.Inputs[1].NumTuples.Value()))
 		}
 		if s.Inputs[1].WaitTime.HasValue() {
-			fn("right stall time", s.Inputs[1].WaitTime.Value().Round(time.Microsecond))
+			fn("right stall time", humanizeutil.Duration(s.Inputs[1].WaitTime.Value()))
 		}
 	}
 
 	// KV stats.
 	if s.KV.KVTime.HasValue() {
-		fn("KV time", s.KV.KVTime.Value().Round(time.Microsecond))
+		fn("KV time", humanizeutil.Duration(s.KV.KVTime.Value()))
+	}
+	if s.KV.ContentionTime.HasValue() {
+		fn("KV contention time", humanizeutil.Duration(s.KV.ContentionTime.Value()))
 	}
 	if s.KV.TuplesRead.HasValue() {
-		fn("KV tuples read", s.KV.TuplesRead.Value())
+		fn("KV tuples read", humanizeutil.Count(s.KV.TuplesRead.Value()))
 	}
 	if s.KV.BytesRead.HasValue() {
 		fn("KV bytes read", humanize.IBytes(s.KV.BytesRead.Value()))
@@ -105,7 +174,7 @@ func (s *ComponentStats) formatStats(fn func(suffix string, value interface{})) 
 
 	// Exec stats.
 	if s.Exec.ExecTime.HasValue() {
-		fn("execution time", s.Exec.ExecTime.Value().Round(time.Microsecond))
+		fn("execution time", humanizeutil.Duration(s.Exec.ExecTime.Value()))
 	}
 	if s.Exec.MaxAllocatedMem.HasValue() {
 		fn("max memory allocated", humanize.IBytes(s.Exec.MaxAllocatedMem.Value()))
@@ -116,11 +185,90 @@ func (s *ComponentStats) formatStats(fn func(suffix string, value interface{})) 
 
 	// Output stats.
 	if s.Output.NumBatches.HasValue() {
-		fn("batches output", s.Output.NumBatches.Value())
+		fn("batches output", humanizeutil.Count(s.Output.NumBatches.Value()))
 	}
 	if s.Output.NumTuples.HasValue() {
-		fn("tuples output", s.Output.NumTuples.Value())
+		fn("tuples output", humanizeutil.Count(s.Output.NumTuples.Value()))
 	}
+}
+
+// Union creates a new ComponentStats that contains all statistics in either the
+// receiver (s) or the argument (other).
+// If a statistic is set in both, the one in the receiver (s) is preferred.
+func (s *ComponentStats) Union(other *ComponentStats) *ComponentStats {
+	result := *s
+
+	// Network Rx stats.
+	if !result.NetRx.Latency.HasValue() {
+		result.NetRx.Latency = other.NetRx.Latency
+	}
+	if !result.NetRx.WaitTime.HasValue() {
+		result.NetRx.WaitTime = other.NetRx.WaitTime
+	}
+	if !result.NetRx.DeserializationTime.HasValue() {
+		result.NetRx.DeserializationTime = other.NetRx.DeserializationTime
+	}
+	if !result.NetRx.TuplesReceived.HasValue() {
+		result.NetRx.TuplesReceived = other.NetRx.TuplesReceived
+	}
+	if !result.NetRx.BytesReceived.HasValue() {
+		result.NetRx.BytesReceived = other.NetRx.BytesReceived
+	}
+	if !result.NetRx.MessagesReceived.HasValue() {
+		result.NetRx.MessagesReceived = other.NetRx.MessagesReceived
+	}
+
+	// Network Tx stats.
+	if !result.NetTx.TuplesSent.HasValue() {
+		result.NetTx.TuplesSent = other.NetTx.TuplesSent
+	}
+	if !result.NetTx.BytesSent.HasValue() {
+		result.NetTx.BytesSent = other.NetTx.BytesSent
+	}
+
+	// Input stats. Make sure we don't reuse slices.
+	result.Inputs = append([]InputStats(nil), s.Inputs...)
+	result.Inputs = append(result.Inputs, other.Inputs...)
+
+	// KV stats.
+	if !result.KV.KVTime.HasValue() {
+		result.KV.KVTime = other.KV.KVTime
+	}
+	if !result.KV.ContentionTime.HasValue() {
+		result.KV.ContentionTime = other.KV.ContentionTime
+	}
+	if !result.KV.TuplesRead.HasValue() {
+		result.KV.TuplesRead = other.KV.TuplesRead
+	}
+	if !result.KV.BytesRead.HasValue() {
+		result.KV.BytesRead = other.KV.BytesRead
+	}
+
+	// Exec stats.
+	if !result.Exec.ExecTime.HasValue() {
+		result.Exec.ExecTime = other.Exec.ExecTime
+	}
+	if !result.Exec.MaxAllocatedMem.HasValue() {
+		result.Exec.MaxAllocatedMem = other.Exec.MaxAllocatedMem
+	}
+	if !result.Exec.MaxAllocatedDisk.HasValue() {
+		result.Exec.MaxAllocatedDisk = other.Exec.MaxAllocatedDisk
+	}
+
+	// Output stats.
+	if !result.Output.NumBatches.HasValue() {
+		result.Output.NumBatches = other.Output.NumBatches
+	}
+	if !result.Output.NumTuples.HasValue() {
+		result.Output.NumTuples = other.Output.NumTuples
+	}
+
+	// Flow stats.
+	if !result.FlowStats.MaxMemUsage.HasValue() {
+		result.FlowStats.MaxMemUsage = other.FlowStats.MaxMemUsage
+	}
+
+	return &result
 }
 
 // MakeDeterministic is used only for testing; it modifies any non-deterministic
@@ -150,15 +298,31 @@ func (s *ComponentStats) MakeDeterministic() {
 	timeVal(&s.NetRx.WaitTime)
 	timeVal(&s.NetRx.DeserializationTime)
 	if s.NetRx.BytesReceived.HasValue() {
-		// BytesReceived is overridden to a useful value for tests.
-		s.NetRx.BytesReceived.Set(8 * s.Output.NumTuples.Value())
+		// BytesReceived can be non-deterministic because some message fields have
+		// varying sizes across different runs (e.g. metadata). Override to a useful
+		// value for tests.
+		s.NetRx.BytesReceived.Set(8 * s.NetRx.TuplesReceived.Value())
+	}
+	if s.NetRx.MessagesReceived.HasValue() {
+		// Override to a useful value for tests.
+		s.NetRx.MessagesReceived.Set(s.NetRx.TuplesReceived.Value() / 2)
 	}
 
 	// NetTx.
-	resetUint(&s.NetTx.BytesSent)
+	if s.NetTx.BytesSent.HasValue() {
+		// BytesSent can be non-deterministic because some message fields have
+		// varying sizes across different runs (e.g. metadata). Override to a useful
+		// value for tests.
+		s.NetTx.BytesSent.Set(8 * s.NetTx.TuplesSent.Value())
+	}
+	if s.NetTx.MessagesSent.HasValue() {
+		// Override to a useful value for tests.
+		s.NetTx.MessagesSent.Set(s.NetTx.TuplesSent.Value() / 2)
+	}
 
 	// KV.
 	timeVal(&s.KV.KVTime)
+	timeVal(&s.KV.ContentionTime)
 	if s.KV.BytesRead.HasValue() {
 		// BytesRead is overridden to a useful value for tests.
 		s.KV.BytesRead.Set(8 * s.KV.TuplesRead.Value())
@@ -176,4 +340,50 @@ func (s *ComponentStats) MakeDeterministic() {
 	for i := range s.Inputs {
 		timeVal(&s.Inputs[i].WaitTime)
 	}
+}
+
+// ExtractStatsFromSpans extracts all ComponentStats from a set of tracing
+// spans.
+func ExtractStatsFromSpans(
+	spans []tracingpb.RecordedSpan, makeDeterministic bool,
+) map[ComponentID]*ComponentStats {
+	statsMap := make(map[ComponentID]*ComponentStats)
+	for i := range spans {
+		span := &spans[i]
+		var stats ComponentStats
+
+		found := false
+		// TODO(radu): there's nothing stopping us from having multiple
+		// ComponentStats in a single Span once we are in the 21.2 cycle.
+		span.Structured(func(item *types.Any) {
+			if found {
+				return
+			}
+			if !types.Is(item, &stats) {
+				return
+			}
+			if err := protoutil.Unmarshal(item.Value, &stats); err != nil {
+				return
+			}
+			found = true
+		})
+
+		if stats.Component == (ComponentID{}) {
+			continue
+		}
+		if makeDeterministic {
+			stats.MakeDeterministic()
+		}
+		existing := statsMap[stats.Component]
+		if existing == nil {
+			statsMap[stats.Component] = &stats
+		} else {
+			// In the vectorized flow we can have multiple statistics entries for one
+			// component. Merge the stats together.
+			// TODO(radu): figure out a way to emit the statistics correctly in the
+			// first place.
+			statsMap[stats.Component] = existing.Union(&stats)
+		}
+	}
+	return statsMap
 }

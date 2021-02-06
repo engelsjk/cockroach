@@ -54,6 +54,11 @@ func newNoopProcessor(
 	); err != nil {
 		return nil, err
 	}
+	ctx := flowCtx.EvalCtx.Ctx()
+	if execinfra.ShouldCollectStats(ctx, flowCtx) {
+		n.input = newInputStatCollector(n.input)
+		n.ExecStatsForTrace = n.execStatsForTrace
+	}
 	return n, nil
 }
 
@@ -90,6 +95,18 @@ func (n *noopProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadat
 func (n *noopProcessor) ConsumerClosed() {
 	// The consumer is done, Next() will not be called again.
 	n.InternalClose()
+}
+
+// execStatsForTrace implements ProcessorBase.ExecStatsForTrace.
+func (n *noopProcessor) execStatsForTrace() *execinfrapb.ComponentStats {
+	is, ok := getInputStats(n.input)
+	if !ok {
+		return nil
+	}
+	return &execinfrapb.ComponentStats{
+		Inputs: []execinfrapb.InputStats{is},
+		Output: n.Out.Stats(),
+	}
 }
 
 // ChildCount is part of the execinfra.OpNode interface.

@@ -19,7 +19,11 @@
 
 package tree
 
-import "github.com/cockroachdb/cockroach/pkg/sql/lex"
+import (
+	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+)
 
 // ShowVar represents a SHOW statement.
 type ShowVar struct {
@@ -148,7 +152,9 @@ func (node *ShowDatabases) Format(ctx *FmtCtx) {
 }
 
 // ShowEnums represents a SHOW ENUMS statement.
-type ShowEnums struct{}
+type ShowEnums struct {
+	ObjectNamePrefix
+}
 
 // Format implements the NodeFormatter interface.
 func (node *ShowEnums) Format(ctx *FmtCtx) {
@@ -221,7 +227,7 @@ func (node *ShowDatabaseIndexes) Format(ctx *FmtCtx) {
 	}
 }
 
-// ShowQueries represents a SHOW QUERIES statement.
+// ShowQueries represents a SHOW STATEMENTS statement.
 type ShowQueries struct {
 	All     bool
 	Cluster bool
@@ -234,9 +240,9 @@ func (node *ShowQueries) Format(ctx *FmtCtx) {
 		ctx.WriteString("ALL ")
 	}
 	if node.Cluster {
-		ctx.WriteString("CLUSTER QUERIES")
+		ctx.WriteString("CLUSTER STATEMENTS")
 	} else {
-		ctx.WriteString("LOCAL QUERIES")
+		ctx.WriteString("LOCAL STATEMENTS")
 	}
 }
 
@@ -278,23 +284,57 @@ func (node *ShowJobs) Format(ctx *FmtCtx) {
 	}
 }
 
-// ShowRegions represents a SHOW REGIONS statement
-type ShowRegions struct {
-	FromDatabase bool
+// ShowSurvivalGoal represents a SHOW REGIONS statement
+type ShowSurvivalGoal struct {
 	DatabaseName Name
 }
 
 // Format implements the NodeFormatter interface.
+func (node *ShowSurvivalGoal) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW SURVIVAL GOAL FROM DATABASE")
+	if node.DatabaseName != "" {
+		ctx.WriteString(" ")
+		node.DatabaseName.Format(ctx)
+	}
+}
+
+// ShowRegionsFrom denotes what kind of SHOW REGIONS command is being used.
+type ShowRegionsFrom int
+
+const (
+	// ShowRegionsFromCluster represents SHOW REGIONS FROM CLUSTER.
+	ShowRegionsFromCluster ShowRegionsFrom = iota
+	// ShowRegionsFromDatabase represents SHOW REGIONS FROM DATABASE.
+	ShowRegionsFromDatabase
+	// ShowRegionsFromAllDatabases represents SHOW REGIONS FROM ALL DATABASES.
+	ShowRegionsFromAllDatabases
+	// ShowRegionsFromDefault represents SHOW REGIONS.
+	ShowRegionsFromDefault
+)
+
+// ShowRegions represents a SHOW REGIONS statement
+type ShowRegions struct {
+	ShowRegionsFrom ShowRegionsFrom
+	DatabaseName    Name
+}
+
+// Format implements the NodeFormatter interface.
 func (node *ShowRegions) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW REGIONS ")
-	if node.FromDatabase {
-		ctx.WriteString("FROM DATABASE")
+	ctx.WriteString("SHOW REGIONS")
+	switch node.ShowRegionsFrom {
+	case ShowRegionsFromDefault:
+	case ShowRegionsFromAllDatabases:
+		ctx.WriteString(" FROM ALL DATABASES")
+	case ShowRegionsFromDatabase:
+		ctx.WriteString(" FROM DATABASE")
 		if node.DatabaseName != "" {
 			ctx.WriteString(" ")
 			node.DatabaseName.Format(ctx)
 		}
-	} else {
-		ctx.WriteString("FROM CLUSTER")
+	case ShowRegionsFromCluster:
+		ctx.WriteString(" FROM CLUSTER")
+	default:
+		panic(fmt.Sprintf("unknown ShowRegionsFrom: %v", node.ShowRegionsFrom))
 	}
 }
 

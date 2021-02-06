@@ -35,6 +35,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
@@ -54,7 +56,8 @@ type alterTableNode struct {
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"ALTER TABLE",
 	); err != nil {
 		return nil, err
@@ -159,9 +162,21 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 		switch t := cmd.(type) {
 		case *tree.AlterTableAddColumn:
+			if t.ColumnDef.Unique.WithoutIndex {
+				// TODO(rytaft): add support for this in the future if we want to expose
+				// UNIQUE WITHOUT INDEX to users.
+				return errors.WithHint(
+					pgerror.New(
+						pgcode.FeatureNotSupported,
+						"adding a column marked as UNIQUE WITHOUT INDEX is unsupported",
+					),
+					"add the column first, then run ALTER TABLE ... ADD CONSTRAINT to add a "+
+						"UNIQUE WITHOUT INDEX constraint on the column",
+				)
+			}
 			var err error
 			params.p.runWithOptions(resolveFlags{contextDatabaseID: n.tableDesc.ParentID}, func() {
-				err = params.p.addColumnImpl(params, n, tn, n.tableDesc, t)
+				err = params.p.addColumnImpl(params, n, tn, n.tableDesc, t, params.SessionData())
 			})
 			if err != nil {
 				return err
@@ -170,10 +185,20 @@ func (n *alterTableNode) startExec(params runParams) error {
 			switch d := t.ConstraintDef.(type) {
 			case *tree.UniqueConstraintTableDef:
 				if d.WithoutIndex {
-					return pgerror.New(pgcode.FeatureNotSupported,
-						"unique constraints without an index are not yet supported",
-					)
+					if err := addUniqueWithoutIndexTableDef(
+						params.ctx,
+						params.EvalContext(),
+						params.SessionData(),
+						d,
+						n.tableDesc,
+						NonEmptyTable,
+						t.ValidationBehavior,
+					); err != nil {
+						return err
+					}
+					continue
 				}
+
 				if d.PrimaryKey {
 					// We only support "adding" a primary key when we are using the
 					// default rowid primary index or if a DROP PRIMARY KEY statement
@@ -189,12 +214,26 @@ func (n *alterTableNode) startExec(params runParams) error {
 						Columns:    d.Columns,
 						Sharded:    d.Sharded,
 						Interleave: d.Interleave,
+						Name:       d.Name,
 					}
-					if err := params.p.AlterPrimaryKey(params.ctx, n.tableDesc, alterPK); err != nil {
+					if err := params.p.AlterPrimaryKey(
+						params.ctx,
+						n.tableDesc,
+						alterPK,
+						nil, /* localityConfigSwap */
+					); err != nil {
 						return err
 					}
 					continue
 				}
+
+				// Check if the columns exist on the table.
+				for _, column := range d.Columns {
+					if _, err := n.tableDesc.FindColumnWithName(column.Column); err != nil {
+						return err
+					}
+				}
+
 				idx := descpb.IndexDescriptor{
 					Name:             string(d.Name),
 					Unique:           true,
@@ -203,18 +242,20 @@ func (n *alterTableNode) startExec(params runParams) error {
 				if err := idx.FillColumns(d.Columns); err != nil {
 					return err
 				}
-				if d.PartitionBy != nil {
-					partitioning, err := CreatePartitioning(
-						params.ctx, params.p.ExecCfg().Settings,
-						params.EvalContext(), n.tableDesc, &idx, d.PartitionBy)
-					if err != nil {
-						return err
-					}
-					idx.Partitioning = partitioning
+
+				var err error
+				idx, err = params.p.configureIndexDescForNewIndexPartitioning(
+					params.ctx,
+					n.tableDesc,
+					idx,
+					d.PartitionByIndex,
+				)
+				if err != nil {
+					return err
 				}
-				_, dropped, err := n.tableDesc.FindIndexByName(string(d.Name))
+				foundIndex, err := n.tableDesc.FindIndexWithName(string(d.Name))
 				if err == nil {
-					if dropped {
+					if foundIndex.Dropped() {
 						return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 							"index %q being dropped, try again later", d.Name)
 					}
@@ -223,11 +264,23 @@ func (n *alterTableNode) startExec(params runParams) error {
 					return err
 				}
 
+				// We need to allocate IDs upfront in the event we need to update the zone config
+				// in the same transaction.
+				if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
+					return err
+				}
+				if err := params.p.configureZoneConfigForNewIndexPartitioning(
+					params.ctx,
+					n.tableDesc,
+					idx,
+				); err != nil {
+					return err
+				}
 			case *tree.CheckConstraintTableDef:
 				var err error
 				params.p.runWithOptions(resolveFlags{contextDatabaseID: n.tableDesc.ParentID}, func() {
 					info, infoErr := n.tableDesc.GetConstraintInfo(params.ctx, nil)
-					if err != nil {
+					if infoErr != nil {
 						err = infoErr
 						return
 					}
@@ -252,16 +305,6 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 
 			case *tree.ForeignKeyConstraintTableDef:
-				for _, colName := range d.FromCols {
-					col, err := n.tableDesc.FindActiveOrNewColumnByName(colName)
-					if err != nil {
-						return err
-					}
-
-					if err := col.CheckCanBeFKRef(); err != nil {
-						return err
-					}
-				}
 				affected := make(map[descpb.ID]*tabledesc.Mutable)
 
 				// If there are any FKs, we will need to update the table descriptor of the
@@ -280,7 +323,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 						err = scanErr
 						return
 					}
-					var tableState FKTableState
+					var tableState TableState
 					if len(kvs) == 0 {
 						tableState = EmptyTable
 					} else {
@@ -326,7 +369,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 		case *tree.AlterTableAlterPrimaryKey:
-			if err := params.p.AlterPrimaryKey(params.ctx, n.tableDesc, t); err != nil {
+			if err := params.p.AlterPrimaryKey(
+				params.ctx,
+				n.tableDesc,
+				t,
+				nil, /* localityConfigSwap */
+			); err != nil {
 				return err
 			}
 			// Mark descriptorChanged so that a mutation job is scheduled at the end of startExec.
@@ -347,7 +395,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 
-			colToDrop, dropped, err := n.tableDesc.FindColumnByName(t.Column)
+			colToDrop, err := n.tableDesc.FindColumnWithName(t.Column)
 			if err != nil {
 				if t.IfExists {
 					// Noop.
@@ -355,24 +403,24 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 				return err
 			}
-			if dropped {
+			if colToDrop.Dropped() {
 				continue
 			}
 
 			// If the dropped column uses a sequence, remove references to it from that sequence.
-			if len(colToDrop.UsesSequenceIds) > 0 {
-				if err := params.p.removeSequenceDependencies(params.ctx, n.tableDesc, colToDrop); err != nil {
+			if colToDrop.NumUsesSequences() > 0 {
+				if err := params.p.removeSequenceDependencies(params.ctx, n.tableDesc, colToDrop.ColumnDesc()); err != nil {
 					return err
 				}
 			}
 
 			// You can't remove a column that owns a sequence that is depended on
 			// by another column
-			if err := params.p.canRemoveAllColumnOwnedSequences(params.ctx, n.tableDesc, colToDrop, t.DropBehavior); err != nil {
+			if err := params.p.canRemoveAllColumnOwnedSequences(params.ctx, n.tableDesc, colToDrop.ColumnDesc(), t.DropBehavior); err != nil {
 				return err
 			}
 
-			if err := params.p.dropSequencesOwnedByCol(params.ctx, colToDrop, true /* queueJob */); err != nil {
+			if err := params.p.dropSequencesOwnedByCol(params.ctx, colToDrop.ColumnDesc(), true /* queueJob */); err != nil {
 				return err
 			}
 
@@ -381,7 +429,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			for _, ref := range n.tableDesc.DependedOnBy {
 				found := false
 				for _, colID := range ref.ColumnIDs {
-					if colID == colToDrop.ID {
+					if colID == colToDrop.GetID() {
 						found = true
 						break
 					}
@@ -403,10 +451,17 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 				jobDesc := fmt.Sprintf("removing view %q dependent on column %q which is being dropped",
 					viewDesc.Name, colToDrop.ColName())
-				droppedViews, err = params.p.removeDependentView(params.ctx, n.tableDesc, viewDesc, jobDesc)
+				cascadedViews, err := params.p.removeDependentView(params.ctx, n.tableDesc, viewDesc, jobDesc)
 				if err != nil {
 					return err
 				}
+				qualifiedView, err := params.p.getQualifiedTableName(params.ctx, viewDesc)
+				if err != nil {
+					return err
+				}
+
+				droppedViews = append(droppedViews, cascadedViews...)
+				droppedViews = append(droppedViews, qualifiedView.FQString())
 			}
 
 			// We cannot remove this column if there are computed columns that use it.
@@ -416,16 +471,16 @@ func (n *alterTableNode) startExec(params runParams) error {
 				&params.p.semaCtx,
 				tn,
 			)
-			if err := computedColValidator.ValidateNoDependents(colToDrop); err != nil {
+			if err := computedColValidator.ValidateNoDependents(colToDrop.ColumnDesc()); err != nil {
 				return err
 			}
 
-			if n.tableDesc.PrimaryIndex.ContainsColumnID(colToDrop.ID) {
+			if n.tableDesc.GetPrimaryIndex().ContainsColumnID(colToDrop.GetID()) {
 				return pgerror.Newf(pgcode.InvalidColumnReference,
-					"column %q is referenced by the primary key", colToDrop.Name)
+					"column %q is referenced by the primary key", colToDrop.GetName())
 			}
 			var idxNamesToDelete []string
-			for _, idx := range n.tableDesc.AllNonDropIndexes() {
+			for _, idx := range n.tableDesc.NonDropIndexes() {
 				// We automatically drop indexes that reference the column
 				// being dropped.
 
@@ -434,15 +489,16 @@ func (n *alterTableNode) startExec(params runParams) error {
 				containsThisColumn := false
 
 				// Analyze the index.
-				for _, id := range idx.ColumnIDs {
-					if id == colToDrop.ID {
+				for j := 0; j < idx.NumColumns(); j++ {
+					if idx.GetColumnID(j) == colToDrop.GetID() {
 						containsThisColumn = true
 						break
 					}
 				}
 				if !containsThisColumn {
-					for _, id := range idx.ExtraColumnIDs {
-						if n.tableDesc.PrimaryIndex.ContainsColumnID(id) {
+					for j := 0; j < idx.NumExtraColumns(); j++ {
+						id := idx.GetExtraColumnID(j)
+						if n.tableDesc.GetPrimaryIndex().ContainsColumnID(id) {
 							// All secondary indices necessary contain the PK
 							// columns, too. (See the comments on the definition of
 							// IndexDescriptor). The presence of a PK column in the
@@ -450,7 +506,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 							// sufficient reason to reject the DROP.
 							continue
 						}
-						if id == colToDrop.ID {
+						if id == colToDrop.GetID() {
 							containsThisColumn = true
 							break
 						}
@@ -460,8 +516,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 					// The loop above this comment is for the old STORING encoding. The
 					// loop below is for the new encoding (where the STORING columns are
 					// always in the value part of a KV).
-					for _, id := range idx.StoreColumnIDs {
-						if id == colToDrop.ID {
+					for j := 0; j < idx.NumStoredColumns(); j++ {
+						if idx.GetStoredColumnID(j) == colToDrop.GetID() {
 							containsThisColumn = true
 							break
 						}
@@ -471,7 +527,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				// If the column being dropped is referenced in the partial
 				// index predicate, then the index should be dropped.
 				if !containsThisColumn && idx.IsPartial() {
-					expr, err := parser.ParseExpr(idx.Predicate)
+					expr, err := parser.ParseExpr(idx.GetPredicate())
 					if err != nil {
 						return err
 					}
@@ -481,14 +537,14 @@ func (n *alterTableNode) startExec(params runParams) error {
 						return err
 					}
 
-					if colIDs.Contains(colToDrop.ID) {
+					if colIDs.Contains(colToDrop.GetID()) {
 						containsThisColumn = true
 					}
 				}
 
 				// Perform the DROP.
 				if containsThisColumn {
-					idxNamesToDelete = append(idxNamesToDelete, idx.Name)
+					idxNamesToDelete = append(idxNamesToDelete, idx.GetName())
 				}
 			}
 
@@ -504,10 +560,32 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 			}
 
+			// Drop unique constraints that reference the column.
+			sliceIdx := 0
+			for i := range n.tableDesc.UniqueWithoutIndexConstraints {
+				constraint := &n.tableDesc.UniqueWithoutIndexConstraints[i]
+				n.tableDesc.UniqueWithoutIndexConstraints[sliceIdx] = *constraint
+				sliceIdx++
+				if descpb.ColumnIDs(constraint.ColumnIDs).Contains(colToDrop.GetID()) {
+					sliceIdx--
+
+					// If this unique constraint is used on the referencing side of any FK
+					// constraints, try to remove the references. Don't bother trying to find
+					// an alternate index or constraint, since all possible matches will
+					// be dropped when the column is dropped.
+					if err := params.p.tryRemoveFKBackReferences(
+						params.ctx, n.tableDesc, constraint, t.DropBehavior, nil,
+					); err != nil {
+						return err
+					}
+				}
+			}
+			n.tableDesc.UniqueWithoutIndexConstraints = n.tableDesc.UniqueWithoutIndexConstraints[:sliceIdx]
+
 			// Drop check constraints which reference the column.
 			validChecks := n.tableDesc.Checks[:0]
 			for _, check := range n.tableDesc.AllActiveAndInactiveChecks() {
-				if used, err := n.tableDesc.CheckConstraintUsesColumn(check, colToDrop.ID); err != nil {
+				if used, err := n.tableDesc.CheckConstraintUsesColumn(check, colToDrop.GetID()); err != nil {
 					return err
 				} else if used {
 					if check.Validity == descpb.ConstraintValidity_Validating {
@@ -527,21 +605,21 @@ func (n *alterTableNode) startExec(params runParams) error {
 			if err != nil {
 				return err
 			}
-			if err := params.p.removeColumnComment(params.ctx, n.tableDesc.ID, colToDrop.ID); err != nil {
+			if err := params.p.removeColumnComment(params.ctx, n.tableDesc.ID, colToDrop.GetID()); err != nil {
 				return err
 			}
 
 			// Since we are able to drop indexes used by foreign keys on the origin side,
 			// the drop index codepaths aren't going to remove dependent FKs, so we
 			// need to do that here.
-			if params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.VersionNoOriginFKIndexes) {
+			if params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.NoOriginFKIndexes) {
 				// We update the FK's slice in place here.
 				sliceIdx := 0
 				for i := range n.tableDesc.OutboundFKs {
 					n.tableDesc.OutboundFKs[sliceIdx] = n.tableDesc.OutboundFKs[i]
 					sliceIdx++
 					fk := &n.tableDesc.OutboundFKs[i]
-					if descpb.ColumnIDs(fk.OriginColumnIDs).Contains(colToDrop.ID) {
+					if descpb.ColumnIDs(fk.OriginColumnIDs).Contains(colToDrop.GetID()) {
 						sliceIdx--
 						if err := params.p.removeFKBackReference(params.ctx, n.tableDesc, fk); err != nil {
 							return err
@@ -553,8 +631,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 			found := false
 			for i := range n.tableDesc.Columns {
-				if n.tableDesc.Columns[i].ID == colToDrop.ID {
-					n.tableDesc.AddColumnMutation(colToDrop, descpb.DescriptorMutation_DROP)
+				if n.tableDesc.Columns[i].ID == colToDrop.GetID() {
+					n.tableDesc.AddColumnMutation(colToDrop.ColumnDesc(), descpb.DescriptorMutation_DROP)
 					// Use [:i:i] to prevent reuse of existing slice, or outstanding refs
 					// to ColumnDescriptors may unexpectedly change.
 					n.tableDesc.Columns = append(n.tableDesc.Columns[:i:i], n.tableDesc.Columns[i+1:]...)
@@ -620,7 +698,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 				found := false
 				var ck *descpb.TableDescriptor_CheckConstraint
 				for _, c := range n.tableDesc.Checks {
-					// If the constraint is still being validated, don't allow VALIDATE CONSTRAINT to run
+					// If the constraint is still being validated, don't allow
+					// VALIDATE CONSTRAINT to run.
 					if c.Name == name && c.Validity != descpb.ConstraintValidity_Validating {
 						found = true
 						ck = c
@@ -642,7 +721,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 				var foundFk *descpb.ForeignKeyConstraint
 				for i := range n.tableDesc.OutboundFKs {
 					fk := &n.tableDesc.OutboundFKs[i]
-					// If the constraint is still being validated, don't allow VALIDATE CONSTRAINT to run
+					// If the constraint is still being validated, don't allow
+					// VALIDATE CONSTRAINT to run.
 					if fk.Name == name && fk.Validity != descpb.ConstraintValidity_Validating {
 						foundFk = fk
 						break
@@ -659,47 +739,101 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 				foundFk.Validity = descpb.ConstraintValidity_Validated
 
+			case descpb.ConstraintTypeUnique:
+				if constraint.Index == nil {
+					var foundUnique *descpb.UniqueWithoutIndexConstraint
+					for i := range n.tableDesc.UniqueWithoutIndexConstraints {
+						uc := &n.tableDesc.UniqueWithoutIndexConstraints[i]
+						// If the constraint is still being validated, don't allow
+						// VALIDATE CONSTRAINT to run.
+						if uc.Name == name && uc.Validity != descpb.ConstraintValidity_Validating {
+							foundUnique = uc
+							break
+						}
+					}
+					if foundUnique == nil {
+						return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+							"constraint %q in the middle of being added, try again later", t.Constraint)
+					}
+					if err := validateUniqueConstraintInTxn(
+						params.ctx, params.p.LeaseMgr(), params.EvalContext(), n.tableDesc, params.EvalContext().Txn, name,
+					); err != nil {
+						return err
+					}
+					foundUnique.Validity = descpb.ConstraintValidity_Validated
+					break
+				}
+
+				// This unique constraint is enforced by an index, so fall through to
+				// the error below.
+				fallthrough
+
 			default:
 				return pgerror.Newf(pgcode.WrongObjectType,
-					"constraint %q of relation %q is not a foreign key or check constraint",
-					tree.ErrString(&t.Constraint), tree.ErrString(n.n.Table))
+					"constraint %q of relation %q is not a foreign key, check, or unique without index"+
+						" constraint", tree.ErrString(&t.Constraint), tree.ErrString(n.n.Table))
 			}
 			descriptorChanged = true
 
 		case tree.ColumnMutationCmd:
 			// Column mutations
-			col, dropped, err := n.tableDesc.FindColumnByName(t.GetColumn())
+			col, err := n.tableDesc.FindColumnWithName(t.GetColumn())
 			if err != nil {
 				return err
 			}
-			if dropped {
+			if col.Dropped() {
 				return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 					"column %q in the middle of being dropped", t.GetColumn())
 			}
 			// Apply mutations to copy of column descriptor.
-			if err := applyColumnMutation(params.ctx, n.tableDesc, col, t, params, n.n.Cmds, tn); err != nil {
+			if err := applyColumnMutation(params.ctx, n.tableDesc, col.ColumnDesc(), t, params, n.n.Cmds, tn); err != nil {
 				return err
 			}
 			descriptorChanged = true
 
-		case *tree.AlterTablePartitionBy:
-			partitioning, err := CreatePartitioning(
+		case *tree.AlterTablePartitionByTable:
+			if t.All {
+				return unimplemented.New("ALTER TABLE PARTITION ALL BY", "PARTITION ALL BY not yet implemented")
+			}
+			oldPartitioning := n.tableDesc.GetPrimaryIndex().GetPartitioning()
+			if oldPartitioning.NumImplicitColumns > 0 {
+				return unimplemented.New(
+					"ALTER TABLE PARTITION BY",
+					"cannot ALTER TABLE PARTITION BY on table which already has implicit column partitioning",
+				)
+			}
+			newPrimaryIndex, err := CreatePartitioning(
 				params.ctx, params.p.ExecCfg().Settings,
 				params.EvalContext(),
-				n.tableDesc, &n.tableDesc.PrimaryIndex, t.PartitionBy)
-			if err != nil {
-				return err
-			}
-			descriptorChanged = descriptorChanged || !n.tableDesc.PrimaryIndex.Partitioning.Equal(&partitioning)
-			err = deleteRemovedPartitionZoneConfigs(
-				params.ctx, params.p.txn,
-				n.tableDesc, &n.tableDesc.PrimaryIndex, &n.tableDesc.PrimaryIndex.Partitioning,
-				&partitioning, params.extendedEvalCtx.ExecCfg,
+				n.tableDesc,
+				*n.tableDesc.GetPrimaryIndex().IndexDesc(),
+				t.PartitionBy,
 			)
 			if err != nil {
 				return err
 			}
-			n.tableDesc.PrimaryIndex.Partitioning = partitioning
+			if newPrimaryIndex.Partitioning.NumImplicitColumns > 0 {
+				return unimplemented.New(
+					"ALTER TABLE PARTITION BY",
+					"cannot ALTER TABLE and change the partitioning to contain implicit columns",
+				)
+			}
+			descriptorChanged = descriptorChanged || !n.tableDesc.GetPrimaryIndex().IndexDesc().Equal(&newPrimaryIndex)
+			err = deleteRemovedPartitionZoneConfigs(
+				params.ctx,
+				params.p.txn,
+				n.tableDesc,
+				n.tableDesc.GetPrimaryIndex().IndexDesc(),
+				&oldPartitioning,
+				&newPrimaryIndex.Partitioning,
+				params.extendedEvalCtx.ExecCfg,
+			)
+			if err != nil {
+				return err
+			}
+			{
+				n.tableDesc.SetPrimaryIndex(newPrimaryIndex)
+			}
 
 		case *tree.AlterTableSetAudit:
 			changed, err := params.p.setAuditMode(params.ctx, n.tableDesc, t.Mode)
@@ -753,16 +887,11 @@ func (n *alterTableNode) startExec(params runParams) error {
 			// new name exists. This is what postgres does.
 			switch details.Kind {
 			case descpb.ConstraintTypeUnique, descpb.ConstraintTypePK:
-				if err := n.tableDesc.ForeachNonDropIndex(func(
-					descriptor *descpb.IndexDescriptor,
-				) error {
-					if descriptor.Name == string(t.NewName) {
-						return pgerror.Newf(pgcode.DuplicateRelation,
-							"relation %v already exists", t.NewName)
-					}
-					return nil
-				}); err != nil {
-					return err
+				if catalog.FindNonDropIndex(n.tableDesc, func(idx catalog.Index) bool {
+					return idx.GetName() == string(t.NewName)
+				}) != nil {
+					return pgerror.Newf(pgcode.DuplicateRelation,
+						"relation %v already exists", t.NewName)
 				}
 			}
 
@@ -784,12 +913,6 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 			descriptorChanged = true
-		case *tree.AlterTableOwner:
-			changed, err := params.p.alterTableOwner(params.p.EvalContext().Context, n, t.Owner)
-			if err != nil {
-				return err
-			}
-			descriptorChanged = descriptorChanged || changed
 		default:
 			return errors.AssertionFailedf("unsupported alter command: %T", cmd)
 		}
@@ -829,24 +952,13 @@ func (n *alterTableNode) startExec(params runParams) error {
 	// Record this table alteration in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogAlterTable,
-		int32(n.tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			TableName           string
-			Statement           string
-			User                string
-			MutationID          uint32
-			CascadeDroppedViews []string
-		}{
-			params.p.ResolvedName(n.n.Table).FQString(),
-			n.n.String(),
-			params.SessionData().User().Normalized(),
-			uint32(mutationID), droppedViews},
-	)
+	return params.p.logEvent(params.ctx,
+		n.tableDesc.ID,
+		&eventpb.AlterTable{
+			TableName:           params.p.ResolvedName(n.n.Table).FQString(),
+			MutationID:          uint32(mutationID),
+			CascadeDroppedViews: droppedViews,
+		})
 }
 
 func (p *planner) setAuditMode(
@@ -986,7 +1098,7 @@ func applyColumnMutation(
 		}
 
 		// Prevent a column in a primary key from becoming non-null.
-		if tableDesc.PrimaryIndex.ContainsColumnID(col.ID) {
+		if tableDesc.GetPrimaryIndex().ContainsColumnID(col.ID) {
 			return pgerror.Newf(pgcode.InvalidTableDefinition,
 				`column "%s" is in a primary index`, col.Name)
 		}
@@ -1030,13 +1142,13 @@ func applyColumnMutation(
 	return nil
 }
 
-func labeledRowValues(cols []descpb.ColumnDescriptor, values tree.Datums) string {
+func labeledRowValues(cols []catalog.Column, values tree.Datums) string {
 	var s bytes.Buffer
 	for i := range cols {
 		if i != 0 {
 			s.WriteString(`, `)
 		}
-		s.WriteString(cols[i].Name)
+		s.WriteString(cols[i].GetName())
 		s.WriteString(`=`)
 		s.WriteString(values[i].String())
 	}
@@ -1094,11 +1206,11 @@ func injectTableStats(
 
 		columnIDs := tree.NewDArray(types.Int)
 		for _, colName := range s.Columns {
-			colDesc, _, err := desc.FindColumnByName(tree.Name(colName))
+			col, err := desc.FindColumnWithName(tree.Name(colName))
 			if err != nil {
 				return err
 			}
-			if err := columnIDs.Append(tree.NewDInt(tree.DInt(colDesc.ID))); err != nil {
+			if err := columnIDs.Append(tree.NewDInt(tree.DInt(col.GetID()))); err != nil {
 				return err
 			}
 		}
@@ -1202,42 +1314,51 @@ func (p *planner) updateFKBackReferenceName(
 	return errors.Errorf("missing backreference for foreign key %s", ref.Name)
 }
 
-// alterTableOwner sets the owner of the table to newOwner and returns true if the descriptor
-// was updated.
-func (p *planner) alterTableOwner(
-	ctx context.Context, n *alterTableNode, newOwner security.SQLUsername,
-) (bool, error) {
-	privs := n.tableDesc.GetPrivileges()
-
-	// If the owner we want to set to is the current owner, do a no-op.
-	if newOwner == privs.Owner() {
-		return false, nil
-	}
-
-	if err := p.checkCanAlterTableAndSetNewOwner(ctx, n.tableDesc, newOwner); err != nil {
-		return false, err
-	}
-
-	return true, nil
-}
-
-// checkCanAlterTableAndSetNewOwner handles privilege checking and setting new owner.
-// Called in ALTER TABLE and REASSIGN OWNED BY.
-func (p *planner) checkCanAlterTableAndSetNewOwner(
-	ctx context.Context, desc *tabledesc.Mutable, newOwner security.SQLUsername,
+// tryRemoveFKBackReferences determines whether the provided unique constraint
+// is used on the referencing side of a FK constraint. If so, it tries to remove
+// the references or find an alternate unique constraint that will suffice.
+func (p *planner) tryRemoveFKBackReferences(
+	ctx context.Context,
+	tableDesc *tabledesc.Mutable,
+	constraint descpb.UniqueConstraint,
+	behavior tree.DropBehavior,
+	candidateConstraints []descpb.UniqueConstraint,
 ) error {
-	if err := p.checkCanAlterToNewOwner(ctx, desc, newOwner); err != nil {
-		return err
+	// uniqueConstraintHasReplacementCandidate runs
+	// IsValidReferencedUniqueConstraint on the candidateConstraints. Returns true
+	// if at least one constraint satisfies IsValidReferencedUniqueConstraint.
+	uniqueConstraintHasReplacementCandidate := func(
+		referencedColumnIDs []descpb.ColumnID,
+	) bool {
+		for _, uc := range candidateConstraints {
+			if uc.IsValidReferencedUniqueConstraint(referencedColumnIDs) {
+				return true
+			}
+		}
+		return false
 	}
 
-	// Ensure the new owner has CREATE privilege on the table's schema.
-	if err := p.canCreateOnSchema(
-		ctx, desc.GetParentSchemaID(), desc.ParentID, newOwner, checkPublicSchema); err != nil {
-		return err
+	// Index for updating the FK slices in place when removing FKs.
+	sliceIdx := 0
+	for i := range tableDesc.InboundFKs {
+		tableDesc.InboundFKs[sliceIdx] = tableDesc.InboundFKs[i]
+		sliceIdx++
+		fk := &tableDesc.InboundFKs[i]
+		// The constraint being deleted could potentially be the referenced unique
+		// constraint for this fk.
+		if constraint.IsValidReferencedUniqueConstraint(fk.ReferencedColumnIDs) &&
+			!uniqueConstraintHasReplacementCandidate(fk.ReferencedColumnIDs) {
+			// If we found haven't found a replacement, then we check that the drop
+			// behavior is cascade.
+			if err := p.canRemoveFKBackreference(ctx, constraint.GetName(), fk, behavior); err != nil {
+				return err
+			}
+			sliceIdx--
+			if err := p.removeFKForBackReference(ctx, tableDesc, fk); err != nil {
+				return err
+			}
+		}
 	}
-
-	privs := desc.GetPrivileges()
-	privs.SetOwner(newOwner)
-
+	tableDesc.InboundFKs = tableDesc.InboundFKs[:sliceIdx]
 	return nil
 }

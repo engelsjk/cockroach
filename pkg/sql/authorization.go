@@ -306,7 +306,7 @@ func (p *planner) MemberOfWithAdminOption(
 	roleMembersCache := p.execCfg.RoleMemberCache
 
 	// Lookup table version.
-	tableDesc, err := p.Descriptors().GetTableVersion(
+	_, tableDesc, err := p.Descriptors().GetImmutableTableByName(
 		ctx,
 		p.txn,
 		&roleMembersTableName,
@@ -505,7 +505,8 @@ func (p *planner) canCreateOnSchema(
 	user security.SQLUsername,
 	checkPublicSchema shouldCheckPublicSchema,
 ) error {
-	resolvedSchema, err := p.Descriptors().ResolveSchemaByID(ctx, p.Txn(), schemaID)
+	resolvedSchema, err := p.Descriptors().GetImmutableSchemaByID(
+		ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{})
 	if err != nil {
 		return err
 	}
@@ -517,8 +518,8 @@ func (p *planner) canCreateOnSchema(
 			// The caller wishes to skip this check.
 			return nil
 		}
-		dbDesc, err := p.Descriptors().GetDatabaseVersionByID(
-			ctx, p.Txn(), dbID, tree.DatabaseLookupFlags{Required: true})
+		dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
+			ctx, p.Txn(), dbID, tree.DatabaseLookupFlags{})
 		if err != nil {
 			return err
 		}
@@ -545,7 +546,8 @@ func (p *planner) canResolveDescUnderSchema(
 	if tbl, ok := desc.(catalog.TableDescriptor); ok && tbl.IsTemporary() {
 		return nil
 	}
-	resolvedSchema, err := p.Descriptors().ResolveSchemaByID(ctx, p.Txn(), schemaID)
+	resolvedSchema, err := p.Descriptors().GetImmutableSchemaByID(
+		ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{})
 	if err != nil {
 		return err
 	}
@@ -626,9 +628,15 @@ func (p *planner) checkCanAlterToNewOwner(
 // HasOwnershipOnSchema checks if the current user has ownership on the schema.
 // For schemas, we cannot always use HasOwnership as not every schema has a
 // descriptor.
-func (p *planner) HasOwnershipOnSchema(ctx context.Context, schemaID descpb.ID) (bool, error) {
-	resolvedSchema, err := p.Descriptors().ResolveSchemaByID(
-		ctx, p.Txn(), schemaID,
+func (p *planner) HasOwnershipOnSchema(
+	ctx context.Context, schemaID descpb.ID, dbID descpb.ID,
+) (bool, error) {
+	if dbID == keys.SystemDatabaseID {
+		// Only the node user has ownership over the system database.
+		return p.User().IsNodeUser(), nil
+	}
+	resolvedSchema, err := p.Descriptors().GetImmutableSchemaByID(
+		ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{},
 	)
 	if err != nil {
 		return false, err

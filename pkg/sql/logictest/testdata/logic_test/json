@@ -168,10 +168,9 @@ SELECT bar FROM foo WHERE bar ?| ARRAY['a', null]
 ----
 {"a": "b"}
 
-# TODO(justin): #29355
-# query T
-# SELECT bar FROM foo WHERE bar ?| ARRAY[null, null]::STRING[]
-# ----
+query T
+SELECT bar FROM foo WHERE bar ?| ARRAY[null, null]::STRING[]
+----
 
 query T
 SELECT bar FROM foo WHERE bar ?& ARRAY['a', null]
@@ -362,6 +361,56 @@ query T
 SELECT '[1, 2, 3]'::JSONB->>3
 ----
 NULL
+
+query TTTT
+SELECT 'null'::jsonb->-2, 'null'::jsonb->-1, 'null'::jsonb->0, 'null'::jsonb->1
+----
+NULL  null  null  NULL
+
+query TTTT
+SELECT 'true'::jsonb->-2, 'true'::jsonb->-1, 'true'::jsonb->0, 'true'::jsonb->1
+----
+NULL  true  true  NULL
+
+query TTTT
+SELECT 'false'::jsonb->-2, 'false'::jsonb->-1, 'false'::jsonb->0, 'false'::jsonb->1
+----
+NULL  false  false  NULL
+
+query TTTT
+SELECT '"foo"'::jsonb->-2, '"foo"'::jsonb->-1, '"foo"'::jsonb->0, '"foo"'::jsonb->1
+----
+NULL  "foo"  "foo"  NULL
+
+query TTTT
+SELECT '123'::jsonb->-2, '123'::jsonb->-1, '123'::jsonb->0, '123'::jsonb->1
+----
+NULL  123  123  NULL
+
+query TTTT
+SELECT 'null'::jsonb->>-2, 'null'::jsonb->>-1, 'null'::jsonb->>0, 'null'::jsonb->>1
+----
+NULL  NULL  NULL  NULL
+
+query TTTT
+SELECT 'true'::jsonb->>-2, 'true'::jsonb->>-1, 'true'::jsonb->>0, 'true'::jsonb->>1
+----
+NULL  true  true  NULL
+
+query TTTT
+SELECT 'false'::jsonb->>-2, 'false'::jsonb->>-1, 'false'::jsonb->>0, 'false'::jsonb->>1
+----
+NULL  false  false  NULL
+
+query TTTT
+SELECT '"foo"'::jsonb->>-2, '"foo"'::jsonb->>-1, '"foo"'::jsonb->>0, '"foo"'::jsonb->>1
+----
+NULL  foo  foo  NULL
+
+query TTTT
+SELECT '123'::jsonb->>-2, '123'::jsonb->>-1, '123'::jsonb->>0, '123'::jsonb->>1
+----
+NULL  123  123  NULL
 
 query T
 SELECT '{"a": 1}'::JSONB#>'{a}'::STRING[]
@@ -766,3 +815,28 @@ SELECT j FROM t49143 WHERE NOT (j -> 'b' @> '[1]') ORDER BY k
 {"b": 1}
 {"b": 2}
 {"b": [3, 4]}
+
+# Regression tests for #57165 (wrong type conversion in the vectorized engine).
+subtest regression_57165
+
+statement ok
+CREATE TABLE t57165(j JSON, s STRING);
+INSERT INTO t57165 VALUES ('{"foo": "bar"}', 'foo'), ('{"bar": "foo"}', 'bar')
+
+query TT
+SELECT j - 'foo' AS a, j - 'bar' AS b FROM t57165 ORDER BY rowid
+----
+{}              {"foo": "bar"}
+{"bar": "foo"}  {}
+
+query TT
+SELECT '{"foo": "bar"}' - s AS a, '{"bar": "foo"}' - s AS b FROM t57165 ORDER BY rowid
+----
+{}              {"bar": "foo"}
+{"foo": "bar"}  {}
+
+query T
+SELECT j - s FROM t57165
+----
+{}
+{}

@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
@@ -212,7 +213,9 @@ func createTestStoreWithOpts(
 			eng,
 			kvs, /* initialValues */
 			clusterversion.TestingBinaryVersion,
-			1 /* numStores */, splits, storeCfg.Clock.PhysicalNow())
+			1 /* numStores */, splits, storeCfg.Clock.PhysicalNow(),
+			storeCfg.TestingKnobs,
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -236,7 +239,7 @@ func createTestStoreWithOpts(
 	var ba roachpb.BatchRequest
 	get := roachpb.GetRequest{}
 	get.Key = keys.LocalMax
-	ba.Header.Replica = repl.Desc().Replicas().Voters()[0]
+	ba.Header.Replica = repl.Desc().Replicas().VoterDescriptors()[0]
 	ba.Header.RangeID = repl.RangeID
 	ba.Add(&get)
 	_, pErr := store.Send(ctx, ba)
@@ -495,54 +498,6 @@ func (m *multiTestContext) Stop() {
 	}
 }
 
-// gossipStores forces each store to gossip its store descriptor and then
-// blocks until all nodes have received these updated descriptors.
-func (m *multiTestContext) gossipStores() {
-	timestamps := make(map[string]int64)
-	for i := 0; i < len(m.stores); i++ {
-		<-m.gossips[i].Connected
-		if err := m.stores[i].GossipStore(context.Background(), false /* useCached */); err != nil {
-			m.t.Fatal(err)
-		}
-		infoStatus := m.gossips[i].GetInfoStatus()
-		storeKey := gossip.MakeStoreKey(m.stores[i].Ident.StoreID)
-		timestamps[storeKey] = infoStatus.Infos[storeKey].OrigStamp
-	}
-	// Wait until all stores know about each other.
-	testutils.SucceedsSoon(m.t, func() error {
-		for i := 0; i < len(m.stores); i++ {
-			nodeID := m.stores[i].Ident.NodeID
-			infoStatus := m.gossips[i].GetInfoStatus()
-			for storeKey, timestamp := range timestamps {
-				info, ok := infoStatus.Infos[storeKey]
-				if !ok {
-					return errors.Errorf("node %d does not have a storeDesc for %s yet", nodeID, storeKey)
-				}
-				if info.OrigStamp < timestamp {
-					return errors.Errorf("node %d's storeDesc for %s is not up to date", nodeID, storeKey)
-				}
-			}
-		}
-		return nil
-	})
-}
-
-// initGossipNetwork gossips all store descriptors and waits until all
-// storePools have received those descriptors.
-func (m *multiTestContext) initGossipNetwork() {
-	m.gossipStores()
-	testutils.SucceedsSoon(m.t, func() error {
-		for i := 0; i < len(m.stores); i++ {
-			if _, alive, _ := m.storePools[i].GetStoreList(); alive != len(m.stores) {
-				return errors.Errorf("node %d's store pool only has %d alive stores, expected %d",
-					m.stores[i].Ident.NodeID, alive, len(m.stores))
-			}
-		}
-		return nil
-	})
-	log.Info(context.Background(), "gossip network initialized")
-}
-
 type multiTestContextKVTransport struct {
 	mtc      *multiTestContext
 	idx      int
@@ -790,10 +745,14 @@ func (m *multiTestContext) makeStoreConfig(i int) kvserver.StoreConfig {
 	cfg.TestingKnobs.DisableMergeQueue = true
 	cfg.TestingKnobs.DisableSplitQueue = true
 	cfg.TestingKnobs.ReplicateQueueAcceptsUnsplit = true
+	// The mtc does not populate the allocator's store pool well and so
+	// the check never sees any live replicas.
+	cfg.TestingKnobs.AllowDangerousReplicationChanges = true
+
 	return cfg
 }
 
-var _ kvcoord.RangeDescriptorDB = mtcRangeDescriptorDB{}
+var _ rangecache.RangeDescriptorDB = mtcRangeDescriptorDB{}
 
 type mtcRangeDescriptorDB struct {
 	*multiTestContext
@@ -954,7 +913,9 @@ func (m *multiTestContext) addStore(idx int) {
 			eng,
 			kvs, /* initialValues */
 			clusterversion.TestingBinaryVersion,
-			len(m.engines), splits, cfg.Clock.PhysicalNow())
+			len(m.engines), splits, cfg.Clock.PhysicalNow(),
+			cfg.TestingKnobs,
+		)
 		if err != nil {
 			m.t.Fatal(err)
 		}
@@ -966,8 +927,9 @@ func (m *multiTestContext) addStore(idx int) {
 
 	sender := kvserver.NewStores(ambient, clock)
 	sender.AddStore(store)
-	perReplicaServer := kvserver.MakeServer(&roachpb.NodeDescriptor{NodeID: nodeID}, sender)
-	kvserver.RegisterPerReplicaServer(grpcServer, perReplicaServer)
+	server := kvserver.MakeServer(&roachpb.NodeDescriptor{NodeID: nodeID}, sender)
+	kvserver.RegisterPerReplicaServer(grpcServer, server)
+	kvserver.RegisterPerStoreServer(grpcServer, server)
 
 	ln, err := netutil.ListenAndServeGRPC(m.transportStopper, grpcServer, util.TestAddr)
 	if err != nil {
@@ -1177,17 +1139,6 @@ func (m *multiTestContext) findStartKeyLocked(rangeID roachpb.RangeID) roachpb.R
 	return nil // unreached, but the compiler can't tell.
 }
 
-// restart stops and restarts all stores but leaves the engines intact,
-// so the stores should contain the same persistent storage as before.
-func (m *multiTestContext) restart() {
-	for i := range m.stores {
-		m.stopStore(i)
-	}
-	for i := range m.stores {
-		m.restartStore(i)
-	}
-}
-
 // changeReplicas performs a ChangeReplicas operation, retrying until the
 // destination store has been addded or removed. Returns the range's
 // NextReplicaID, which is the ID of the newly-added replica if this is an add.
@@ -1195,14 +1146,6 @@ func (m *multiTestContext) changeReplicas(
 	startKey roachpb.RKey, dest int, changeType roachpb.ReplicaChangeType,
 ) (roachpb.ReplicaID, error) {
 	ctx := context.Background()
-
-	var alreadyDoneErr string
-	switch changeType {
-	case roachpb.ADD_VOTER:
-		alreadyDoneErr = "unable to add replica .* which is already present"
-	case roachpb.REMOVE_VOTER:
-		alreadyDoneErr = "unable to remove replica .* which is not present"
-	}
 
 	retryOpts := retry.Options{
 		InitialBackoff: time.Millisecond,
@@ -1216,9 +1159,7 @@ func (m *multiTestContext) changeReplicas(
 		// the effects of any previous ChangeReplicas call. By the time
 		// ChangeReplicas returns the raft leader is guaranteed to have the
 		// updated version, but followers are not.
-		if err := m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc); err != nil {
-			return 0, err
-		}
+		require.NoError(m.t, m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc))
 
 		_, err := m.dbs[0].AdminChangeReplicas(
 			ctx, startKey.AsRawKey(),
@@ -1231,8 +1172,22 @@ func (m *multiTestContext) changeReplicas(
 				}),
 		)
 
-		if err == nil || testutils.IsError(err, alreadyDoneErr) {
+		if err == nil {
 			break
+		}
+
+		// There was an error. Refresh the range descriptor and check if we're already done.
+		//
+		// NB: this could get smarter around non-voters. Hasn't been necessary so far.
+		require.NoError(m.t, m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc))
+		if changeType == roachpb.ADD_VOTER {
+			if _, ok := desc.GetReplicaDescriptor(m.idents[dest].StoreID); ok {
+				break
+			}
+		} else if changeType == roachpb.REMOVE_VOTER {
+			if _, ok := desc.GetReplicaDescriptor(m.idents[dest].StoreID); !ok {
+				break
+			}
 		}
 
 		if errors.HasType(err, (*roachpb.AmbiguousResultError)(nil)) {
@@ -1242,13 +1197,11 @@ func (m *multiTestContext) changeReplicas(
 			continue
 		}
 
-		// We can't use storage.IsSnapshotError() because the original error object
-		// is lost. We could make a this into a roachpb.Error but it seems overkill
-		// for this one usage.
-		if testutils.IsError(err, "snapshot failed: .*|descriptor changed") {
+		if kvserver.IsRetriableReplicationChangeError(err) {
 			log.Infof(ctx, "%v", err)
 			continue
 		}
+
 		return 0, err
 	}
 
@@ -1564,6 +1517,16 @@ func pushTxnArgs(
 	}
 }
 
+func migrateArgs(start, end roachpb.Key, version roachpb.Version) *roachpb.MigrateRequest {
+	return &roachpb.MigrateRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key:    start,
+			EndKey: end,
+		},
+		Version: version,
+	}
+}
+
 func adminTransferLeaseArgs(key roachpb.Key, target roachpb.StoreID) roachpb.Request {
 	return &roachpb.AdminTransferLeaseRequest{
 		RequestHeader: roachpb.RequestHeader{
@@ -1641,6 +1604,9 @@ func verifyRangeStats(
 	if err != nil {
 		return err
 	}
+	// When used with a real wall clock these will not be the same, since it
+	// takes time to load stats.
+	expMS.AgeTo(ms.LastUpdateNanos)
 	// Clear system counts as these are expected to vary.
 	ms.SysBytes, ms.SysCount, ms.AbortSpanBytes = 0, 0, 0
 	if ms != expMS {

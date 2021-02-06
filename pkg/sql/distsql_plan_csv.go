@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/logtags"
@@ -159,7 +158,7 @@ func presplitTableBoundaries(
 	expirationTime := cfg.DB.Clock().Now().Add(time.Hour.Nanoseconds(), 0)
 	for _, tbl := range tables {
 		// TODO(ajwerner): Consider passing in the wrapped descriptors.
-		tblDesc := tabledesc.MakeImmutable(*tbl.Desc)
+		tblDesc := tabledesc.NewImmutable(*tbl.Desc)
 		for _, span := range tblDesc.AllIndexSpans(cfg.Codec) {
 			if err := cfg.DB.AdminSplit(ctx, span.Key, expirationTime); err != nil {
 				return err
@@ -228,6 +227,13 @@ func DistIngest(
 			prog := details.(*jobspb.Progress_Import).Import
 			prog.ReadProgress = make([]float32, len(from))
 			prog.ResumePos = make([]int64, len(from))
+			if prog.SequenceDetails == nil {
+				prog.SequenceDetails = make([]*jobspb.SequenceDetails, len(from))
+				for i := range prog.SequenceDetails {
+					prog.SequenceDetails[i] = &jobspb.SequenceDetails{}
+				}
+			}
+
 			return 0.0
 		},
 	); err != nil {
@@ -281,8 +287,10 @@ func DistIngest(
 		return nil
 	})
 
-	if err := presplitTableBoundaries(ctx, execCtx.ExecCfg(), tables); err != nil {
-		return roachpb.BulkOpSummary{}, err
+	if evalCtx.Codec.ForSystemTenant() {
+		if err := presplitTableBoundaries(ctx, execCtx.ExecCfg(), tables); err != nil {
+			return roachpb.BulkOpSummary{}, err
+		}
 	}
 
 	recv := MakeDistSQLReceiver(
@@ -291,8 +299,9 @@ func DistIngest(
 		tree.Rows,
 		nil, /* rangeCache */
 		nil, /* txn - the flow does not read or write the database */
-		func(ts hlc.Timestamp) {},
+		nil, /* clockUpdater */
 		evalCtx.Tracing,
+		evalCtx.ExecCfg.ContentionRegistry,
 	)
 	defer recv.Release()
 

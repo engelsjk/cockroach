@@ -21,7 +21,6 @@ import (
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
-	"github.com/opentracing/opentracing-go/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -125,18 +124,18 @@ func ServerInterceptor(tracer *Tracer) grpc.UnaryServerInterceptor {
 			return handler(ctx, req)
 		}
 
-		serverSpan := tracer.StartSpan(
+		ctx, serverSpan := tracer.StartSpanCtx(
+			ctx,
 			info.FullMethod,
 			WithTags(gRPCComponentTag, ext.SpanKindRPCServer),
 			WithParentAndManualCollection(spanMeta),
 		)
 		defer serverSpan.Finish()
 
-		ctx = ContextWithSpan(ctx, serverSpan)
 		resp, err = handler(ctx, req)
 		if err != nil {
 			SetSpanTags(serverSpan, err, false)
-			serverSpan.LogFields(log.String("event", "error"), log.String("message", err.Error()))
+			serverSpan.Recordf("error: %s", err)
 		}
 		return resp, err
 	}
@@ -168,7 +167,8 @@ func StreamServerInterceptor(tracer *Tracer) grpc.StreamServerInterceptor {
 			return handler(srv, ss)
 		}
 
-		serverSpan := tracer.StartSpan(
+		ctx, serverSpan := tracer.StartSpanCtx(
+			ss.Context(),
 			info.FullMethod,
 			WithTags(gRPCComponentTag, ext.SpanKindRPCServer),
 			WithParentAndManualCollection(spanMeta),
@@ -176,12 +176,12 @@ func StreamServerInterceptor(tracer *Tracer) grpc.StreamServerInterceptor {
 		defer serverSpan.Finish()
 		ss = &tracingServerStream{
 			ServerStream: ss,
-			ctx:          ContextWithSpan(ss.Context(), serverSpan),
+			ctx:          ctx,
 		}
 		err = handler(srv, ss)
 		if err != nil {
 			SetSpanTags(serverSpan, err, false)
-			serverSpan.LogFields(log.String("event", "error"), log.String("message", err.Error()))
+			serverSpan.Recordf("error: %s", err)
 		}
 		return err
 	}
@@ -220,7 +220,7 @@ func injectSpanContext(ctx context.Context, tracer *Tracer, clientSpan *Span) co
 	err := tracer.Inject(clientSpan.Meta(), opentracing.HTTPHeaders, mdWriter)
 	// We have no better place to record an error than the Span itself :-/
 	if err != nil {
-		clientSpan.LogFields(log.String("event", "Tracer.Inject() failed"), log.Error(err))
+		clientSpan.Recordf("error: %s", err)
 	}
 	return metadata.NewOutgoingContext(ctx, md)
 }
@@ -237,7 +237,7 @@ func injectSpanContext(ctx context.Context, tracer *Tracer, clientSpan *Span) co
 //
 // All gRPC client spans will inject the tracing SpanMeta into the gRPC
 // metadata; they will also look in the context.Context for an active
-// in-process parent Span and establish a ChildOf reference if such a parent
+// in-process parent Span and establish a ChildOf relationship if such a parent
 // Span could be found.
 func ClientInterceptor(tracer *Tracer, init func(*Span)) grpc.UnaryClientInterceptor {
 	if init == nil {
@@ -266,7 +266,7 @@ func ClientInterceptor(tracer *Tracer, init func(*Span)) grpc.UnaryClientInterce
 		err := invoker(ctx, method, req, resp, cc, opts...)
 		if err != nil {
 			SetSpanTags(clientSpan, err, true)
-			clientSpan.LogFields(log.String("event", "error"), log.String("message", err.Error()))
+			clientSpan.Recordf("error: %s", err)
 		}
 		return err
 	}
@@ -285,7 +285,7 @@ func ClientInterceptor(tracer *Tracer, init func(*Span)) grpc.UnaryClientInterce
 //
 // All gRPC client spans will inject the tracing SpanMeta into the gRPC
 // metadata; they will also look in the context.Context for an active
-// in-process parent Span and establish a ChildOf reference if such a parent
+// in-process parent Span and establish a ChildOf relationship if such a parent
 // Span could be found.
 func StreamClientInterceptor(tracer *Tracer, init func(*Span)) grpc.StreamClientInterceptor {
 	if init == nil {
@@ -313,7 +313,7 @@ func StreamClientInterceptor(tracer *Tracer, init func(*Span)) grpc.StreamClient
 		ctx = injectSpanContext(ctx, tracer, clientSpan)
 		cs, err := streamer(ctx, desc, cc, method, opts...)
 		if err != nil {
-			clientSpan.LogFields(log.String("event", "error"), log.String("message", err.Error()))
+			clientSpan.Recordf("error: %s", err)
 			SetSpanTags(clientSpan, err, true)
 			clientSpan.Finish()
 			return cs, err
@@ -340,7 +340,7 @@ func newTracingClientStream(
 		close(finishChan)
 		defer clientSpan.Finish()
 		if err != nil {
-			clientSpan.LogFields(log.String("event", "error"), log.String("message", err.Error()))
+			clientSpan.Recordf("error: %s", err)
 			SetSpanTags(clientSpan, err, true)
 		}
 	}

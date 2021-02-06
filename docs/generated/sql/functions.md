@@ -711,6 +711,8 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="unique_rowid"></a><code>unique_rowid() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns a unique ID used by CockroachDB to generate unique row IDs if a Primary Key isn’t defined for the table. The value is a combination of the insert timestamp and the ID of the node executing the statement, which guarantees this combination is globally unique. However, there can be gaps and the order is not completely guaranteed.</p>
 </span></td></tr>
+<tr><td><a name="uuid_generate_v4"></a><code>uuid_generate_v4() &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Generates a random UUID and returns it as a value of UUID type.</p>
+</span></td></tr>
 <tr><td><a name="uuid_v4"></a><code>uuid_v4() &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Returns a UUID.</p>
 </span></td></tr></tbody>
 </table>
@@ -777,6 +779,10 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td></tr>
 <tr><td><a name="fnv64a"></a><code>fnv64a(<a href="string.html">string</a>...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the 64-bit FNV-1a hash value of a set of values.</p>
 </span></td></tr>
+<tr><td><a name="levenshtein"></a><code>levenshtein(source: <a href="string.html">string</a>, target: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the Levenshtein distance between two strings. Maximum input length is 255 characters.</p>
+</span></td></tr>
+<tr><td><a name="levenshtein"></a><code>levenshtein(source: <a href="string.html">string</a>, target: <a href="string.html">string</a>, ins_cost: <a href="int.html">int</a>, del_cost: <a href="int.html">int</a>, sub_cost: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the Levenshtein distance between two strings. The cost parameters specify how much to charge for each edit operation. Maximum input length is 255 characters.</p>
+</span></td></tr>
 <tr><td><a name="width_bucket"></a><code>width_bucket(operand: <a href="decimal.html">decimal</a>, b1: <a href="decimal.html">decimal</a>, b2: <a href="decimal.html">decimal</a>, count: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>return the bucket number to which operand would be assigned in a histogram having count equal-width buckets spanning the range b1 to b2.</p>
 </span></td></tr>
 <tr><td><a name="width_bucket"></a><code>width_bucket(operand: <a href="int.html">int</a>, b1: <a href="int.html">int</a>, b2: <a href="int.html">int</a>, count: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>return the bucket number to which operand would be assigned in a histogram having count equal-width buckets spanning the range b1 to b2.</p>
@@ -797,6 +803,8 @@ has no relationship with the commit order of concurrent transactions.</p>
 <tr><td><a name="crdb_internal.json_to_pb"></a><code>crdb_internal.json_to_pb(pbname: <a href="string.html">string</a>, json: jsonb) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Convert JSONB data to protocol message bytes</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.pb_to_json"></a><code>crdb_internal.pb_to_json(pbname: <a href="string.html">string</a>, data: <a href="bytes.html">bytes</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Converts protocol message to its JSONB representation.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.pb_to_json"></a><code>crdb_internal.pb_to_json(pbname: <a href="string.html">string</a>, data: <a href="bytes.html">bytes</a>, emit_defaults: <a href="bool.html">bool</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Converts protocol message to its JSONB representation.</p>
 </span></td></tr>
 <tr><td><a name="json_array_length"></a><code>json_array_length(json: jsonb) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of elements in the outermost JSON or JSONB array.</p>
 </span></td></tr>
@@ -851,6 +859,16 @@ has no relationship with the commit order of concurrent transactions.</p>
 <tr><td><a name="to_json"></a><code>to_json(val: anyelement) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Returns the value as JSON or JSONB.</p>
 </span></td></tr>
 <tr><td><a name="to_jsonb"></a><code>to_jsonb(val: anyelement) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Returns the value as JSON or JSONB.</p>
+</span></td></tr></tbody>
+</table>
+
+### Multi-region functions
+
+<table>
+<thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><a name="gateway_region"></a><code>gateway_region() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the region of the connection’s current node as defined by
+the locality flag on node startup. Returns an error if no region is set.</p>
 </span></td></tr></tbody>
 </table>
 
@@ -951,15 +969,23 @@ has no relationship with the commit order of concurrent transactions.</p>
 <tbody>
 <tr><td><a name="currval"></a><code>currval(sequence_name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the latest value obtained with nextval for this sequence in this session.</p>
 </span></td></tr>
+<tr><td><a name="currval"></a><code>currval(sequence_name: regclass) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the latest value obtained with nextval for this sequence in this session.</p>
+</span></td></tr>
 <tr><td><a name="lastval"></a><code>lastval() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return value most recently obtained with nextval in this session.</p>
 </span></td></tr>
 <tr><td><a name="nextval"></a><code>nextval(sequence_name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Advances the given sequence and returns its new value.</p>
+</span></td></tr>
+<tr><td><a name="nextval"></a><code>nextval(sequence_name: regclass) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Advances the given sequence and returns its new value.</p>
 </span></td></tr>
 <tr><td><a name="pg_get_serial_sequence"></a><code>pg_get_serial_sequence(table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the name of the sequence used by the given column_name in the table table_name.</p>
 </span></td></tr>
 <tr><td><a name="setval"></a><code>setval(sequence_name: <a href="string.html">string</a>, value: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Set the given sequence’s current value. The next call to nextval will return <code>value + Increment</code></p>
 </span></td></tr>
 <tr><td><a name="setval"></a><code>setval(sequence_name: <a href="string.html">string</a>, value: <a href="int.html">int</a>, is_called: <a href="bool.html">bool</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Set the given sequence’s current value. If is_called is false, the next call to nextval will return <code>value</code>; otherwise <code>value + Increment</code>.</p>
+</span></td></tr>
+<tr><td><a name="setval"></a><code>setval(sequence_name: regclass, value: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Set the given sequence’s current value. The next call to nextval will return <code>value + Increment</code></p>
+</span></td></tr>
+<tr><td><a name="setval"></a><code>setval(sequence_name: regclass, value: <a href="int.html">int</a>, is_called: <a href="bool.html">bool</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Set the given sequence’s current value. If is_called is false, the next call to nextval will return <code>value</code>; otherwise <code>value + Increment</code>.</p>
 </span></td></tr></tbody>
 </table>
 
@@ -1675,7 +1701,12 @@ Bottom Left.</p>
 <p>This function utilizes the GEOS module.</p>
 </span></td></tr>
 <tr><td><a name="st_frechetdistance"></a><code>st_frechetdistance(geometry_a: geometry, geometry_b: geometry, densify_frac: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the Frechet distance between the given geometries, with the given segment densification (range 0.0-1.0, -1 to disable).</p>
+<p>Smaller densify_frac gives a more accurate Fréchet distance. However, the computation time and memory usage increases with the square of the number of subsegments.</p>
 <p>This function utilizes the GEOS module.</p>
+</span></td></tr>
+<tr><td><a name="st_generatepoints"></a><code>st_generatepoints(geometry: geometry, npoints: int4) &rarr; geometry</code></td><td><span class="funcdesc"><p>Generates pseudo-random points until the requested number are found within the input area. Uses system time as a seed.</p>
+</span></td></tr>
+<tr><td><a name="st_generatepoints"></a><code>st_generatepoints(geometry: geometry, npoints: int4, seed: int4) &rarr; geometry</code></td><td><span class="funcdesc"><p>Generates pseudo-random points until the requested number are found within the input area.</p>
 </span></td></tr>
 <tr><td><a name="st_geogfromewkb"></a><code>st_geogfromewkb(val: <a href="bytes.html">bytes</a>) &rarr; geography</code></td><td><span class="funcdesc"><p>Returns the Geography from an EWKB representation.</p>
 </span></td></tr>
@@ -1874,6 +1905,10 @@ calculated, the result is transformed back into a Geography with SRID 4326.</p>
 </span></td></tr>
 <tr><td><a name="st_linestringfromwkb"></a><code>st_linestringfromwkb(wkb: <a href="bytes.html">bytes</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the Geometry from a WKB (or EWKB) representation with an SRID. If the shape underneath is not LineString, NULL is returned.</p>
 </span></td></tr>
+<tr><td><a name="st_linesubstring"></a><code>st_linesubstring(linestring: geometry, start_fraction: <a href="decimal.html">decimal</a>, end_fraction: <a href="decimal.html">decimal</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Return a linestring being a substring of the input one starting and ending at the given fractions of total 2D length. Second and third arguments are float8 values between 0 and 1.</p>
+</span></td></tr>
+<tr><td><a name="st_linesubstring"></a><code>st_linesubstring(linestring: geometry, start_fraction: <a href="float.html">float</a>, end_fraction: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Return a linestring being a substring of the input one starting and ending at the given fractions of total 2D length. Second and third arguments are float8 values between 0 and 1.</p>
+</span></td></tr>
 <tr><td><a name="st_longestline"></a><code>st_longestline(geometry_a: geometry, geometry_b: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the LineString corresponds to the max distance across every pair of points comprising the given geometries.</p>
 <p>Note if geometries are the same, it will return the LineString with the maximum distance between the geometry’s vertexes. The function will return the longest line that was discovered first when comparing maximum distances if more than one is found.</p>
 </span></td></tr>
@@ -1988,6 +2023,10 @@ calculated, the result is transformed back into a Geography with SRID 4326.</p>
 <tr><td><a name="st_numpoints"></a><code>st_numpoints(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the number of points in a LineString. Returns NULL if the Geometry is not a LineString.</p>
 </span></td></tr>
 <tr><td><a name="st_orderingequals"></a><code>st_orderingequals(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a is exactly equal to geometry_b, having all coordinates in the same order, as well as the same type, SRID, bounding box, and so on.</p>
+</span></td></tr>
+<tr><td><a name="st_orientedenvelope"></a><code>st_orientedenvelope(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a minimum rotated rectangle enclosing a geometry.
+Note that more than one minimum rotated rectangle may exist.
+May return a Point or LineString in the case of degenerate inputs.</p>
 </span></td></tr>
 <tr><td><a name="st_overlaps"></a><code>st_overlaps(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a intersects but does not completely contain geometry_b, or vice versa. “Does not completely” implies ST_Within(geometry_a, geometry_b) = ST_Within(geometry_b, geometry_a) = false.</p>
 <p>This function utilizes the GEOS module.</p>
@@ -2120,6 +2159,8 @@ SELECT ST_S2Covering(geometry, ‘s2_max_level=15,s2_level_mod=3’).</p>
 those going in the opposite direction are in the second element.
 The paths themselves are given in the direction of the first geometry.</p>
 </span></td></tr>
+<tr><td><a name="st_shiftlongitude"></a><code>st_shiftlongitude(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a modified version of a geometry in which the longitude (X coordinate) of each point is incremented by 360 if it is &lt;0 and decremented by 360 if it is &gt;180. The result is only meaningful if the coordinates are in longitude/latitude.</p>
+</span></td></tr>
 <tr><td><a name="st_shortestline"></a><code>st_shortestline(geometry_a: geometry, geometry_b: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the LineString corresponds to the minimum distance across every pair of points comprising the given geometries.</p>
 <p>Note if geometries are the same, it will return the LineString with the minimum distance between the geometry’s vertexes. The function will return the shortest line that was discovered first when comparing minimum distances if more than one is found.</p>
 </span></td></tr>
@@ -2140,6 +2181,10 @@ The paths themselves are given in the direction of the first geometry.</p>
 <tr><td><a name="st_srid"></a><code>st_srid(geometry: geometry) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the Spatial Reference Identifier (SRID) for the ST_Geometry as defined in spatial_ref_sys table.</p>
 </span></td></tr>
 <tr><td><a name="st_startpoint"></a><code>st_startpoint(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the first point of a geometry which has shape LineString. Returns NULL if the geometry is not a LineString.</p>
+</span></td></tr>
+<tr><td><a name="st_subdivide"></a><code>st_subdivide(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a geometry divided into parts, where each part contains no more than 256 vertices.</p>
+</span></td></tr>
+<tr><td><a name="st_subdivide"></a><code>st_subdivide(geometry: geometry, max_vertices: int4) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a geometry divided into parts, where each part contains no more than the number of vertices provided.</p>
 </span></td></tr>
 <tr><td><a name="st_summary"></a><code>st_summary(geography: geography) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns a text summary of the contents of the geography.</p>
 <p>Flags shown square brackets after the geometry type have the following meaning:</p>
@@ -2191,6 +2236,18 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 <tr><td><a name="st_transscale"></a><code>st_transscale(geometry: geometry, delta_x: <a href="float.html">float</a>, delta_y: <a href="float.html">float</a>, x_factor: <a href="float.html">float</a>, y_factor: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Translates the geometry using the deltaX and deltaY args, then scales it using the XFactor, YFactor args, working in 2D only.</p>
 </span></td></tr>
 <tr><td><a name="st_unaryunion"></a><code>st_unaryunion(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a union of the components for any geometry or geometry collection provided. Dissolves boundaries of a multipolygon.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoilines"></a><code>st_voronoilines(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry asthe boundaries between cells in that diagram as a MultiLineString.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoilines"></a><code>st_voronoilines(geometry: geometry, tolerance: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry asthe boundaries between cells in that diagram as a MultiLineString.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoilines"></a><code>st_voronoilines(geometry: geometry, tolerance: <a href="float.html">float</a>, extend_to: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry asthe boundaries between cells in that diagram as a MultiLineString.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoipolygons"></a><code>st_voronoipolygons(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoipolygons"></a><code>st_voronoipolygons(geometry: geometry, tolerance: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry.</p>
+</span></td></tr>
+<tr><td><a name="st_voronoipolygons"></a><code>st_voronoipolygons(geometry: geometry, tolerance: <a href="float.html">float</a>, extend_to: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a two-dimensional Voronoi diagram from the vertices of the supplied geometry.</p>
 </span></td></tr>
 <tr><td><a name="st_within"></a><code>st_within(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a is completely inside geometry_b.</p>
 <p>This function utilizes the GEOS module.</p>
@@ -2244,6 +2301,8 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 <tr><td><a name="convert_to"></a><code>convert_to(str: <a href="string.html">string</a>, enc: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Encode the string <code>str</code> as a byte array using encoding <code>enc</code>. Supports encodings ‘UTF8’ and ‘LATIN1’.</p>
 </span></td></tr>
 <tr><td><a name="decode"></a><code>decode(text: <a href="string.html">string</a>, format: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Decodes <code>data</code> using <code>format</code> (<code>hex</code> / <code>escape</code> / <code>base64</code>).</p>
+</span></td></tr>
+<tr><td><a name="difference"></a><code>difference(source: <a href="string.html">string</a>, target: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert two strings to their Soundex codes and then reports the number of matching code positions.</p>
 </span></td></tr>
 <tr><td><a name="encode"></a><code>encode(data: <a href="bytes.html">bytes</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Encodes <code>data</code> using <code>format</code> (<code>hex</code> / <code>escape</code> / <code>base64</code>).</p>
 </span></td></tr>
@@ -2425,6 +2484,8 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td></tr>
 <tr><td><a name="sha512"></a><code>sha512(<a href="string.html">string</a>...) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Calculates the SHA512 hash value of a set of values.</p>
 </span></td></tr>
+<tr><td><a name="soundex"></a><code>soundex(source: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert a string to its Soundex code.</p>
+</span></td></tr>
 <tr><td><a name="split_part"></a><code>split_part(input: <a href="string.html">string</a>, delimiter: <a href="string.html">string</a>, return_index_pos: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Splits <code>input</code> on <code>delimiter</code> and return the value in the <code>return_index_pos</code>  position (starting at 1).</p>
 <p>For example, <code>split_part('123.456.789.0','.',3)</code>returns <code>789</code>.</p>
 </span></td></tr>
@@ -2531,6 +2592,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="crdb_internal.is_admin"></a><code>crdb_internal.is_admin() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Retrieves the current user’s admin status.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.lease_holder"></a><code>crdb_internal.lease_holder(key: <a href="bytes.html">bytes</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used to fetch the leaseholder corresponding to a request key</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.list_sql_keys_in_range"></a><code>crdb_internal.list_sql_keys_in_range(range_id: <a href="int.html">int</a>) &rarr; tuple{string AS key, string AS value}</code></td><td><span class="funcdesc"><p>Returns all SQL K/V pairs within the requested range.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.locality_value"></a><code>crdb_internal.locality_value(key: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the value of the specified locality key.</p>
 </span></td></tr>

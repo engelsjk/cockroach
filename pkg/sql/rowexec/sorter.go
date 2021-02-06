@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -54,7 +53,7 @@ func (s *sorterBase) init(
 	opts execinfra.ProcStateOpts,
 ) error {
 	ctx := flowCtx.EvalCtx.Ctx()
-	if sp := tracing.SpanFromContext(ctx); sp != nil && sp.IsRecording() {
+	if execinfra.ShouldCollectStats(ctx, flowCtx) {
 		input = newInputStatCollector(input)
 		s.ExecStatsForTrace = s.execStatsForTrace
 	}
@@ -152,7 +151,7 @@ func newSorter(
 	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	count := uint64(0)
-	if post.Limit != 0 && post.Filter.Empty() {
+	if post.Limit != 0 {
 		// The sorter needs to produce Offset + Limit rows. The ProcOutputHelper
 		// will discard the first Offset ones.
 		if post.Limit <= math.MaxUint64-post.Offset {

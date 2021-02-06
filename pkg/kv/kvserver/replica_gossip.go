@@ -29,6 +29,10 @@ const configGossipTTL = 0 // does not expire
 func (r *Replica) gossipFirstRange(ctx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.gossipFirstRangeLocked(ctx)
+}
+
+func (r *Replica) gossipFirstRangeLocked(ctx context.Context) {
 	// Gossip is not provided for the bootstrap store and for some tests.
 	if r.store.Gossip() == nil {
 		return
@@ -56,7 +60,7 @@ func (r *Replica) gossipFirstRange(ctx context.Context) {
 // inherently inconsistent and asynchronous, we're using the lease as a way to
 // ensure that only one node gossips at a time.
 func (r *Replica) shouldGossip(ctx context.Context) bool {
-	return r.OwnsValidLease(ctx, r.store.Clock().Now())
+	return r.OwnsValidLease(ctx, r.store.Clock().NowAsClockTimestamp())
 }
 
 // MaybeGossipSystemConfig scans the entire SystemConfig span and gossips it.
@@ -177,7 +181,7 @@ func (r *Replica) MaybeGossipNodeLiveness(ctx context.Context, span roachpb.Span
 				continue
 			}
 		}
-		if !r.ClusterSettings().Version.IsActive(ctx, clusterversion.VersionNodeMembershipStatus) {
+		if !r.ClusterSettings().Version.IsActive(ctx, clusterversion.NodeMembershipStatus) {
 			// We can't transmit liveness records with a backwards incompatible
 			// representation unless we're told by the user that there are no
 			// pre-v20.1 nodes around. We should never get here.
@@ -292,10 +296,6 @@ func (r *Replica) maybeGossipFirstRange(ctx context.Context) *roachpb.Error {
 	}
 	if err := r.store.Gossip().AddClusterID(r.store.ClusterID()); err != nil {
 		log.Errorf(ctx, "failed to gossip cluster ID: %+v", err)
-	}
-
-	if r.store.cfg.TestingKnobs.DisablePeriodicGossips {
-		return nil
 	}
 
 	hasLease, pErr := r.getLeaseForGossip(ctx)

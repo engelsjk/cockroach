@@ -130,6 +130,9 @@ type BaseConfig struct {
 	// heapprofiler. If empty, no heap profiles will be collected.
 	HeapProfileDirName string
 
+	// CPUProfileDirName is the directory name for CPU profile dumps.
+	CPUProfileDirName string
+
 	// DefaultZoneConfig is used to set the default zone config inside the server.
 	// It can be overridden during tests by setting the DefaultZoneConfigOverride
 	// server testing knob.
@@ -272,6 +275,10 @@ type KVConfig struct {
 	// the Admin API's HTTP endpoints.
 	EnableWebSessionAuthentication bool
 
+	// EnableDemoLoginEndpoint enables the HTTP GET endpoint for user logins,
+	// which a feature unique to the demo shell.
+	EnableDemoLoginEndpoint bool
+
 	enginesCreated bool
 }
 
@@ -319,9 +326,6 @@ type SQLConfig struct {
 	// used by SQL clients to store row data in server RAM.
 	MemoryPoolSize int64
 
-	// AuditLogDirName is the target directory name for SQL audit logs.
-	AuditLogDirName *log.DirName
-
 	// TableStatCacheSize is the size (number of tables) of the table
 	// statistics cache.
 	TableStatCacheSize int
@@ -333,12 +337,6 @@ type SQLConfig struct {
 	//
 	// Only applies when the SQL server is deployed individually.
 	TenantKVAddrs []string
-
-	// TenantIDCodecOverride overrides the tenant ID used to construct the SQL
-	// server's codec, but nothing else (e.g. its certs). Used for testing.
-	//
-	// Only applies when the SQL server is deployed individually.
-	TenantIDCodecOverride roachpb.TenantID
 }
 
 // MakeSQLConfig returns a SQLConfig with default values.
@@ -500,7 +498,18 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			details = append(details, fmt.Sprintf("store %d: in-memory, size %s",
 				i, humanizeutil.IBytes(sizeInBytes)))
 			if spec.StickyInMemoryEngineID != "" {
-				e, err := getOrCreateStickyInMemEngine(ctx, spec.StickyInMemoryEngineID, spec.Attributes, sizeInBytes)
+				if cfg.TestingKnobs.Server == nil {
+					return Engines{}, errors.AssertionFailedf("Could not create a sticky " +
+						"engine no server knobs available to get a registry. " +
+						"Please use Knobs.Server.StickyEngineRegistry to provide one.")
+				}
+				knobs := cfg.TestingKnobs.Server.(*TestingKnobs)
+				if knobs.StickyEngineRegistry == nil {
+					return Engines{}, errors.Errorf("Could not create a sticky " +
+						"engine no registry available. Please use " +
+						"Knobs.Server.StickyEngineRegistry to provide one.")
+				}
+				e, err := knobs.StickyEngineRegistry.GetOrCreateStickyInMemEngine(ctx, spec)
 				if err != nil {
 					return Engines{}, err
 				}

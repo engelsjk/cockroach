@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -53,7 +54,8 @@ var _ planNode = &createTypeNode{n: nil}
 
 func (p *planner) CreateType(ctx context.Context, n *tree.CreateType) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"CREATE TYPE",
 	); err != nil {
 		return nil, err
@@ -73,6 +75,26 @@ func (p *planner) CreateType(ctx context.Context, n *tree.CreateType) (planNode,
 }
 
 func (n *createTypeNode) startExec(params runParams) error {
+	// Check if a type with the same name exists already.
+	flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
+		Required:    false,
+		AvoidCached: true,
+	}}
+	found, _, err := params.p.Descriptors().GetImmutableTypeByName(params.ctx, params.p.Txn(), n.typeName, flags)
+	if err != nil {
+		return err
+	}
+	// If we found a descriptor and have IfNotExists = true, then exit without
+	// doing anything. Ideally, we would do this below by inspecting the type
+	// of error returned by getCreateTypeParams, but it doesn't return enough
+	// information for us to do so. For comparison, we handle this case in
+	// CREATE TABLE IF NOT EXISTS by checking the return code
+	// (pgcode.DuplicateRelation) of getCreateTableParams. However, there isn't
+	// a pgcode for duplicate types, only the more general pgcode.DuplicateObject.
+	if found && n.n.IfNotExists {
+		return nil
+	}
+
 	switch n.n.Variety {
 	case tree.Enum:
 		return params.p.createUserDefinedEnum(params, n)
@@ -219,7 +241,7 @@ func (p *planner) createArrayType(
 	// ID of the array type in order for the array type to correctly created.
 	var elemTyp *types.T
 	switch t := typDesc.Kind; t {
-	case descpb.TypeDescriptor_ENUM:
+	case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_MULTIREGION_ENUM:
 		elemTyp = types.MakeEnum(typedesc.TypeIDToOID(typDesc.GetID()), typedesc.TypeIDToOID(id))
 	default:
 		return 0, errors.AssertionFailedf("cannot make array type for kind %s", t.String())
@@ -275,7 +297,7 @@ func (p *planner) createEnumWithID(
 	enumType enumType,
 ) error {
 	// Make sure that all nodes in the cluster are able to recognize ENUM types.
-	if !p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.VersionEnums) {
+	if !p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.Enums) {
 		return pgerror.Newf(pgcode.FeatureNotSupported,
 			"not all nodes are the correct version for ENUM type creation")
 	}
@@ -314,7 +336,8 @@ func (p *planner) createEnumWithID(
 	// However having USAGE on a parent schema of the type
 	// gives USAGE privilege to the type.
 	privs := descpb.NewDefaultPrivilegeDescriptor(params.p.User())
-	resolvedSchema, err := p.Descriptors().ResolveSchemaByID(params.ctx, p.Txn(), schemaID)
+	resolvedSchema, err := p.Descriptors().GetImmutableSchemaByID(
+		params.ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{})
 	if err != nil {
 		return err
 	}
@@ -323,8 +346,16 @@ func (p *planner) createEnumWithID(
 	privs.Grant(params.p.User(), privilege.List{privilege.ALL})
 
 	enumKind := descpb.TypeDescriptor_ENUM
+	var regionConfig *descpb.TypeDescriptor_RegionConfig
 	if enumType == enumTypeMultiRegion {
 		enumKind = descpb.TypeDescriptor_MULTIREGION_ENUM
+		primaryRegion, err := dbDesc.PrimaryRegionName()
+		if err != nil {
+			return err
+		}
+		regionConfig = &descpb.TypeDescriptor_RegionConfig{
+			PrimaryRegion: primaryRegion,
+		}
 	}
 
 	// TODO (rohany): OID's are computed using an offset of
@@ -342,15 +373,13 @@ func (p *planner) createEnumWithID(
 			EnumMembers:    members,
 			Version:        1,
 			Privileges:     privs,
+			RegionConfig:   regionConfig,
 		})
 
 	// Create the implicit array type for this type before finishing the type.
-	arrayTypeID := descpb.InvalidID
-	if enumType == enumTypeUserDefined {
-		arrayTypeID, err = p.createArrayType(params, typeName, typeDesc, dbDesc, schemaID)
-		if err != nil {
-			return err
-		}
+	arrayTypeID, err := p.createArrayType(params, typeName, typeDesc, dbDesc, schemaID)
+	if err != nil {
+		return err
 	}
 
 	// Update the typeDesc with the created array type ID.
@@ -369,18 +398,11 @@ func (p *planner) createEnumWithID(
 	}
 
 	// Log the event.
-	return MakeEventLogger(p.ExecCfg()).InsertEventRecord(
-		params.ctx,
-		p.txn,
-		EventLogCreateType,
-		int32(typeDesc.GetID()),
-		int32(p.ExtendedEvalContext().NodeID.SQLInstanceID()),
-		struct {
-			TypeName  string
-			Statement string
-			User      string
-		}{typeName.FQString(), typeName.String(), p.User().Normalized()},
-	)
+	return p.logEvent(params.ctx,
+		typeDesc.GetID(),
+		&eventpb.CreateType{
+			TypeName: typeName.FQString(),
+		})
 }
 
 func (n *createTypeNode) Next(params runParams) (bool, error) { return false, nil }

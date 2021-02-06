@@ -12,7 +12,6 @@ package colflow
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"path/filepath"
 	"strconv"
@@ -24,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
@@ -36,8 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -45,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -167,21 +164,6 @@ func NewVectorizedFlow(base *flowinfra.FlowBase) flowinfra.Flow {
 	return vf
 }
 
-// VectorizeTestingBatchSize is a testing cluster setting that sets the default
-// batch size used by the vectorized execution engine. A low batch size is
-// useful to test batch reuse.
-var VectorizeTestingBatchSize = settings.RegisterValidatedIntSetting(
-	"sql.testing.vectorize.batch_size",
-	fmt.Sprintf("the size of a batch of rows in the vectorized engine (0=default, value must be less than %d)", coldata.MaxBatchSize),
-	0,
-	func(newBatchSize int64) error {
-		if newBatchSize > coldata.MaxBatchSize {
-			return pgerror.Newf(pgcode.InvalidParameterValue, "batch size %d may not be larger than %d", newBatchSize, coldata.MaxBatchSize)
-		}
-		return nil
-	},
-)
-
 // Setup is part of the flowinfra.Flow interface.
 func (f *vectorizedFlow) Setup(
 	ctx context.Context, spec *execinfrapb.FlowSpec, opt flowinfra.FuseOpt,
@@ -195,22 +177,10 @@ func (f *vectorizedFlow) Setup(
 		log.Infof(ctx, "setting up vectorize flow %s", f.ID.Short())
 	}
 	recordingStats := false
-	if sp := tracing.SpanFromContext(ctx); sp != nil && sp.IsRecording() {
+	if execinfra.ShouldCollectStats(ctx, &f.FlowCtx) {
 		recordingStats = true
 	}
 	helper := newVectorizedFlowCreatorHelper(f.FlowBase)
-
-	testingBatchSize := int64(0)
-	if f.FlowCtx.Cfg.Settings != nil {
-		testingBatchSize = VectorizeTestingBatchSize.Get(&f.FlowCtx.Cfg.Settings.SV)
-	}
-	if testingBatchSize != 0 {
-		if err := coldata.SetBatchSizeForTests(int(testingBatchSize)); err != nil {
-			return ctx, err
-		}
-	} else {
-		coldata.ResetBatchSizeForTests()
-	}
 
 	diskQueueCfg := colcontainer.DiskQueueCfg{
 		FS:        f.Cfg.TempFS,
@@ -225,6 +195,7 @@ func (f *vectorizedFlow) Setup(
 		helper,
 		vectorizedRemoteComponentCreator{},
 		recordingStats,
+		f.Gateway,
 		f.GetWaitGroup(),
 		f.GetSyncFlowConsumer(),
 		flowCtx.Cfg.NodeDialer,
@@ -236,7 +207,7 @@ func (f *vectorizedFlow) Setup(
 	if f.testingKnobs.onSetupFlow != nil {
 		f.testingKnobs.onSetupFlow(f.creator)
 	}
-	_, err = f.creator.setupFlow(ctx, flowCtx, spec.Processors, opt)
+	_, err = f.creator.setupFlow(ctx, flowCtx, spec.Processors, f.GetLocalProcessors(), opt)
 	if err == nil {
 		f.testingInfo.numClosers = f.creator.numClosers
 		f.testingInfo.numClosed = &f.creator.numClosed
@@ -343,11 +314,9 @@ func (f *vectorizedFlow) Cleanup(ctx context.Context) {
 // must have already been wrapped).
 func (s *vectorizedFlowCreator) wrapWithVectorizedStatsCollectorBase(
 	op colexecbase.Operator,
-	ioReader execinfra.IOReader,
+	kvReader execinfra.KVReader,
 	inputs []colexecbase.Operator,
-	id int32,
-	idTagKey string,
-	omitNumTuples bool,
+	component execinfrapb.ComponentID,
 	monitors []*mon.BytesMonitor,
 ) (colexec.VectorizedStatsCollector, error) {
 	inputWatch := timeutil.NewStopWatch()
@@ -368,7 +337,7 @@ func (s *vectorizedFlowCreator) wrapWithVectorizedStatsCollectorBase(
 		inputStatsCollectors[i] = sc
 	}
 	vsc := colexec.NewVectorizedStatsCollector(
-		op, ioReader, id, idTagKey, omitNumTuples, inputWatch,
+		op, kvReader, component, inputWatch,
 		memMonitors, diskMonitors, inputStatsCollectors,
 	)
 	s.vectorizedStatsCollectorsQueue = append(s.vectorizedStatsCollectorsQueue, vsc)
@@ -378,12 +347,12 @@ func (s *vectorizedFlowCreator) wrapWithVectorizedStatsCollectorBase(
 // wrapWithNetworkVectorizedStatsCollector creates a new
 // colexec.NetworkVectorizedStatsCollector that wraps op.
 func (s *vectorizedFlowCreator) wrapWithNetworkVectorizedStatsCollector(
-	inbox *colrpc.Inbox, id int32, latency time.Duration,
+	inbox *colrpc.Inbox, component execinfrapb.ComponentID, latency time.Duration,
 ) (colexec.VectorizedStatsCollector, error) {
 	inputWatch := timeutil.NewStopWatch()
 	op := colexecbase.Operator(inbox)
 	networkReader := colexec.NetworkReader(inbox)
-	nvsc := colexec.NewNetworkVectorizedStatsCollector(op, id, inputWatch, networkReader, latency)
+	nvsc := colexec.NewNetworkVectorizedStatsCollector(op, component, inputWatch, networkReader, latency)
 	s.vectorizedStatsCollectorsQueue = append(s.vectorizedStatsCollectorsQueue, nvsc)
 	return nvsc, nil
 }
@@ -391,14 +360,10 @@ func (s *vectorizedFlowCreator) wrapWithNetworkVectorizedStatsCollector(
 // finishVectorizedStatsCollectors finishes the given stats collectors and
 // outputs their stats to the trace contained in the ctx's span.
 func finishVectorizedStatsCollectors(
-	ctx context.Context,
-	flowID execinfrapb.FlowID,
-	deterministicStats bool,
-	vectorizedStatsCollectors []colexec.VectorizedStatsCollector,
+	ctx context.Context, vectorizedStatsCollectors []colexec.VectorizedStatsCollector,
 ) {
-	flowIDString := flowID.String()
 	for _, vsc := range vectorizedStatsCollectors {
-		vsc.OutputStats(ctx, flowIDString, deterministicStats)
+		vsc.OutputStats(ctx)
 	}
 }
 
@@ -474,18 +439,28 @@ type vectorizedFlowCreator struct {
 	streamIDToInputOp              map[execinfrapb.StreamID]opDAGWithMetaSources
 	streamIDToSpecIdx              map[execinfrapb.StreamID]int
 	recordingStats                 bool
+	isGatewayNode                  bool
 	vectorizedStatsCollectorsQueue []colexec.VectorizedStatsCollector
 	waitGroup                      *sync.WaitGroup
 	syncFlowConsumer               execinfra.RowReceiver
 	nodeDialer                     *nodedialer.Dialer
 	flowID                         execinfrapb.FlowID
 	exprHelper                     *colexec.ExprHelper
-	typeResolver                   *descs.DistSQLTypeResolver
+	typeResolver                   descs.DistSQLTypeResolver
 
 	// numOutboxes counts how many exec.Outboxes have been set up on this node.
 	// It must be accessed atomically.
 	numOutboxes       int32
 	materializerAdded bool
+
+	// numOutboxesExited is an atomic that keeps track of how many outboxes have exited.
+	// When numOutboxesExited equals numOutboxes, the cancellation function for the flow
+	// is called.
+	numOutboxesExited int32
+	// numOutboxesDrained is an atomic that keeps track of how many outboxes have
+	// been drained. When numOutboxesDrained equals numOutboxes, flow-level metadata is
+	// added to a flow-level span.
+	numOutboxesDrained int32
 
 	// procIdxQueue is a queue of indices into processorSpecs (the argument to
 	// setupFlow), for topologically ordered processing.
@@ -532,13 +507,14 @@ func newVectorizedFlowCreator(
 	helper flowCreatorHelper,
 	componentCreator remoteComponentCreator,
 	recordingStats bool,
+	isGatewayNode bool,
 	waitGroup *sync.WaitGroup,
 	syncFlowConsumer execinfra.RowReceiver,
 	nodeDialer *nodedialer.Dialer,
 	flowID execinfrapb.FlowID,
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
-	typeResolver *descs.DistSQLTypeResolver,
+	typeResolver descs.DistSQLTypeResolver,
 ) *vectorizedFlowCreator {
 	creator := vectorizedFlowCreatorPool.Get().(*vectorizedFlowCreator)
 	*creator = vectorizedFlowCreator{
@@ -685,7 +661,6 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 			outboxCancelFn,
 			flowinfra.SettingFlowStreamTimeout.Get(&flowCtx.Cfg.Settings.SV),
 		)
-		currentOutboxes := atomic.AddInt32(&s.numOutboxes, -1)
 		// When the last Outbox on this node exits, we want to make sure that
 		// everything is shutdown; namely, we need to call cancelFn if:
 		// - it is the last Outbox
@@ -694,7 +669,7 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 		// - cancelFn is non-nil (it can be nil in tests).
 		// Calling cancelFn will cancel the context that all infrastructure on this
 		// node is listening on, so it will shut everything down.
-		if currentOutboxes == 0 && !s.materializerAdded && cancelFn != nil {
+		if atomic.AddInt32(&s.numOutboxesExited, 1) == atomic.LoadInt32(&s.numOutboxes) && !s.materializerAdded && cancelFn != nil {
 			cancelFn()
 		}
 	}
@@ -774,8 +749,8 @@ func (s *vectorizedFlowCreator) setupRouter(
 				// information (e.g. output stall time).
 				var err error
 				localOp, err = s.wrapWithVectorizedStatsCollectorBase(
-					op, nil /* ioReader */, nil, /* inputs */
-					int32(stream.StreamID), execinfrapb.StreamIDTagKey, false /* omitNumTuples */, mons,
+					op, nil /* kvReader */, nil, /* inputs */
+					flowCtx.StreamComponentID(stream.StreamID), mons,
 				)
 				if err != nil {
 					return err
@@ -835,14 +810,15 @@ func (s *vectorizedFlowCreator) setupInput(
 				return nil, nil, nil, err
 			}
 
-			var latency time.Duration
-			// If LatencyGetter doesn't exist, latency's nil value of 0 is used.
-			// If latency is 0, it is not included in the displayed stats for
-			// EXPLAIN ANALYZE diagrams.
-			if flowCtx.Cfg.LatencyGetter != nil {
-				latency = time.Duration(flowCtx.Cfg.LatencyGetter.GetLatency(
-					ctx, inputStream.OriginNodeID, inputStream.TargetNodeID,
-				))
+			latency, err := s.nodeDialer.Latency(inputStream.TargetNodeID)
+			if err != nil {
+				// If an error occurred, latency's nil value of 0 is used. If latency is
+				// 0, it is not included in the displayed stats for EXPLAIN ANALYZE
+				// diagrams.
+				latency = 0
+				if log.V(1) {
+					log.Infof(ctx, "an error occurred during vectorized planning while getting latency: %v", err)
+				}
 			}
 
 			inbox, err := s.remoteComponentCreator.newInbox(
@@ -856,7 +832,7 @@ func (s *vectorizedFlowCreator) setupInput(
 			op := colexecbase.Operator(inbox)
 			if s.recordingStats {
 				op, err = s.wrapWithNetworkVectorizedStatsCollector(
-					inbox, int32(inputStream.StreamID), latency,
+					inbox, flowCtx.StreamComponentID(inputStream.StreamID), latency,
 				)
 				if err != nil {
 					return nil, nil, nil, err
@@ -913,8 +889,7 @@ func (s *vectorizedFlowCreator) setupInput(
 			// this stats collector to display stats.
 			var err error
 			op, err = s.wrapWithVectorizedStatsCollectorBase(
-				op, nil /* ioReader */, statsInputsAsOps, -1, /* id */
-				"" /* idTagKey */, false /* omitNumTuples */, nil, /* monitors */
+				op, nil /* kvReader */, statsInputsAsOps, execinfrapb.ComponentID{}, nil, /* monitors */
 			)
 			if err != nil {
 				return nil, nil, nil, err
@@ -976,9 +951,20 @@ func (s *vectorizedFlowCreator) setupOutput(
 						// Start a separate recording so that GetRecording will return
 						// the recordings for only the child spans containing stats.
 						ctx, span := tracing.ChildSpanRemote(ctx, "")
-						finishVectorizedStatsCollectors(
-							ctx, flowCtx.ID, flowCtx.Cfg.TestingKnobs.DeterministicStats, vscs,
-						)
+						if atomic.AddInt32(&s.numOutboxesDrained, 1) == atomic.LoadInt32(&s.numOutboxes) && !s.isGatewayNode {
+							// At the last outbox, we can accurately retrieve stats for the
+							// whole flow from parent monitors. These stats are added to a
+							// flow-level span.
+							span.SetTag(execinfrapb.FlowIDTagKey, flowCtx.ID)
+							span.SetSpanStats(&execinfrapb.ComponentStats{
+								Component: execinfrapb.FlowComponentID(outputStream.OriginNodeID, flowCtx.ID),
+								FlowStats: execinfrapb.FlowStats{
+									MaxMemUsage: optional.MakeUint(uint64(flowCtx.EvalCtx.Mon.MaximumBytes())),
+								},
+							})
+						}
+						finishVectorizedStatsCollectors(ctx, vscs)
+						span.Finish()
 						return []execinfrapb.ProducerMetadata{{TraceData: span.GetRecording()}}
 					},
 				},
@@ -1004,9 +990,7 @@ func (s *vectorizedFlowCreator) setupOutput(
 				// TODO(radu): this is a sketchy way to use this infrastructure. We
 				// aren't actually returning any stats, but we are creating and closing
 				// child spans with stats.
-				finishVectorizedStatsCollectors(
-					ctx, flowCtx.ID, flowCtx.Cfg.TestingKnobs.DeterministicStats, vscq,
-				)
+				finishVectorizedStatsCollectors(ctx, vscq)
 				return nil
 			}
 		}
@@ -1039,6 +1023,7 @@ func (s *vectorizedFlowCreator) setupFlow(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorSpecs []execinfrapb.ProcessorSpec,
+	localProcessors []execinfra.LocalProcessor,
 	opt flowinfra.FuseOpt,
 ) (leaves []execinfra.OpNode, err error) {
 	if vecErr := colexecerror.CatchVectorizedRuntimeError(func() {
@@ -1104,6 +1089,7 @@ func (s *vectorizedFlowCreator) setupFlow(
 				Inputs:               inputs,
 				StreamingMemAccount:  s.newStreamingMemAccount(flowCtx),
 				ProcessorConstructor: rowexec.NewProcessor,
+				LocalProcessors:      localProcessors,
 				DiskQueueCfg:         s.diskQueueCfg,
 				FDSemaphore:          s.fdSemaphore,
 				ExprHelper:           s.exprHelper,
@@ -1123,7 +1109,6 @@ func (s *vectorizedFlowCreator) setupFlow(
 				err = errors.Wrapf(err, "unable to vectorize execution plan")
 				return
 			}
-			originalOp := result.Op
 			if flowCtx.Cfg != nil && flowCtx.Cfg.TestingKnobs.EnableVectorizedInvariantsChecker {
 				result.Op = colexec.NewInvariantsChecker(result.Op)
 			}
@@ -1151,12 +1136,13 @@ func (s *vectorizedFlowCreator) setupFlow(
 
 			op := result.Op
 			if s.recordingStats {
-				// We prevent emitting the NumTuples stat from Columnarizers because the
-				// wrapped processor already emits the same stat.
-				_, isColumnarizer := originalOp.(*colexec.Columnarizer)
+				// Note: if the original op is a Columnarizer, this will result in two
+				// sets of stats for the same processor. The code that processes stats
+				// is prepared to union the stats.
+				// TODO(radu): find a way to clean this up.
 				op, err = s.wrapWithVectorizedStatsCollectorBase(
-					op, result.IOReader, inputs, pspec.ProcessorID,
-					execinfrapb.ProcessorIDTagKey, isColumnarizer, result.OpMonitors,
+					op, result.KVReader, inputs, flowCtx.ProcessorComponentID(pspec.ProcessorID),
+					result.OpMonitors,
 				)
 				if err != nil {
 					return
@@ -1368,14 +1354,21 @@ func IsSupported(mode sessiondatapb.VectorizeExecMode, spec *execinfrapb.FlowSpe
 // execinfra.Releasable objects which can *only* be performed once leaves are
 // no longer needed.
 func ConvertToVecTree(
-	ctx context.Context, flowCtx *execinfra.FlowCtx, flow *execinfrapb.FlowSpec, isPlanLocal bool,
+	ctx context.Context,
+	flowCtx *execinfra.FlowCtx,
+	flow *execinfrapb.FlowSpec,
+	localProcessors []execinfra.LocalProcessor,
+	isPlanLocal bool,
 ) (leaves []execinfra.OpNode, cleanup func(), err error) {
+	if !isPlanLocal && len(localProcessors) > 0 {
+		return nil, func() {}, errors.AssertionFailedf("unexpectedly non-empty LocalProcessors when plan is not local")
+	}
 	fuseOpt := flowinfra.FuseNormally
 	if isPlanLocal {
 		fuseOpt = flowinfra.FuseAggressively
 	}
 	creator := newVectorizedFlowCreator(
-		newNoopFlowCreatorHelper(), vectorizedRemoteComponentCreator{}, false,
+		newNoopFlowCreatorHelper(), vectorizedRemoteComponentCreator{}, false, false,
 		nil, &execinfra.RowChannel{}, nil, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
 		flowCtx.Cfg.VecFDSemaphore, flowCtx.TypeResolverFactory.NewTypeResolver(flowCtx.EvalCtx.Txn),
 	)
@@ -1395,21 +1388,6 @@ func ConvertToVecTree(
 	memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
 	defer memoryMonitor.Stop(ctx)
 	defer creator.cleanup(ctx)
-	leaves, err = creator.setupFlow(ctx, flowCtx, flow.Processors, fuseOpt)
+	leaves, err = creator.setupFlow(ctx, flowCtx, flow.Processors, localProcessors, fuseOpt)
 	return leaves, creator.Release, err
-}
-
-// VectorizeAlwaysException is an object that returns whether or not execution
-// should continue if vectorize=experimental_always and an error occurred when
-// setting up the vectorized flow. Consider the case in which
-// vectorize=experimental_always. The user must be able to unset this session
-// variable without getting an error.
-type VectorizeAlwaysException interface {
-	// IsException returns whether this object should be an exception to the rule
-	// that an inability to run this node in a vectorized flow should produce an
-	// error.
-	// TODO(asubiotto): This is the cleanest way I can think of to not error out
-	// on SET statements when running with vectorize = experimental_always. If
-	// there is a better way, we should get rid of this interface.
-	IsException() bool
 }

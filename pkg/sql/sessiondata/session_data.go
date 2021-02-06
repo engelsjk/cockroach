@@ -158,9 +158,14 @@ type LocalOnlySessionData struct {
 	// NOTE: we'd prefer to use tree.UserPriority here, but doing so would
 	// introduce a package dependency cycle.
 	DefaultTxnPriority int
-	// DefaultReadOnly indicates the default read-only status of newly created
-	// transactions.
-	DefaultReadOnly bool
+	// DefaultTxnReadOnly indicates the default read-only status of newly
+	// created transactions.
+	DefaultTxnReadOnly bool
+	// DefaultTxnUseFollowerReads indicates whether transactions should be
+	// created by default using an AS OF SYSTEM TIME clause far enough in the
+	// past to facilitate reads against followers. If true, transactions will
+	// also default to being read-only.
+	DefaultTxnUseFollowerReads bool
 	// PartiallyDistributedPlansDisabled indicates whether the partially
 	// distributed plans produced by distSQLSpecExecFactory are disabled. It
 	// should be set to 'true' only in tests that verify that the old and the
@@ -196,6 +201,9 @@ type LocalOnlySessionData struct {
 	AllowPrepareAsOptPlan bool
 	// TempTablesEnabled indicates whether temporary tables can be created or not.
 	TempTablesEnabled bool
+	// ImplicitPartitioningEnabled indicates whether implicit column partitioning can
+	// be created.
+	ImplicitColumnPartitioningEnabled bool
 	// HashShardedIndexesEnabled indicates whether hash sharded indexes can be created.
 	HashShardedIndexesEnabled bool
 	// DisallowFullTableScans indicates whether queries that plan full table scans
@@ -214,11 +222,20 @@ type LocalOnlySessionData struct {
 	SynchronousCommit bool
 	// EnableSeqScan is a dummy setting for the enable_seqscan var.
 	EnableSeqScan bool
-	// EnableMultiColumnInvertedIndexes indicates whether creating multi-column
-	// inverted indexes is allowed.
-	// TODO(mgartner): remove this once multi-column inverted indexes are fully
+
+	// VirtualColumnsEnabled indicates whether we allow virtual (non-stored)
+	// computed columns.
+	// TODO(radu): remove this once the feature is stable.
+	VirtualColumnsEnabled bool
+
+	// EnableUniqueWithoutIndexConstraints indicates whether creating unique
+	// constraints without an index is allowed.
+	// TODO(rytaft): remove this once unique without index constraints are fully
 	// supported.
-	EnableMultiColumnInvertedIndexes bool
+	EnableUniqueWithoutIndexConstraints bool
+
+	// NewSchemaChangerMode indicates whether to use the new schema changer.
+	NewSchemaChangerMode NewSchemaChangerMode
 	///////////////////////////////////////////////////////////////////////////
 	// WARNING: consider whether a session parameter you're adding needs to  //
 	// be propagated to the remote nodes. If so, that parameter should live  //
@@ -378,6 +395,50 @@ func SerialNormalizationModeFromString(val string) (_ SerialNormalizationMode, o
 		return SerialUsesVirtualSequences, true
 	case "SQL_SEQUENCE":
 		return SerialUsesSQLSequences, true
+	default:
+		return 0, false
+	}
+}
+
+// NewSchemaChangerMode controls if and when the new schema changer (in
+// sql/schemachanger) is in use.
+type NewSchemaChangerMode int64
+
+const (
+	// UseNewSchemaChangerOff means that we never use the new schema changer.
+	UseNewSchemaChangerOff NewSchemaChangerMode = iota
+	// UseNewSchemaChangerOn means that we use the new schema changer for
+	// supported statements in implicit transactions, but fall back to the old
+	// schema changer otherwise.
+	UseNewSchemaChangerOn
+	// UseNewSchemaChangerUnsafeAlways means that we attempt to use the new schema
+	// changer for all statements and return errors for unsupported statements.
+	// Used for testing/development.
+	UseNewSchemaChangerUnsafeAlways
+)
+
+func (m NewSchemaChangerMode) String() string {
+	switch m {
+	case UseNewSchemaChangerOff:
+		return "off"
+	case UseNewSchemaChangerOn:
+		return "on"
+	case UseNewSchemaChangerUnsafeAlways:
+		return "unsafe_always"
+	default:
+		return fmt.Sprintf("invalid (%d)", m)
+	}
+}
+
+// NewSchemaChangerModeFromString converts a string into a NewSchemaChangerMode
+func NewSchemaChangerModeFromString(val string) (_ NewSchemaChangerMode, ok bool) {
+	switch strings.ToUpper(val) {
+	case "OFF":
+		return UseNewSchemaChangerOff, true
+	case "ON":
+		return UseNewSchemaChangerOn, true
+	case "UNSAFE_ALWAYS":
+		return UseNewSchemaChangerUnsafeAlways, true
 	default:
 		return 0, false
 	}

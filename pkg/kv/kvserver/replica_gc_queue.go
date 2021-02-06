@@ -123,7 +123,7 @@ func newReplicaGCQueue(store *Store, db *kv.DB, gossip *gossip.Gossip) *replicaG
 // check must have occurred more than ReplicaGCQueueInactivityThreshold
 // in the past.
 func (rgcq *replicaGCQueue) shouldQueue(
-	ctx context.Context, now hlc.Timestamp, repl *Replica, _ *config.SystemConfig,
+	ctx context.Context, now hlc.ClockTimestamp, repl *Replica, _ *config.SystemConfig,
 ) (shouldQ bool, prio float64) {
 
 	lastCheck, err := repl.GetLastReplicaGCTimestamp(ctx)
@@ -141,7 +141,7 @@ func (rgcq *replicaGCQueue) shouldQueue(
 	}
 
 	if lease, _ := repl.GetLease(); lease.ProposedTS != nil {
-		lastActivity.Forward(*lease.ProposedTS)
+		lastActivity.Forward(lease.ProposedTS.ToTimestamp())
 	}
 
 	// It is critical to think of the replica as suspect if it is a learner as
@@ -170,7 +170,7 @@ func (rgcq *replicaGCQueue) shouldQueue(
 			}
 		}
 	}
-	return replicaGCShouldQueueImpl(now, lastCheck, lastActivity, isSuspect)
+	return replicaGCShouldQueueImpl(now.ToTimestamp(), lastCheck, lastActivity, isSuspect)
 }
 
 func replicaGCShouldQueueImpl(

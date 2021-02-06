@@ -211,7 +211,7 @@ func (r *Replica) tryReproposeWithNewLeaseIndex(
 		// do that without re-evaluating, so give up. The error returned here
 		// will go to back to DistSender, so send something it can digest.
 		err := newNotLeaseHolderError(
-			r.mu.state.Lease,
+			*r.mu.state.Lease,
 			r.store.StoreID(),
 			r.mu.state.Desc,
 			"reproposal failed due to closed timestamp",
@@ -257,7 +257,9 @@ func (r *Replica) handleDescResult(ctx context.Context, desc *roachpb.RangeDescr
 }
 
 func (r *Replica) handleLeaseResult(ctx context.Context, lease *roachpb.Lease) {
-	r.leasePostApply(ctx, *lease, false /* permitJump */)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.leasePostApplyLocked(ctx, *lease, false /* permitJump */)
 }
 
 func (r *Replica) handleTruncatedStateResult(
@@ -290,6 +292,15 @@ func (r *Replica) handleGCThresholdResult(ctx context.Context, thresh *hlc.Times
 	}
 	r.mu.Lock()
 	r.mu.state.GCThreshold = thresh
+	r.mu.Unlock()
+}
+
+func (r *Replica) handleVersionResult(ctx context.Context, version *roachpb.Version) {
+	if (*version == roachpb.Version{}) {
+		log.Fatal(ctx, "not expecting empty replica version downstream of raft")
+	}
+	r.mu.Lock()
+	r.mu.state.Version = version
 	r.mu.Unlock()
 }
 

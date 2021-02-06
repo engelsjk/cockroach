@@ -11,23 +11,23 @@ EXPLAIN (VERBOSE)
   WITH t AS (SELECT a FROM y) SELECT * FROM t JOIN t AS q ON true
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │ columns: (a, a)
 │
 ├── • cross join (inner)
 │   │ columns: (a, a)
-│   │ estimated row count: 1000000 (missing stats)
+│   │ estimated row count: 1,000,000 (missing stats)
 │   │
 │   ├── • scan buffer
 │   │     columns: (a)
-│   │     estimated row count: 1000 (missing stats)
+│   │     estimated row count: 1,000 (missing stats)
 │   │     label: buffer 1 (t)
 │   │
 │   └── • scan buffer
 │         columns: (a)
-│         estimated row count: 1000 (missing stats)
+│         estimated row count: 1,000 (missing stats)
 │         label: buffer 1 (t)
 │
 └── • subquery
@@ -41,7 +41,7 @@ vectorized: false
         │
         └── • scan
               columns: (a)
-              estimated row count: 1000 (missing stats)
+              estimated row count: 1,000 (missing stats)
               table: y@primary
               spans: FULL SCAN
 
@@ -54,12 +54,12 @@ vectorized: true
 ·
 • render
 │ columns: (a)
-│ estimated row count: 1000 (missing stats)
-│ render 0: a
+│ estimated row count: 1,000 (missing stats)
+│ render a: a
 │
 └── • scan
       columns: (a)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: y@primary
       spans: FULL SCAN
 
@@ -68,7 +68,7 @@ EXPLAIN (VERBOSE)
   WITH t AS (INSERT INTO x VALUES (1) RETURNING a) SELECT * FROM t
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │ columns: (a)
@@ -121,17 +121,17 @@ vectorized: true
 ·
 • cross join (inner)
 │ columns: (col)
-│ estimated row count: 1000000 (missing stats)
+│ estimated row count: 1,000,000 (missing stats)
 │
 ├── • scan
 │     columns: ()
-│     estimated row count: 1000 (missing stats)
+│     estimated row count: 1,000 (missing stats)
 │     table: table39010@primary
 │     spans: FULL SCAN
 │
 └── • scan
       columns: (col)
-      estimated row count: 1000 (missing stats)
+      estimated row count: 1,000 (missing stats)
       table: table39010@primary
       spans: FULL SCAN
 
@@ -145,7 +145,7 @@ EXPLAIN (VERBOSE)
   SELECT sum(n) FROM t
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • group (scalar)
 │ columns: (sum)
@@ -155,7 +155,7 @@ vectorized: false
 └── • render
     │ columns: (n)
     │ estimated row count: 10 (missing stats)
-    │ render 0: column1
+    │ render n: column1
     │
     └── • recursive cte
         │ columns: (column1)

@@ -42,12 +42,13 @@ import (
 
 // ReporterInterval is the interval between two generations of the reports.
 // When set to zero - disables the report generation.
-var ReporterInterval = settings.RegisterPublicNonNegativeDurationSetting(
+var ReporterInterval = settings.RegisterDurationSetting(
 	"kv.replication_reports.interval",
 	"the frequency for generating the replication_constraint_stats, replication_stats_report and "+
 		"replication_critical_localities reports (set to 0 to disable)",
 	time.Minute,
-)
+	settings.NonNegativeDuration,
+).WithPublic()
 
 // Reporter periodically produces a couple of reports on the cluster's data
 // distribution: the system tables: replication_constraint_stats,
@@ -114,7 +115,7 @@ func (stats *Reporter) Start(ctx context.Context, stopper *stop.Stopper) {
 		stats.frequencyMu.changeCh = make(chan struct{})
 		stats.frequencyMu.interval = ReporterInterval.Get(&stats.settings.SV)
 	})
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "stats-reporter", func(ctx context.Context) {
 		var timer timeutil.Timer
 		defer timer.Stop()
 		ctx = logtags.AddTag(ctx, "replication-reporter", nil /* value */)
@@ -181,13 +182,13 @@ func (stats *Reporter) update(
 	var getStoresFromGossip StoreResolver = func(
 		r *roachpb.RangeDescriptor,
 	) []roachpb.StoreDescriptor {
-		storeDescs := make([]roachpb.StoreDescriptor, len(r.Replicas().Voters()))
+		storeDescs := make([]roachpb.StoreDescriptor, len(r.Replicas().VoterDescriptors()))
 		// We'll return empty descriptors for stores that gossip doesn't have a
 		// descriptor for. These stores will be considered to satisfy all
 		// constraints.
 		// TODO(andrei): note down that some descriptors were missing from gossip
 		// somewhere in the report.
-		for i, repl := range r.Replicas().Voters() {
+		for i, repl := range r.Replicas().VoterDescriptors() {
 			storeDescs[i] = allStores[repl.StoreID]
 		}
 		return storeDescs
@@ -264,7 +265,7 @@ func (stats *Reporter) meta1LeaseHolderStore(ctx context.Context) *kvserver.Stor
 	if err != nil {
 		log.Fatalf(ctx, "unexpected error when visiting stores: %s", err)
 	}
-	if repl.OwnsValidLease(ctx, store.Clock().Now()) {
+	if repl.OwnsValidLease(ctx, store.Clock().NowAsClockTimestamp()) {
 		return store
 	}
 	return nil

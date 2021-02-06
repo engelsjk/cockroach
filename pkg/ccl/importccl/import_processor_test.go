@@ -116,7 +116,8 @@ func TestConverterFlushesBatches(t *testing.T) {
 				}
 
 				kvCh := make(chan row.KVBatch, batchSize)
-				conv, err := makeInputConverter(ctx, converterSpec, &evalCtx, kvCh)
+				conv, err := makeInputConverter(ctx, converterSpec, &evalCtx, kvCh,
+					nil /* seqChunkProvider */)
 				if err != nil {
 					t.Fatalf("makeInputConverter() error = %v", err)
 				}
@@ -301,8 +302,9 @@ func TestImportIgnoresProcessedFiles(t *testing.T) {
 	for _, testCase := range tests {
 		t.Run(fmt.Sprintf("processes-files-once-%s", testCase.name), func(t *testing.T) {
 			spec := setInputOffsets(t, testCase.spec.getConverterSpec(), testCase.inputOffsets)
+			post := execinfrapb.PostProcessSpec{}
 
-			processor, err := newReadImportDataProcessor(flowCtx, 0, *spec, &errorReportingRowReceiver{t})
+			processor, err := newReadImportDataProcessor(flowCtx, 0, *spec, &post, &errorReportingRowReceiver{t})
 
 			if err != nil {
 				t.Fatalf("Could not create data processor: %v", err)
@@ -418,7 +420,7 @@ func TestImportHonorsResumePosition(t *testing.T) {
 					}
 				}()
 
-				_, err := runImport(ctx, flowCtx, spec, progCh)
+				_, err := runImport(ctx, flowCtx, spec, progCh, nil /* seqChunkProvider */)
 
 				if err != nil {
 					t.Fatal(err)
@@ -495,7 +497,7 @@ func TestImportHandlesDuplicateKVs(t *testing.T) {
 				}
 			}()
 
-			_, err := runImport(ctx, flowCtx, spec, progCh)
+			_, err := runImport(ctx, flowCtx, spec, progCh, nil /* seqChunkProvider */)
 			require.True(t, errors.HasType(err, &kvserverbase.DuplicateKeyError{}))
 		})
 	}
@@ -547,12 +549,10 @@ type cancellableImportResumer struct {
 	wrapped          *importResumer
 }
 
-func (r *cancellableImportResumer) Resume(
-	_ context.Context, execCtx interface{}, resultsCh chan<- tree.Datums,
-) error {
+func (r *cancellableImportResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	r.jobID = *r.wrapped.job.ID()
 	r.jobIDCh <- r.jobID
-	if err := r.wrapped.Resume(r.ctx, execCtx, resultsCh); err != nil {
+	if err := r.wrapped.Resume(r.ctx, execCtx); err != nil {
 		return err
 	}
 	if r.onSuccessBarrier != nil {
@@ -573,9 +573,10 @@ func setImportReaderParallelism(parallelism int32) func() {
 	factory := rowexec.NewReadImportDataProcessor
 	rowexec.NewReadImportDataProcessor = func(
 		flowCtx *execinfra.FlowCtx, processorID int32,
-		spec execinfrapb.ReadImportDataSpec, output execinfra.RowReceiver) (execinfra.Processor, error) {
+		spec execinfrapb.ReadImportDataSpec, post *execinfrapb.PostProcessSpec,
+		output execinfra.RowReceiver) (execinfra.Processor, error) {
 		spec.ReaderParallelism = parallelism
-		return factory(flowCtx, processorID, spec, output)
+		return factory(flowCtx, processorID, spec, post, output)
 	}
 
 	return func() {

@@ -43,12 +43,6 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// Only unique secondary indexes have extra columns to decode (namely the
-// primary index columns).
-func cHasExtraCols(table *cTableInfo) bool {
-	return table.isSecondaryIndex && table.index.Unique
-}
-
 type cTableInfo struct {
 	// -- Fields initialized once --
 
@@ -92,6 +86,11 @@ type cTableInfo struct {
 	// allExtraValColOrdinals is the same as extraValColOrdinals but
 	// does not contain any -1's. It is meant to be used only in logging.
 	allExtraValColOrdinals []int
+
+	// invertedColOrdinal is a column index (into cols), indicating the virtual
+	// inverted column; -1 if there is no virtual inverted column or we don't
+	// need the value for that column.
+	invertedColOrdinal int
 
 	// maxColumnFamilyID is the maximum possible family id for the configured
 	// table.
@@ -251,6 +250,12 @@ type cFetcher struct {
 	// are required to produce an MVCC timestamp system column.
 	mvccDecodeStrategy row.MVCCDecodingStrategy
 
+	// testingGenerateMockContentionEvents is a field that specifies whether
+	// a kvFetcher generates mock contention events. See
+	// kvFetcher.TestingEnableMockContentionEventGeneration.
+	// TODO(asubiotto): Remove once KV layer produces real contention events.
+	testingGenerateMockContentionEvents bool
+
 	// fetcher is the underlying fetcher that provides KVs.
 	fetcher *row.KVFetcher
 
@@ -292,7 +297,7 @@ type cFetcher struct {
 		// colvecs to avoid having to cast the vec to decimal on every write.
 		timestampCol []apd.Decimal
 		// tableoidCol is the same as timestampCol but for the tableoid system column.
-		tableoidCol []int64
+		tableoidCol coldata.DatumVec
 	}
 
 	typs      []*types.T
@@ -320,7 +325,7 @@ func (rf *cFetcher) resetBatch(timestampOutputIdx, tableOidOutputIdx int) {
 			rf.machine.timestampCol = rf.machine.colvecs[timestampOutputIdx].Decimal()
 		}
 		if tableOidOutputIdx != noOutputColumn {
-			rf.machine.tableoidCol = rf.machine.colvecs[tableOidOutputIdx].Int64()
+			rf.machine.tableoidCol = rf.machine.colvecs[tableOidOutputIdx].Datum()
 		}
 	}
 }
@@ -356,13 +361,14 @@ func (rf *cFetcher) Init(
 		table.colIdxMap.vals = make(descpb.ColumnIDs, 0, nCols)
 		table.colIdxMap.ords = make([]int, 0, nCols)
 	}
-	for i := range tableArgs.Cols {
-		id := tableArgs.Cols[i].ID
+	colDescriptors := tableArgs.Cols
+	for i := range colDescriptors {
+		//gcassert:bce
+		id := colDescriptors[i].ID
 		table.colIdxMap.vals = append(table.colIdxMap.vals, id)
 		table.colIdxMap.ords = append(table.colIdxMap.ords, tableArgs.ColIdxMap.GetDefault(id))
 	}
 	sort.Sort(table.colIdxMap)
-	colDescriptors := tableArgs.Cols
 	*table = cTableInfo{
 		spans:                  tableArgs.Spans,
 		desc:                   tableArgs.Desc,
@@ -384,8 +390,11 @@ func (rf *cFetcher) Init(
 	} else {
 		rf.typs = rf.typs[:len(colDescriptors)]
 	}
-	for i := range rf.typs {
-		rf.typs[i] = colDescriptors[i].Type
+	typs := rf.typs
+	_ = typs[len(colDescriptors)-1]
+	for i := range colDescriptors {
+		//gcassert:bce
+		typs[i] = colDescriptors[i].Type
 	}
 
 	var err error
@@ -396,8 +405,9 @@ func (rf *cFetcher) Init(
 	if numNeededCols := tableArgs.ValNeededForCol.Len(); cap(table.neededColsList) < numNeededCols {
 		table.neededColsList = make([]int, 0, numNeededCols)
 	}
-	for i := range tableArgs.Cols {
-		col := tableArgs.Cols[i].ID
+	for i := range colDescriptors {
+		//gcassert:bce
+		col := colDescriptors[i].ID
 		idx := tableArgs.ColIdxMap.GetDefault(col)
 		if tableArgs.ValNeededForCol.Contains(idx) {
 			// The idx-th column is required.
@@ -451,11 +461,17 @@ func (rf *cFetcher) Init(
 	} else {
 		table.allIndexColOrdinals = make([]int, nIndexCols)
 	}
+	indexColOrdinals := table.indexColOrdinals
+	_ = indexColOrdinals[len(indexColumnIDs)-1]
+	allIndexColOrdinals := table.allIndexColOrdinals
+	_ = allIndexColOrdinals[len(indexColumnIDs)-1]
 	for i, id := range indexColumnIDs {
 		colIdx, ok := tableArgs.ColIdxMap.Get(id)
-		table.allIndexColOrdinals[i] = colIdx
+		//gcassert:bce
+		allIndexColOrdinals[i] = colIdx
 		if ok && neededCols.Contains(int(id)) {
-			table.indexColOrdinals[i] = colIdx
+			//gcassert:bce
+			indexColOrdinals[i] = colIdx
 			neededIndexCols++
 			// A composite column might also have a value encoding which must be
 			// decoded. Others can be removed from neededValueColsByIdx.
@@ -465,10 +481,21 @@ func (rf *cFetcher) Init(
 				table.neededValueColsByIdx.Remove(colIdx)
 			}
 		} else {
-			table.indexColOrdinals[i] = -1
+			//gcassert:bce
+			indexColOrdinals[i] = -1
 			if neededCols.Contains(int(id)) {
 				return errors.AssertionFailedf("needed column %d not in colIdxMap", id)
 			}
+		}
+	}
+	table.invertedColOrdinal = -1
+	if table.index.Type == descpb.IndexDescriptor_INVERTED {
+		id := table.index.InvertedColumnID()
+		colIdx, ok := tableArgs.ColIdxMap.Get(id)
+		if ok && neededCols.Contains(int(id)) {
+			table.invertedColOrdinal = colIdx
+		} else if neededCols.Contains(int(id)) {
+			return errors.AssertionFailedf("needed column %d not in colIdxMap", id)
 		}
 	}
 	// Unique secondary indexes contain the extra column IDs as part of
@@ -497,26 +524,30 @@ func (rf *cFetcher) Init(
 	}
 
 	if table.isSecondaryIndex {
-		for i := range table.cols {
-			if neededCols.Contains(int(table.cols[i].ID)) && !table.index.ContainsColumnID(table.cols[i].ID) {
-				return errors.Errorf("requested column %s not in index", table.cols[i].Name)
+		for i := range colDescriptors {
+			//gcassert:bce
+			id := colDescriptors[i].ID
+			if neededCols.Contains(int(id)) && !table.index.ContainsColumnID(id) {
+				return errors.Errorf("requested column %s not in index", colDescriptors[i].Name)
 			}
 		}
 	}
 
 	// Prepare our index key vals slice.
-	table.keyValTypes, err = colinfo.GetColumnTypes(table.desc, indexColumnIDs, table.keyValTypes)
-	if err != nil {
-		return err
-	}
-	if cHasExtraCols(table) {
+	table.keyValTypes = colinfo.GetColumnTypesFromColDescs(
+		colDescriptors, indexColumnIDs, table.keyValTypes,
+	)
+	if len(table.index.ExtraColumnIDs) > 0 {
 		// Unique secondary indexes have a value that is the
 		// primary index key.
 		// Primary indexes only contain ascendingly-encoded
 		// values. If this ever changes, we'll probably have to
 		// figure out the directions here too.
-		table.extraTypes, err = colinfo.GetColumnTypes(table.desc, table.index.ExtraColumnIDs, table.extraTypes)
-		nExtraColumns := len(table.index.ExtraColumnIDs)
+		extraColumnIDs := table.index.ExtraColumnIDs
+		table.extraTypes = colinfo.GetColumnTypesFromColDescs(
+			colDescriptors, extraColumnIDs, table.extraTypes,
+		)
+		nExtraColumns := len(extraColumnIDs)
 		if cap(table.extraValColOrdinals) >= nExtraColumns {
 			table.extraValColOrdinals = table.extraValColOrdinals[:nExtraColumns]
 		} else {
@@ -529,17 +560,21 @@ func (rf *cFetcher) Init(
 			table.allExtraValColOrdinals = make([]int, nExtraColumns)
 		}
 
-		for i, id := range table.index.ExtraColumnIDs {
+		extraValColOrdinals := table.extraValColOrdinals
+		_ = extraValColOrdinals[len(extraColumnIDs)-1]
+		allExtraValColOrdinals := table.allExtraValColOrdinals
+		_ = allExtraValColOrdinals[len(extraColumnIDs)-1]
+		for i, id := range extraColumnIDs {
 			idx := tableArgs.ColIdxMap.GetDefault(id)
-			table.allExtraValColOrdinals[i] = idx
+			//gcassert:bce
+			allExtraValColOrdinals[i] = idx
 			if neededCols.Contains(int(id)) {
-				table.extraValColOrdinals[i] = idx
+				//gcassert:bce
+				extraValColOrdinals[i] = idx
 			} else {
-				table.extraValColOrdinals[i] = -1
+				//gcassert:bce
+				extraValColOrdinals[i] = -1
 			}
-		}
-		if err != nil {
-			return err
 		}
 	}
 
@@ -578,6 +613,7 @@ func (rf *cFetcher) StartScan(
 	limitBatches bool,
 	limitHint int64,
 	traceKV bool,
+	forceProductionKVBatchSize bool,
 ) error {
 	if len(spans) == 0 {
 		return errors.AssertionFailedf("no spans")
@@ -610,11 +646,15 @@ func (rf *cFetcher) StartScan(
 		rf.lockStrength,
 		rf.lockWaitPolicy,
 		nil, /* memMonitor */
+		forceProductionKVBatchSize,
 	)
 	if err != nil {
 		return err
 	}
 	rf.fetcher = f
+	if rf.testingGenerateMockContentionEvents {
+		rf.fetcher.TestingEnableMockContentionEventGeneration()
+	}
 	rf.machine.lastRowPrefix = nil
 	rf.machine.state[0] = stateInitFetch
 	return nil
@@ -801,6 +841,7 @@ func (rf *cFetcher) nextBatch(ctx context.Context) (coldata.Batch, error) {
 					rf.table.keyValTypes,
 					rf.table.indexColumnDirs,
 					rf.machine.nextKV.Key[rf.table.knownPrefixLength:],
+					rf.table.invertedColOrdinal,
 				)
 				if err != nil {
 					return nil, err
@@ -993,7 +1034,7 @@ func (rf *cFetcher) nextBatch(ctx context.Context) (coldata.Batch, error) {
 				rf.machine.timestampCol[rf.machine.rowIdx] = tree.TimestampToDecimal(rf.table.rowLastModified)
 			}
 			if rf.table.oidOutputIdx != noOutputColumn {
-				rf.machine.tableoidCol[rf.machine.rowIdx] = int64(rf.table.desc.GetID())
+				rf.machine.tableoidCol.Set(rf.machine.rowIdx, tree.NewDOid(tree.DInt(rf.table.desc.GetID())))
 			}
 
 			// We're finished with a row. Bump the row index, fill the row in with
@@ -1131,7 +1172,7 @@ func (rf *cFetcher) processValue(
 				return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
 			}
 
-			if cHasExtraCols(table) {
+			if table.isSecondaryIndex && table.index.Unique {
 				// This is a unique secondary index; decode the extra
 				// column values from the value.
 				var err error
@@ -1148,6 +1189,7 @@ func (rf *cFetcher) processValue(
 					nil,
 					&rf.machine.remainingValueColsByIdx,
 					valueBytes,
+					rf.table.invertedColOrdinal,
 				)
 				if err != nil {
 					return "", "", scrub.WrapError(scrub.SecondaryIndexKeyExtraValueDecodingError, err)
@@ -1222,7 +1264,7 @@ func (rf *cFetcher) processValueSingle(
 	if needDecode {
 		if idx, ok := table.colIdxMap.get(colID); ok {
 			if rf.traceKV {
-				prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.GetColumnAtIdx(idx).Name)
+				prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.AllColumns()[idx].GetName())
 			}
 			val := rf.machine.nextKV.Value
 			if len(val.RawBytes) == 0 {
@@ -1323,7 +1365,7 @@ func (rf *cFetcher) processValueBytes(
 		}
 
 		if rf.traceKV {
-			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.GetColumnAtIdx(idx).Name)
+			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.AllColumns()[idx].GetName())
 		}
 
 		vec := rf.machine.colvecs[idx]

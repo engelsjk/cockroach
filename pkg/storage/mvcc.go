@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/dustin/go-humanize"
@@ -174,18 +173,18 @@ func (k MVCCKey) Len() int {
 		timestampSentinelLen      = 1
 		walltimeEncodedLen        = 8
 		logicalEncodedLen         = 4
-		flagsEncodedLen           = 1
+		syntheticEncodedLen       = 1
 		timestampEncodedLengthLen = 1
 	)
 
 	n := len(k.Key) + timestampEncodedLengthLen
 	if !k.Timestamp.IsEmpty() {
 		n += timestampSentinelLen + walltimeEncodedLen
-		if k.Timestamp.Logical != 0 || k.Timestamp.Flags != 0 {
+		if k.Timestamp.Logical != 0 || k.Timestamp.Synthetic {
 			n += logicalEncodedLen
 		}
-		if k.Timestamp.Flags != 0 {
-			n += flagsEncodedLen
+		if k.Timestamp.Synthetic {
+			n += syntheticEncodedLen
 		}
 	}
 	return n
@@ -1678,7 +1677,7 @@ func mvccPutInternal(
 			txnMeta = &txn.TxnMeta
 			// If we bumped the WriteTimestamp, we update both the TxnMeta and the
 			// MVCCMetadata.Timestamp.
-			if txnMeta.WriteTimestamp.Less(writeTimestamp) {
+			if txnMeta.WriteTimestamp != writeTimestamp {
 				txnMetaCpy := *txnMeta
 				txnMetaCpy.WriteTimestamp.Forward(writeTimestamp)
 				txnMeta = &txnMetaCpy
@@ -2040,10 +2039,12 @@ func MVCCMerge(
 // buffer of keys selected for deletion but not yet flushed (as done to detect
 // long runs for cleaning in a single ClearRange).
 //
-// This function does not handle the stats computations to determine the correct
+// This function handles the stats computations to determine the correct
 // incremental deltas of clearing these keys (and correctly determining if it
-// does or not not change the live and gc keys) so the caller is responsible for
-// recomputing stats over the resulting span if needed.
+// does or not not change the live and gc keys).
+//
+// If the underlying iterator encounters an intent with a timestamp in the span
+// (startTime, endTime], or any inline meta, this method will return an error.
 func MVCCClearTimeRange(
 	_ context.Context,
 	rw ReadWriter,
@@ -2051,6 +2052,7 @@ func MVCCClearTimeRange(
 	key, endKey roachpb.Key,
 	startTime, endTime hlc.Timestamp,
 	maxBatchSize int64,
+	useTBI bool,
 ) (*roachpb.Span, error) {
 	var batchSize int64
 	var resume *roachpb.Span
@@ -2070,6 +2072,12 @@ func MVCCClearTimeRange(
 	var buf [useClearRangeThreshold]MVCCKey
 	var bufSize int
 	var clearRangeStart MVCCKey
+
+	if ms == nil {
+		return nil, errors.AssertionFailedf(
+			"MVCCStats passed in to MVCCClearTimeRange must be non-nil to ensure proper stats" +
+				" computation during Clear operations")
+	}
 
 	clearMatchingKey := func(k MVCCKey) {
 		if len(clearRangeStart.Key) == 0 {
@@ -2115,42 +2123,50 @@ func MVCCClearTimeRange(
 		return nil
 	}
 
-	// TODO(dt): time-bound iter could potentially be a big win here -- the
-	// expected use-case for this is to run over an entire table's span with a
-	// very recent timestamp, rolling back just the writes of some failed IMPORT
-	// and that could very likely only have hit some small subset of the table's
-	// keyspace. However to get the stats right we need a non-time-bound iter
-	// e.g. we need to know if there is an older key under the one we are
-	// clearing to know if we're changing the number of live keys. An approach
-	// that seems promising might be to use time-bound iter to find candidates
-	// for deletion, allowing us to quickly skip over swaths of uninteresting
-	// keys, but then use a normal iteration to actually do the delete including
-	// updating the live key stats correctly.
+	// Using the IncrementalIterator with the time-bound iter optimization could
+	// potentially be a big win here -- the expected use-case for this is to run
+	// over an entire table's span with a very recent timestamp, rolling back just
+	// the writes of some failed IMPORT and that could very likely only have hit
+	// some small subset of the table's keyspace. However to get the stats right
+	// we need a non-time-bound iter e.g. we need to know if there is an older key
+	// under the one we are clearing to know if we're changing the number of live
+	// keys. The MVCCIncrementalIterator uses a non-time-bound iter as its source
+	// of truth, and only uses the TBI iterator as an optimization when finding
+	// the next KV to iterate over. This pattern allows us to quickly skip over
+	// swaths of uninteresting keys, but then use a normal iteration to actually
+	// do the delete including updating the live key stats correctly.
 	//
-	// Intents must be seen so that an error can be returned. We never delete an
-	// intent here.
-	it := rw.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{LowerBound: key, UpperBound: endKey})
-	defer it.Close()
+	// The MVCCIncrementalIterator checks for and fails on any intents in our
+	// time-range, as we do not want to clear any running transactions. We don't
+	// _expect_ to hit this since the RevertRange is only intended for non-live
+	// key spans, but there could be an intent leftover.
+	iter := NewMVCCIncrementalIterator(rw, MVCCIncrementalIterOptions{
+		EnableTimeBoundIteratorOptimization: useTBI,
+		EndKey:                              endKey,
+		StartTime:                           startTime,
+		EndTime:                             endTime,
+	})
+	defer iter.Close()
 
 	var clearedMetaKey MVCCKey
 	var clearedMeta enginepb.MVCCMetadata
 	var restoredMeta enginepb.MVCCMetadata
-	for it.SeekGE(MVCCKey{Key: key}); ; it.Next() {
-		ok, err := it.Valid()
-		if err != nil {
+	iter.SeekGE(MVCCKey{Key: key})
+	for {
+		if ok, err := iter.Valid(); err != nil {
 			return nil, err
 		} else if !ok {
 			break
 		}
 
-		k := it.UnsafeKey()
+		k := iter.UnsafeKey()
 
-		if ms != nil && len(clearedMetaKey.Key) > 0 {
+		if len(clearedMetaKey.Key) > 0 {
 			metaKeySize := int64(clearedMetaKey.EncodedSize())
 			if bytes.Equal(clearedMetaKey.Key, k.Key) {
 				// Since the key matches, our previous clear "restored" this revision of
 				// the this key, so update the stats with this as the "restored" key.
-				valueSize := int64(len(it.Value()))
+				valueSize := int64(len(iter.Value()))
 				restoredMeta.KeyBytes = MVCCVersionTimestampSize
 				restoredMeta.Deleted = valueSize == 0
 				restoredMeta.ValBytes = valueSize
@@ -2166,51 +2182,44 @@ func MVCCClearTimeRange(
 			clearedMetaKey.Key = clearedMetaKey.Key[:0]
 		}
 
-		if c := k.Key.Compare(endKey); c >= 0 {
-			break
-		}
-
-		// We need to check for and fail on any intents in our time-range, as we do
-		// not want to clear any running transactions. We don't _expect_ to hit this
-		// since the RevertRange is only intended for non-live key spans, but there
-		// could be an intent leftover.
-		var meta enginepb.MVCCMetadata
-		if !k.IsValue() {
-			if err := it.ValueProto(&meta); err != nil {
-				return nil, err
-			}
-			ts := meta.Timestamp.ToTimestamp()
-			if meta.Txn != nil && startTime.Less(ts) && ts.LessEq(endTime) {
-				err := &roachpb.WriteIntentError{
-					Intents: []roachpb.Intent{
-						roachpb.MakeIntent(meta.Txn, append([]byte{}, k.Key...)),
-					}}
-				return nil, err
-			}
-		}
-
 		if startTime.Less(k.Timestamp) && k.Timestamp.LessEq(endTime) {
 			if batchSize >= maxBatchSize {
 				resume = &roachpb.Span{Key: append([]byte{}, k.Key...), EndKey: endKey}
 				break
 			}
 			clearMatchingKey(k)
-			if ms != nil {
-				clearedMetaKey.Key = append(clearedMetaKey.Key[:0], k.Key...)
-				clearedMeta.KeyBytes = MVCCVersionTimestampSize
-				clearedMeta.ValBytes = int64(len(it.UnsafeValue()))
-				clearedMeta.Deleted = clearedMeta.ValBytes == 0
-				clearedMeta.Timestamp = k.Timestamp.ToLegacyTimestamp()
-			}
+			clearedMetaKey.Key = append(clearedMetaKey.Key[:0], k.Key...)
+			clearedMeta.KeyBytes = MVCCVersionTimestampSize
+			clearedMeta.ValBytes = int64(len(iter.UnsafeValue()))
+			clearedMeta.Deleted = clearedMeta.ValBytes == 0
+			clearedMeta.Timestamp = k.Timestamp.ToLegacyTimestamp()
+
+			// Move the iterator to the next key/value in linear iteration even if it
+			// lies outside (startTime, endTime].
+			//
+			// If iter lands on an older version of the current key, we will update
+			// the stats in the next iteration of the loop. This is necessary to
+			// report accurate stats as we have "uncovered" an older version of the
+			// key by clearing the current version.
+			//
+			// If iter lands on the next key, it will either add to the current run of
+			// keys to be cleared, or trigger a flush depending on whether or not it
+			// lies in our time bounds respectively.
+			iter.NextIgnoringTime()
 		} else {
 			// This key does not match, so we need to flush our run of matching keys.
 			if err := flushClearedKeys(k); err != nil {
 				return nil, err
 			}
+			// Move the incremental iterator to the next valid key that can be rolled
+			// back. If TBI was enabled when initializing the incremental iterator,
+			// this step could jump over large swaths of keys that do not qualify for
+			// clearing.
+			iter.Next()
 		}
 	}
 
-	if ms != nil && len(clearedMetaKey.Key) > 0 {
+	if len(clearedMetaKey.Key) > 0 {
 		// If we cleared on the last iteration, no older revision of that key was
 		// "restored", since otherwise we would have iterated over it.
 		origMetaKeySize := int64(clearedMetaKey.EncodedSize())
@@ -2801,7 +2810,7 @@ func mvccResolveWriteIntent(
 				rw, metaKey, precedingIntentState, txnDidNotUpdateMeta, &buf.newMeta)
 		} else {
 			metaKeySize = int64(metaKey.EncodedSize())
-			err = rw.ClearIntent(metaKey.Key, precedingIntentState, txnDidNotUpdateMeta, uuid.UUID{})
+			err = rw.ClearIntent(metaKey.Key, precedingIntentState, txnDidNotUpdateMeta, meta.Txn.ID)
 		}
 		if err != nil {
 			return false, err
@@ -2904,7 +2913,7 @@ func mvccResolveWriteIntent(
 
 	if !ok {
 		// If there is no other version, we should just clean up the key entirely.
-		if err = rw.ClearIntent(metaKey.Key, precedingIntentState, txnDidNotUpdateMeta, uuid.UUID{}); err != nil {
+		if err = rw.ClearIntent(metaKey.Key, precedingIntentState, txnDidNotUpdateMeta, meta.Txn.ID); err != nil {
 			return false, err
 		}
 		// Clear stat counters attributable to the intent we're aborting.
@@ -2922,7 +2931,7 @@ func mvccResolveWriteIntent(
 		KeyBytes: MVCCVersionTimestampSize,
 		ValBytes: valueSize,
 	}
-	if err := rw.ClearIntent(metaKey.Key, precedingIntentState, txnDidNotUpdateMeta, uuid.UUID{}); err != nil {
+	if err := rw.ClearIntent(metaKey.Key, precedingIntentState, txnDidNotUpdateMeta, meta.Txn.ID); err != nil {
 		return false, err
 	}
 	metaKeySize := int64(metaKey.EncodedSize())
@@ -3007,10 +3016,18 @@ func GetBufUsingIter(iter MVCCIterator) IterAndBuf {
 	}
 }
 
+// SwitchIter switches to iter, and relinquishes ownership of the existing
+// iter.
+func (b *IterAndBuf) SwitchIter(iter MVCCIterator) {
+	b.iter = iter
+}
+
 // Cleanup must be called to release the resources when done.
 func (b IterAndBuf) Cleanup() {
 	b.buf.release()
-	b.iter.Close()
+	if b.iter != nil {
+		b.iter.Close()
+	}
 }
 
 // MVCCResolveWriteIntentRange commits or aborts (rolls back) the
@@ -3106,6 +3123,11 @@ func MVCCResolveWriteIntentRangeUsingIter(
 // timestamp parameter is used to compute the intent age on GC.
 //
 // Note that this method will be sorting the keys.
+//
+// REQUIRES: the keys are either all local keys, or all global keys, and
+// not a mix of the two. This is to accommodate the implementation below
+// that creates an iterator with bounds that span from the first to last
+// key (in sorted order).
 func MVCCGarbageCollect(
 	ctx context.Context,
 	rw ReadWriter,
@@ -3135,6 +3157,10 @@ func MVCCGarbageCollect(
 
 	// Bound the iterator appropriately for the set of keys we'll be garbage
 	// collecting.
+	// TODO(sumeer): this can span from local to global keys. Fix in cmd_gc.go
+	// which is already examining all the keys and can separate out the local
+	// keys to call MVCCGarbageCollect separately.
+	// TODO(sumeer): do we even need these coarse bounds?
 	iter := rw.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
 		LowerBound: keys[0].Key,
 		UpperBound: keys[len(keys)-1].Key.Next(),
@@ -3424,9 +3450,7 @@ func willOverflow(a, b int64) bool {
 
 // ComputeStatsForRange scans the underlying engine from start to end keys and
 // computes stats counters based on the values. This method is used after a
-// range is split to recompute stats for each subrange. The start key is always
-// adjusted to avoid counting local keys in the event stats are being recomputed
-// for the first range (i.e. the one with start key == KeyMin). The nowNanos arg
+// range is split to recompute stats for each subrange. The nowNanos arg
 // specifies the wall time in nanoseconds since the epoch and is used to compute
 // the total age of all intents.
 //

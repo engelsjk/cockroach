@@ -17,7 +17,7 @@ import (
 	"strconv"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
@@ -387,7 +387,10 @@ func (j *jsonEncoded) FetchValIdx(idx int) (JSON, error) {
 		return dec.FetchValIdx(idx)
 	}
 
-	if j.Type() == ArrayJSONType {
+	switch j.typ {
+	case NumberJSONType, StringJSONType, TrueJSONType, FalseJSONType, NullJSONType:
+		return fetchValIdxForScalar(j, idx), nil
+	case ArrayJSONType:
 		if idx < 0 {
 			idx = j.containerLen + idx
 		}
@@ -404,8 +407,11 @@ func (j *jsonEncoded) FetchValIdx(idx int) (JSON, error) {
 		}
 
 		return newEncoded(entry, j.arrayGetDataRange(begin, end))
+	case ObjectJSONType:
+		return nil, nil
+	default:
+		return nil, errors.AssertionFailedf("unknown json type: %v", errors.Safe(j.typ))
 	}
-	return nil, nil
 }
 
 func (j *jsonEncoded) FetchValKey(key string) (JSON, error) {
@@ -717,10 +723,10 @@ func (j *jsonEncoded) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 
 func (j *jsonEncoded) encodeContainingInvertedIndexSpans(
 	b []byte, isRoot, isObjectValue bool,
-) ([]roachpb.Spans, bool, bool, error) {
+) (inverted.Expression, error) {
 	decoded, err := j.decode()
 	if err != nil {
-		return nil, false, false, err
+		return nil, err
 	}
 	return decoded.encodeContainingInvertedIndexSpans(b, isRoot, isObjectValue)
 }

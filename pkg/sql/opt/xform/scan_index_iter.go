@@ -69,6 +69,15 @@ type scanIndexIter struct {
 	// rejectFlags is a set of flags that designate which types of indexes to
 	// skip during iteration.
 	rejectFlags indexRejectFlags
+
+	// filtersMutateChecker is used to assert that filters are not mutated by
+	// enumerateIndexFunc callbacks. This check is a no-op in non-test builds.
+	filtersMutateChecker memo.FiltersExprMutateChecker
+
+	// originalFiltersMutateChecker is used to assert that originalFilters are
+	// not mutated by enumerateIndexFunc callbacks. This check is a no-op in
+	// non-test builds.
+	originalFiltersMutateChecker memo.FiltersExprMutateChecker
 }
 
 // Init initializes a new scanIndexIter.
@@ -79,12 +88,17 @@ func (it *scanIndexIter) Init(
 	filters memo.FiltersExpr,
 	rejectFlags indexRejectFlags,
 ) {
-	it.mem = mem
-	it.im = im
-	it.tabMeta = mem.Metadata().TableMeta(scanPrivate.Table)
-	it.scanPrivate = scanPrivate
-	it.filters = filters
-	it.rejectFlags = rejectFlags
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*it = scanIndexIter{
+		mem:         mem,
+		im:          im,
+		tabMeta:     mem.Metadata().TableMeta(scanPrivate.Table),
+		scanPrivate: scanPrivate,
+		filters:     filters,
+		rejectFlags: rejectFlags,
+	}
+	it.filtersMutateChecker.Init(it.filters)
 }
 
 // SetOriginalFilters specifies an optional, non-reduced, original set of
@@ -138,6 +152,7 @@ func (it *scanIndexIter) SetOriginalFilters(filters memo.FiltersExpr) {
 		panic(errors.AssertionFailedf("cannot specify originalFilters with nil filters"))
 	}
 	it.originalFilters = filters
+	it.originalFiltersMutateChecker.Init(it.originalFilters)
 }
 
 // enumerateIndexFunc defines the callback function for the ForEach and
@@ -198,7 +213,7 @@ func (it *scanIndexIter) ForEachStartingAfter(ord int, f enumerateIndexFunc) {
 			continue
 		}
 
-		_, isPartialIndex := index.Predicate()
+		pred, isPartialIndex := it.tabMeta.PartialIndexPredicate(ord)
 
 		// Skip over partial indexes if rejectPartialIndexes is set.
 		if it.hasRejectFlags(rejectPartialIndexes) && isPartialIndex {
@@ -212,27 +227,19 @@ func (it *scanIndexIter) ForEachStartingAfter(ord int, f enumerateIndexFunc) {
 
 		filters := it.filters
 
-		// If the index is a partial index, check whether or not the filters
-		// imply the predicate.
+		// If the index is a partial index, check whether the filters imply the
+		// predicate.
 		if isPartialIndex {
-			p, ok := it.tabMeta.PartialIndexPredicates[ord]
-			if !ok {
-				// A partial index predicate expression was not built for the
-				// partial index. See Builder.buildScan for details on when this
-				// can occur. Implication cannot be proven so it must be
-				// skipped.
-				continue
-			}
-			pred := *p.(*memo.FiltersExpr)
+			predFilters := *pred.(*memo.FiltersExpr)
 
 			// If there are no filters, then skip over any partial indexes that
 			// are not pseudo-partial indexes.
-			if filters == nil && !pred.IsTrue() {
+			if filters == nil && !predFilters.IsTrue() {
 				continue
 			}
 
 			if filters != nil {
-				remainingFilters, ok := it.filtersImplyPredicate(pred)
+				remainingFilters, ok := it.filtersImplyPredicate(predFilters)
 				if !ok {
 					// The predicate is not implied by the filters, so skip over
 					// the partial index.
@@ -249,6 +256,13 @@ func (it *scanIndexIter) ForEachStartingAfter(ord int, f enumerateIndexFunc) {
 		isCovering := it.scanPrivate.Cols.SubsetOf(indexCols)
 
 		f(index, filters, indexCols, isCovering)
+
+		// Verify that f did not mutate filters or originalFilters (in test
+		// builds only).
+		it.filtersMutateChecker.CheckForMutation(it.filters)
+		if it.originalFilters != nil {
+			it.originalFiltersMutateChecker.CheckForMutation(it.originalFilters)
+		}
 	}
 }
 

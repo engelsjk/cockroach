@@ -252,7 +252,8 @@ func (a aggregateInfo) isOrderingSensitive() bool {
 		return true
 	}
 	switch a.def.Name {
-	case "array_agg", "concat_agg", "string_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg":
+	case "array_agg", "concat_agg", "string_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
+		"st_makeline", "st_collect", "st_memcollect":
 		return true
 	default:
 		return false
@@ -633,7 +634,7 @@ func (b *Builder) buildGrouping(
 		// Save a representation of the GROUP BY expression for validation of the
 		// SELECT and HAVING expressions. This enables queries such as:
 		//   SELECT x+y FROM t GROUP BY x+y
-		col := b.addColumn(aggInScope, alias, e)
+		col := aggInScope.addColumn(alias, e)
 		b.buildScalar(e, fromScope, aggInScope, col, nil)
 		fromScope.groupby.groupStrs[exprStr] = col
 	}
@@ -647,7 +648,7 @@ func (b *Builder) buildAggArg(
 ) opt.ScalarExpr {
 	// This synthesizes a new tempScope column, unless the argument is a
 	// simple VariableOp.
-	col := b.addColumn(tempScope, "" /* alias */, e)
+	col := tempScope.addColumn("" /* alias */, e)
 	b.buildScalar(e, fromScope, tempScope, col, &info.colRefs)
 	if col.scalar != nil {
 		return col.scalar
@@ -809,6 +810,10 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 		return b.factory.ConstructCovarPop(args[0], args[1])
 	case "covar_samp":
 		return b.factory.ConstructCovarSamp(args[0], args[1])
+	case "regr_avgx":
+		return b.factory.ConstructRegressionAvgX(args[0], args[1])
+	case "regr_avgy":
+		return b.factory.ConstructRegressionAvgY(args[0], args[1])
 	case "regr_intercept":
 		return b.factory.ConstructRegressionIntercept(args[0], args[1])
 	case "regr_r2":

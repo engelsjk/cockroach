@@ -134,19 +134,15 @@ const (
 // partitions. It looks at i'th partitionCol value to check whether a new
 // partition begins at index i, and if so, it records the already computed
 // size of the previous partition into partitionsState.runningSizes vector.
-func _COMPUTE_PARTITIONS_SIZES() { // */}}
+func _COMPUTE_PARTITIONS_SIZES(_HAS_SEL bool) { // */}}
 	// {{define "computePartitionsSizes" -}}
+	// {{if not $.HasSel}}
+	//gcassert:bce
+	// {{end}}
 	if partitionCol[i] {
 		// We have encountered a start of a new partition, so we
 		// need to save the computed size of the previous one
 		// (if there was one).
-		if r.partitionsState.runningSizes == nil {
-			// TODO(yuzefovich): do not instantiate a new batch here once
-			// spillingQueues actually copy the batches when those are kept
-			// in-memory.
-			r.partitionsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
-			runningPartitionsSizesCol = r.partitionsState.runningSizes.ColVec(0).Int64()
-		}
 		if r.numTuplesInPartition > 0 {
 			runningPartitionsSizesCol[r.partitionsState.idx] = r.numTuplesInPartition
 			r.numTuplesInPartition = 0
@@ -157,8 +153,8 @@ func _COMPUTE_PARTITIONS_SIZES() { // */}}
 				if err := r.partitionsState.enqueue(ctx, r.partitionsState.runningSizes); err != nil {
 					colexecerror.InternalError(err)
 				}
-				r.partitionsState.runningSizes = nil
 				r.partitionsState.idx = 0
+				r.partitionsState.runningSizes.ResetInternalBatch()
 			}
 		}
 	}
@@ -172,19 +168,15 @@ func _COMPUTE_PARTITIONS_SIZES() { // */}}
 // peer groups. It looks at i'th peersCol value to check whether a new
 // peer group begins at index i, and if so, it records the already computed
 // size of the previous peer group into peerGroupsState.runningSizes vector.
-func _COMPUTE_PEER_GROUPS_SIZES() { // */}}
+func _COMPUTE_PEER_GROUPS_SIZES(_HAS_SEL bool) { // */}}
 	// {{define "computePeerGroupsSizes" -}}
+	// {{if not $.HasSel}}
+	//gcassert:bce
+	// {{end}}
 	if peersCol[i] {
 		// We have encountered a start of a new peer group, so we
 		// need to save the computed size of the previous one
 		// (if there was one).
-		if r.peerGroupsState.runningSizes == nil {
-			// TODO(yuzefovich): do not instantiate a new batch here once
-			// spillingQueues actually copy the batches when those are kept
-			// in-memory.
-			r.peerGroupsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
-			runningPeerGroupsSizesCol = r.peerGroupsState.runningSizes.ColVec(0).Int64()
-		}
 		if r.numPeers > 0 {
 			runningPeerGroupsSizesCol[r.peerGroupsState.idx] = r.numPeers
 			r.numPeers = 0
@@ -195,8 +187,8 @@ func _COMPUTE_PEER_GROUPS_SIZES() { // */}}
 				if err := r.peerGroupsState.enqueue(ctx, r.peerGroupsState.runningSizes); err != nil {
 					colexecerror.InternalError(err)
 				}
-				r.peerGroupsState.runningSizes = nil
 				r.peerGroupsState.idx = 0
+				r.peerGroupsState.runningSizes.ResetInternalBatch()
 			}
 		}
 	}
@@ -281,25 +273,43 @@ func (r *_RELATIVE_RANK_STRINGOp) Init() {
 	usedMemoryLimitFraction := 0.0
 	// {{if .HasPartition}}
 	r.partitionsState.spillingQueue = newSpillingQueue(
-		r.allocator, []*types.T{types.Int},
-		int64(float64(r.memoryLimit)*relativeRankUtilityQueueMemLimitFraction),
-		r.diskQueueCfg, r.fdSemaphore, r.diskAcc,
+		&NewSpillingQueueArgs{
+			UnlimitedAllocator: r.allocator,
+			Types:              []*types.T{types.Int},
+			MemoryLimit:        int64(float64(r.memoryLimit) * relativeRankUtilityQueueMemLimitFraction),
+			DiskQueueCfg:       r.diskQueueCfg,
+			FDSemaphore:        r.fdSemaphore,
+			DiskAcc:            r.diskAcc,
+		},
 	)
+	r.partitionsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
 	usedMemoryLimitFraction += relativeRankUtilityQueueMemLimitFraction
 	// {{end}}
 	// {{if .IsCumeDist}}
 	r.peerGroupsState.spillingQueue = newSpillingQueue(
-		r.allocator, []*types.T{types.Int},
-		int64(float64(r.memoryLimit)*relativeRankUtilityQueueMemLimitFraction),
-		r.diskQueueCfg, r.fdSemaphore, r.diskAcc,
+		&NewSpillingQueueArgs{
+			UnlimitedAllocator: r.allocator,
+			Types:              []*types.T{types.Int},
+			MemoryLimit:        int64(float64(r.memoryLimit) * relativeRankUtilityQueueMemLimitFraction),
+			DiskQueueCfg:       r.diskQueueCfg,
+			FDSemaphore:        r.fdSemaphore,
+			DiskAcc:            r.diskAcc,
+		},
 	)
+	r.peerGroupsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
 	usedMemoryLimitFraction += relativeRankUtilityQueueMemLimitFraction
 	// {{end}}
 	r.bufferedTuples = newSpillingQueue(
-		r.allocator, r.inputTypes,
-		int64(float64(r.memoryLimit)*(1.0-usedMemoryLimitFraction)),
-		r.diskQueueCfg, r.fdSemaphore, r.diskAcc,
+		&NewSpillingQueueArgs{
+			UnlimitedAllocator: r.allocator,
+			Types:              r.inputTypes,
+			MemoryLimit:        int64(float64(r.memoryLimit) * (1.0 - usedMemoryLimitFraction)),
+			DiskQueueCfg:       r.diskQueueCfg,
+			FDSemaphore:        r.fdSemaphore,
+			DiskAcc:            r.diskAcc,
+		},
 	)
+	r.scratch = r.allocator.NewMemBatchWithFixedCapacity(r.inputTypes, coldata.BatchSize())
 	r.output = r.allocator.NewMemBatchWithFixedCapacity(append(r.inputTypes, types.Float), coldata.BatchSize())
 	// {{if .IsPercentRank}}
 	// All rank functions start counting from 1. Before we assign the rank to a
@@ -354,12 +364,6 @@ func (r *_RELATIVE_RANK_STRINGOp) Next(ctx context.Context) coldata.Batch {
 				// {{if .HasPartition}}
 				// We need to flush the last vector of the running partitions
 				// sizes, including the very last partition.
-				if r.partitionsState.runningSizes == nil {
-					// TODO(yuzefovich): do not instantiate a new batch here once
-					// spillingQueues actually copy the batches when those are kept
-					// in-memory.
-					r.partitionsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
-				}
 				runningPartitionsSizesCol := r.partitionsState.runningSizes.ColVec(0).Int64()
 				runningPartitionsSizesCol[r.partitionsState.idx] = r.numTuplesInPartition
 				r.partitionsState.idx++
@@ -374,12 +378,6 @@ func (r *_RELATIVE_RANK_STRINGOp) Next(ctx context.Context) coldata.Batch {
 				// {{if .IsCumeDist}}
 				// We need to flush the last vector of the running peer groups
 				// sizes, including the very last peer group.
-				if r.peerGroupsState.runningSizes == nil {
-					// TODO(yuzefovich): do not instantiate a new batch here once
-					// spillingQueues actually copy the batches when those are kept
-					// in-memory.
-					r.peerGroupsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
-				}
 				runningPeerGroupsSizesCol := r.peerGroupsState.runningSizes.ColVec(0).Int64()
 				runningPeerGroupsSizesCol[r.peerGroupsState.idx] = r.numPeers
 				r.peerGroupsState.idx++
@@ -408,10 +406,7 @@ func (r *_RELATIVE_RANK_STRINGOp) Next(ctx context.Context) coldata.Batch {
 
 			sel := batch.Selection()
 			// First, we buffer up all of the tuples.
-			// TODO(yuzefovich): do not instantiate a new batch here once
-			// spillingQueues actually copy the batches when those are kept
-			// in-memory.
-			r.scratch = r.allocator.NewMemBatchWithFixedCapacity(r.inputTypes, n)
+			r.scratch.ResetInternalBatch()
 			r.allocator.PerformOperation(r.scratch.ColVecs(), func() {
 				for colIdx, vec := range r.scratch.ColVecs() {
 					vec.Copy(
@@ -439,11 +434,12 @@ func (r *_RELATIVE_RANK_STRINGOp) Next(ctx context.Context) coldata.Batch {
 			}
 			if sel != nil {
 				for _, i := range sel[:n] {
-					_COMPUTE_PARTITIONS_SIZES()
+					_COMPUTE_PARTITIONS_SIZES(true)
 				}
 			} else {
+				_ = partitionCol[n-1]
 				for i := 0; i < n; i++ {
-					_COMPUTE_PARTITIONS_SIZES()
+					_COMPUTE_PARTITIONS_SIZES(false)
 				}
 			}
 			// {{else}}
@@ -460,11 +456,12 @@ func (r *_RELATIVE_RANK_STRINGOp) Next(ctx context.Context) coldata.Batch {
 			}
 			if sel != nil {
 				for _, i := range sel[:n] {
-					_COMPUTE_PEER_GROUPS_SIZES()
+					_COMPUTE_PEER_GROUPS_SIZES(true)
 				}
 			} else {
+				_ = peersCol[n-1]
 				for i := 0; i < n; i++ {
-					_COMPUTE_PEER_GROUPS_SIZES()
+					_COMPUTE_PEER_GROUPS_SIZES(false)
 				}
 			}
 			// {{end}}
@@ -517,18 +514,22 @@ func (r *_RELATIVE_RANK_STRINGOp) Next(ctx context.Context) coldata.Batch {
 
 			// Now we will populate the output column.
 			relativeRankOutputCol := r.output.ColVec(r.outputColIdx).Float64()
+			_ = relativeRankOutputCol[n-1]
 			// {{if .HasPartition}}
 			partitionCol := r.scratch.ColVec(r.partitionColIdx).Bool()
+			_ = partitionCol[n-1]
 			// {{end}}
 			peersCol := r.scratch.ColVec(r.peersColIdx).Bool()
+			_ = peersCol[n-1]
 			// We don't need to think about the selection vector since all the
 			// buffered up tuples have been "deselected" during the buffering
 			// stage.
-			for i := range relativeRankOutputCol[:n] {
+			for i := 0; i < n; i++ {
 				// We need to set r.numTuplesInPartition to the size of the
 				// partition that i'th tuple belongs to (which we have already
 				// computed).
 				// {{if .HasPartition}}
+				//gcassert:bce
 				if partitionCol[i] {
 					if r.partitionsState.idx == r.partitionsState.dequeuedSizes.Length() {
 						if r.partitionsState.dequeuedSizes, err = r.partitionsState.dequeue(ctx); err != nil {
@@ -556,6 +557,7 @@ func (r *_RELATIVE_RANK_STRINGOp) Next(ctx context.Context) coldata.Batch {
 				// r.numTuplesInPartition already contains the correct number.
 				// {{end}}
 
+				//gcassert:bce
 				if peersCol[i] {
 					// {{if .IsPercentRank}}
 					r.rank += r.rankIncrement
@@ -582,13 +584,16 @@ func (r *_RELATIVE_RANK_STRINGOp) Next(ctx context.Context) coldata.Batch {
 				// {{if .IsPercentRank}}
 				if r.numTuplesInPartition == 1 {
 					// There is a single tuple in the partition, so we return 0, per spec.
+					//gcassert:bce
 					relativeRankOutputCol[i] = 0
 				} else {
+					//gcassert:bce
 					relativeRankOutputCol[i] = float64(r.rank-1) / float64(r.numTuplesInPartition-1)
 				}
 				r.rankIncrement++
 				// {{end}}
 				// {{if .IsCumeDist}}
+				//gcassert:bce
 				relativeRankOutputCol[i] = float64(r.numPrecedingTuples+r.numPeers) / float64(r.numTuplesInPartition)
 				// {{end}}
 			}

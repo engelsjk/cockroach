@@ -50,7 +50,7 @@ output row: ['c' 'd']
 output row: ['e' 'f']
 output row: ['f' 'g']
 
-statement error duplicate key value \(v\)=\('g'\) violates unique constraint "a"
+statement error duplicate key value violates unique constraint "a"\nDETAIL: Key \(v\)=\('g'\) already exists\.
 UPDATE kv2 SET v = 'g' WHERE k IN ('a')
 
 statement ok
@@ -102,7 +102,7 @@ query T
 EXPLAIN UPDATE xyz SET y = x
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: xyz
@@ -119,7 +119,7 @@ query T
 EXPLAIN (VERBOSE) UPDATE xyz SET (x, y) = (1, 2)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ columns: ()
@@ -130,16 +130,16 @@ vectorized: false
 │
 └── • render
     │ columns: (x, y, z, x_new, y_new)
-    │ estimated row count: 1000 (missing stats)
-    │ render 0: 1
-    │ render 1: 2
-    │ render 2: x
-    │ render 3: y
-    │ render 4: z
+    │ estimated row count: 1,000 (missing stats)
+    │ render x_new: 1
+    │ render y_new: 2
+    │ render x: x
+    │ render y: y
+    │ render z: z
     │
     └── • scan
           columns: (x, y, z)
-          estimated row count: 1000 (missing stats)
+          estimated row count: 1,000 (missing stats)
           table: xyz@primary
           spans: FULL SCAN
           locking strength: for update
@@ -148,7 +148,7 @@ query T
 EXPLAIN (VERBOSE) UPDATE xyz SET (x, y) = (y, x)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ columns: ()
@@ -162,7 +162,7 @@ vectorized: false
     │
     └── • scan
           columns: (x, y, z)
-          estimated row count: 1000 (missing stats)
+          estimated row count: 1,000 (missing stats)
           table: xyz@primary
           spans: FULL SCAN
           locking strength: for update
@@ -171,7 +171,7 @@ query T
 EXPLAIN (VERBOSE) UPDATE xyz SET (x, y) = (2, 2)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ columns: ()
@@ -185,15 +185,15 @@ vectorized: false
     │
     └── • render
         │ columns: (x_new, x, y, z)
-        │ estimated row count: 1000 (missing stats)
-        │ render 0: 2
-        │ render 1: x
-        │ render 2: y
-        │ render 3: z
+        │ estimated row count: 1,000 (missing stats)
+        │ render x_new: 2
+        │ render x: x
+        │ render y: y
+        │ render z: z
         │
         └── • scan
               columns: (x, y, z)
-              estimated row count: 1000 (missing stats)
+              estimated row count: 1,000 (missing stats)
               table: xyz@primary
               spans: FULL SCAN
               locking strength: for update
@@ -212,7 +212,7 @@ CREATE TABLE pks (
 statement count 2
 INSERT INTO pks VALUES (1, 2, 3), (4, 5, 3)
 
-statement error duplicate key value \(k2,v\)=\(5,3\) violates unique constraint "i"
+statement error duplicate key value violates unique constraint "i"\nDETAIL: Key \(k2,v\)=\(5,3\) already exists\.
 UPDATE pks SET k2 = 5 where k1 = 1
 
 # Test updating only one of the columns of a multi-column primary key.
@@ -245,7 +245,7 @@ query T
 EXPLAIN UPDATE kv SET v = v + 1 ORDER BY v DESC LIMIT 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv
@@ -270,7 +270,7 @@ query T
 EXPLAIN UPDATE kv SET v = v - 1 WHERE k < 3 LIMIT 1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv
@@ -286,73 +286,6 @@ vectorized: false
           limit: 1
           locking strength: for update
 
-# Check that updates on tables with multiple column families behave as
-# they should.
-
-statement ok
-CREATE TABLE tu (a INT PRIMARY KEY, b INT, c INT, d INT, FAMILY (a), FAMILY (b), FAMILY (c,d));
-  INSERT INTO tu VALUES (1, 2, 3, 4)
-
-# Update single column family.
-query T
-EXPLAIN (VERBOSE) UPDATE tu SET c=c+1
-----
-distribution: local
-vectorized: false
-·
-• update
-│ columns: ()
-│ estimated row count: 0 (missing stats)
-│ table: tu
-│ set: c
-│ auto commit
-│
-└── • render
-    │ columns: (a, c, d, c_new)
-    │ estimated row count: 1000 (missing stats)
-    │ render 0: c + 1
-    │ render 1: a
-    │ render 2: c
-    │ render 3: d
-    │
-    └── • scan
-          columns: (a, c, d)
-          estimated row count: 1000 (missing stats)
-          table: tu@primary
-          spans: FULL SCAN
-          locking strength: for update
-
-statement ok
-SET tracing = on,kv,results; UPDATE tu SET c=c+1; SET tracing = off
-
-query T
-SELECT message FROM [SHOW KV TRACE FOR SESSION]
- WHERE operation != 'dist sender send'
-----
-Scan /Table/57/{1-2}
-fetched: /tu/primary/1 -> NULL
-fetched: /tu/primary/1/b -> 2
-fetched: /tu/primary/1/c/d -> /3/4
-Put /Table/57/1/1/2/1 -> /TUPLE/3:3:Int/4/1:4:Int/4
-fast path completed
-rows affected: 1
-
-statement ok
-SET tracing = on,kv,results; UPDATE tu SET b = NULL, c = NULL, d = NULL; SET tracing = off
-
-query T
-SELECT message FROM [SHOW KV TRACE FOR SESSION]
- WHERE operation != 'dist sender send'
-----
-Scan /Table/57/{1-2}
-fetched: /tu/primary/1 -> NULL
-fetched: /tu/primary/1/b -> 2
-fetched: /tu/primary/1/c/d -> /4/4
-Del /Table/57/1/1/1/1
-Del /Table/57/1/1/2/1
-fast path completed
-rows affected: 1
-
 # Regression test for #35564: make sure we use the Update's input required
 # ordering for the internal projection.
 
@@ -363,7 +296,7 @@ query T
 EXPLAIN (VERBOSE) SELECT * FROM [ UPDATE abc SET a=c RETURNING a ] ORDER BY a
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │ columns: (a)
@@ -371,12 +304,12 @@ vectorized: false
 ├── • sort
 │   │ columns: (a)
 │   │ ordering: +a
-│   │ estimated row count: 1000 (missing stats)
+│   │ estimated row count: 1,000 (missing stats)
 │   │ order: +a
 │   │
 │   └── • scan buffer
 │         columns: (a)
-│         estimated row count: 1000 (missing stats)
+│         estimated row count: 1,000 (missing stats)
 │         label: buffer 1
 │
 └── • subquery
@@ -390,11 +323,11 @@ vectorized: false
         │
         └── • project
             │ columns: (a)
-            │ estimated row count: 1000 (missing stats)
+            │ estimated row count: 1,000 (missing stats)
             │
             └── • update
                 │ columns: (a, rowid)
-                │ estimated row count: 1000 (missing stats)
+                │ estimated row count: 1,000 (missing stats)
                 │ table: abc
                 │ set: a
                 │
@@ -403,7 +336,7 @@ vectorized: false
                     │
                     └── • scan
                           columns: (a, b, c, rowid)
-                          estimated row count: 1000 (missing stats)
+                          estimated row count: 1,000 (missing stats)
                           table: abc@primary
                           spans: FULL SCAN
                           locking strength: for update
@@ -440,7 +373,7 @@ query T
 EXPLAIN (VERBOSE) UPDATE t38799@foo SET c=2 WHERE a=1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ columns: ()
@@ -452,10 +385,10 @@ vectorized: false
 └── • render
     │ columns: (a, b, c, c_new)
     │ estimated row count: 1 (missing stats)
-    │ render 0: 2
-    │ render 1: a
-    │ render 2: b
-    │ render 3: c
+    │ render c_new: 2
+    │ render a: a
+    │ render b: b
+    │ render c: c
     │
     └── • filter
         │ columns: (a, b, c)
@@ -464,13 +397,13 @@ vectorized: false
         │
         └── • index join
             │ columns: (a, b, c)
-            │ estimated row count: 1000 (missing stats)
+            │ estimated row count: 1,000 (missing stats)
             │ table: t38799@primary
             │ key columns: a
             │
             └── • scan
                   columns: (a, b)
-                  estimated row count: 1000 (missing stats)
+                  estimated row count: 1,000 (missing stats)
                   table: t38799@foo
                   spans: FULL SCAN
 
@@ -483,7 +416,7 @@ query T
 EXPLAIN UPDATE kv SET v = 10 WHERE k = 3
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv
@@ -502,7 +435,7 @@ query T
 EXPLAIN UPDATE kv SET v = k WHERE k > 1 AND k < 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv
@@ -519,7 +452,7 @@ query T
 EXPLAIN UPDATE kv SET v = 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv
@@ -547,7 +480,7 @@ query T
 EXPLAIN UPDATE kv3 SET k = 3 WHERE v = 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv3
@@ -569,7 +502,7 @@ query T
 EXPLAIN UPDATE kv3 SET k = v WHERE v > 1 AND v < 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv3
@@ -592,7 +525,7 @@ query T
 EXPLAIN UPDATE kv SET v = 10 WHERE k = 3
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv
@@ -610,7 +543,7 @@ query T
 EXPLAIN UPDATE kv SET v = k WHERE k > 1 AND k < 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv
@@ -626,7 +559,7 @@ query T
 EXPLAIN UPDATE kv SET v = 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv
@@ -644,7 +577,7 @@ query T
 EXPLAIN (VERBOSE) UPDATE xyz SET (x, y) = (1, 2)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ columns: ()
@@ -655,16 +588,16 @@ vectorized: false
 │
 └── • render
     │ columns: (x, y, z, x_new, y_new)
-    │ estimated row count: 1000 (missing stats)
-    │ render 0: 1
-    │ render 1: 2
-    │ render 2: x
-    │ render 3: y
-    │ render 4: z
+    │ estimated row count: 1,000 (missing stats)
+    │ render x_new: 1
+    │ render y_new: 2
+    │ render x: x
+    │ render y: y
+    │ render z: z
     │
     └── • scan
           columns: (x, y, z)
-          estimated row count: 1000 (missing stats)
+          estimated row count: 1,000 (missing stats)
           table: xyz@primary
           spans: FULL SCAN
 
@@ -672,7 +605,7 @@ query T
 EXPLAIN UPDATE kv SET v = v - 1 WHERE k < 3 LIMIT 1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv
@@ -691,7 +624,7 @@ query T
 EXPLAIN UPDATE kv3 SET k = 3 WHERE v = 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv3
@@ -712,7 +645,7 @@ query T
 EXPLAIN UPDATE kv3 SET k = v WHERE v > 1 AND v < 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
 │ table: kv3
@@ -727,25 +660,39 @@ vectorized: false
           table: kv3@kv3_v_idx
           spans: [/2 - /9]
 
-# Update single column family.
+# Reset for rest of test.
+statement ok
+SET enable_implicit_select_for_update = true
+
+statement ok
+CREATE TABLE computed (
+  a INT PRIMARY KEY,
+  b INT,
+  c INT,
+  d INT AS (c+1) STORED,
+  INDEX (b),
+  FAMILY (a),
+  FAMILY (b),
+  FAMILY (c),
+  FAMILY (d)
+)
+
+# Verify that we don't do an index join to recalculate d (#42482).
 query T
-EXPLAIN UPDATE tu SET c=c+1
+EXPLAIN UPDATE computed SET b=b*2 WHERE b BETWEEN 1 and 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • update
-│ table: tu
-│ set: c
+│ table: computed
+│ set: b
 │ auto commit
 │
 └── • render
     │
     └── • scan
           missing stats
-          table: tu@primary
-          spans: FULL SCAN
-
-# Reset for rest of test.
-statement ok
-SET enable_implicit_select_for_update = true
+          table: computed@computed_b_idx
+          spans: [/1 - /10]
+          locking strength: for update

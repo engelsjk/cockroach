@@ -254,7 +254,7 @@ func (c *Connection) Connect(ctx context.Context) (*grpc.ClientConn, error) {
 	// Wait for initial heartbeat.
 	select {
 	case <-c.initialHeartbeatDone:
-	case <-c.stopper.ShouldStop():
+	case <-c.stopper.ShouldQuiesce():
 		return nil, errors.Errorf("stopped")
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -398,7 +398,7 @@ func NewContext(opts ContextOptions) *Context {
 		ctx.ClusterID.Set(masterCtx, *id)
 	}
 
-	ctx.Stopper.RunWorker(ctx.masterCtx, func(context.Context) {
+	waitQuiesce := func(context.Context) {
 		<-ctx.Stopper.ShouldQuiesce()
 
 		cancel()
@@ -415,7 +415,10 @@ func NewContext(opts ContextOptions) *Context {
 			ctx.removeConn(conn, k.(connKey))
 			return true
 		})
-	})
+	}
+	if err := ctx.Stopper.RunAsyncTask(ctx.masterCtx, "wait-rpcctx-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(ctx.masterCtx)
+	}
 	return ctx
 }
 
@@ -474,6 +477,12 @@ func (a internalClientAdapter) Join(
 	ctx context.Context, req *roachpb.JoinNodeRequest, _ ...grpc.CallOption,
 ) (*roachpb.JoinNodeResponse, error) {
 	return a.InternalServer.Join(ctx, req)
+}
+
+func (a internalClientAdapter) ResetQuorum(
+	ctx context.Context, req *roachpb.ResetQuorumRequest, _ ...grpc.CallOption,
+) (*roachpb.ResetQuorumResponse, error) {
+	return a.InternalServer.ResetQuorum(ctx, req)
 }
 
 type respStreamClientAdapter struct {
@@ -636,12 +645,12 @@ func (ctx *Context) removeConn(conn *Connection, keys ...connKey) {
 		ctx.conns.Delete(key)
 	}
 	if log.V(1) {
-		log.Infof(ctx.masterCtx, "closing %+v", keys)
+		log.Health.Infof(ctx.masterCtx, "closing %+v", keys)
 	}
 	if grpcConn := conn.grpcConn; grpcConn != nil {
 		if err := grpcConn.Close(); err != nil && !grpcutil.IsClosedConnection(err) {
 			if log.V(1) {
-				log.Errorf(ctx.masterCtx, "failed to close client connection: %v", err)
+				log.Health.Errorf(ctx.masterCtx, "failed to close client connection: %v", err)
 			}
 		}
 	}
@@ -739,6 +748,22 @@ func (ctx *Context) grpcDialOptions(
 		if testingStreamInterceptor != nil {
 			streamInterceptors = append(streamInterceptors, testingStreamInterceptor)
 		}
+	}
+	if ctx.Knobs.ArtificialLatencyMap != nil {
+		dialerFunc := func(ctx context.Context, target string) (net.Conn, error) {
+			dialer := net.Dialer{
+				LocalAddr: sourceAddr,
+			}
+			return dialer.DialContext(ctx, "tcp", target)
+		}
+		latency := ctx.Knobs.ArtificialLatencyMap[target]
+		log.VEventf(ctx.masterCtx, 1, "connecting to node %s with simulated latency %dms", target, latency)
+		dialer := artificialLatencyDialer{
+			dialerFunc: dialerFunc,
+			latencyMS:  latency,
+		}
+		dialerFunc = dialer.dial
+		dialOpts = append(dialOpts, grpc.WithContextDialer(dialerFunc))
 	}
 
 	if len(unaryInterceptors) > 0 {
@@ -956,7 +981,7 @@ func (ctx *Context) grpcDialRaw(
 	dialOpts = append(dialOpts, ctx.testingDialOpts...)
 
 	if log.V(1) {
-		log.Infof(ctx.masterCtx, "dialing %s", target)
+		log.Health.Infof(ctx.masterCtx, "dialing %s", target)
 	}
 	conn, err := grpc.DialContext(ctx.masterCtx, target, dialOpts...)
 	return conn, dialer.redialChan, err
@@ -981,7 +1006,7 @@ func (ctx *Context) GRPCDialNode(
 	target string, remoteNodeID roachpb.NodeID, class ConnectionClass,
 ) *Connection {
 	if remoteNodeID == 0 && !ctx.TestingAllowNamedRPCToAnonymousServer {
-		log.Fatalf(context.TODO(), "invalid node ID 0 in GRPCDialNode()")
+		log.Fatalf(context.TODO(), "%v", errors.AssertionFailedf("invalid node ID 0 in GRPCDialNode()"))
 	}
 	return ctx.grpcDialNodeInternal(target, remoteNodeID, class)
 }
@@ -1024,15 +1049,13 @@ func (ctx *Context) grpcDialNodeInternal(
 		var redialChan <-chan struct{}
 		conn.grpcConn, redialChan, conn.dialErr = ctx.grpcDialRaw(target, remoteNodeID, class)
 		if conn.dialErr == nil {
-			if err := ctx.Stopper.RunTask(
+			if err := ctx.Stopper.RunAsyncTask(
 				ctx.masterCtx, "rpc.Context: grpc heartbeat", func(masterCtx context.Context) {
-					ctx.Stopper.RunWorker(masterCtx, func(masterCtx context.Context) {
-						err := ctx.runHeartbeat(conn, target, redialChan)
-						if err != nil && !grpcutil.IsClosedConnection(err) {
-							log.Errorf(masterCtx, "removing connection to %s due to error: %s", target, err)
-						}
-						ctx.removeConn(conn, thisConnKeys...)
-					})
+					err := ctx.runHeartbeat(conn, target, redialChan)
+					if err != nil && !grpcutil.IsClosedConnection(err) {
+						log.Health.Errorf(masterCtx, "removing connection to %s due to error: %s", target, err)
+					}
+					ctx.removeConn(conn, thisConnKeys...)
 				}); err != nil {
 				conn.dialErr = err
 			}

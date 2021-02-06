@@ -86,6 +86,20 @@ committing the change.
 
 Please follow the instructions above on updating the golang version, omitting the go-version-check.sh step.
 
+## Updating the `bazelbuilder` image
+
+The `bazelbuilder` image is used exclusively for performing builds using Bazel. Only add dependencies to the image that are necessary for performing Bazel builds. The process for updating the image is as follows:
+
+- Edit `build/bazelbuilder/Dockerfile` as desired.
+- Perform the normal sequence of steps for pushing a new Docker image (for `$TAG`, you can use the value of `date +%Y%m%d-%H%M%S`):
+```
+    docker build build/bazelbuilder
+    docker image tag $IMAGE_HASH cockroachdb/bazel:$TAG
+    docker image push cockroachdb/bazel:$TAG
+```
+- Then, update `build/teamcity-bazel.sh` with the new tag and commit all your changes.
+- Ensure the "Github CI (Optional)" job passes on your PR before merging.
+
 #  Dependencies
 
 Dependencies are managed using `go mod`. We use `go mod vendor` so that we can import and use non-Go files (e.g. protobuf files) using the [modvendor](https://github.com/goware/modvendor) script.
@@ -95,14 +109,20 @@ Dependencies are managed using `go mod`. We use `go mod vendor` so that we can i
 ### Installing or updating a dependency
 
 Run `go get -u <dependency>`. To get a specific version, run `go get -u <dependency>@<version|branch|sha>`.
+You should see changes in `go.mod` when running `git diff`.
 
 When updating a dependency, you should run `go mod tidy` after `go get` to ensure the old entries
 are removed from go.sum.
 
-You must then run `make vendor_rebuild` to ensure the modules are installed. These changes must
-then be committed in the submodule directory (see [Working with Submodules](#working-with-submodules)).
+You must then run `make vendor_rebuild` to ensure the modules are installed.
+Ensure the vendor changes are as expected by running `cd vendor && git status`. If your import
+is missing, ensure it is used in code. This can be a blank dependency, e.g.
+`import _ "golang.org/api/compute/v1"`. These changes must then be committed in the submodule directory
+(see [Working with Submodules](#working-with-submodules)).
 
-Programs can then be run using `go build -mod=vendor ...` or `go test -mod=vendor ...`.
+Finally, run `make bazel-generate` to regenerate `DEPS.bzl` with the updated Go dependency information.
+
+Programs can then be run using `go build ...` or `go test ...`.
 
 ### Removing a dependency
 

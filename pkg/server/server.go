@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -51,6 +52,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
+	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
 	"github.com/cockroachdb/cockroach/pkg/server/goroutinedumper"
 	"github.com/cockroachdb/cockroach/pkg/server/heapprofiler"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -62,6 +64,7 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/sql/gcjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
+	_ "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
@@ -73,6 +76,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -82,7 +86,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"github.com/cockroachdb/sentry-go"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -96,13 +99,13 @@ var (
 	// Allocation pool for gzipResponseWriters.
 	gzipResponseWriterPool sync.Pool
 
-	forwardClockJumpCheckEnabled = settings.RegisterPublicBoolSetting(
+	forwardClockJumpCheckEnabled = settings.RegisterBoolSetting(
 		"server.clock.forward_jump_check_enabled",
 		"if enabled, forward clock jumps > max_offset/2 will cause a panic",
 		false,
-	)
+	).WithPublic()
 
-	persistHLCUpperBoundInterval = settings.RegisterPublicDurationSetting(
+	persistHLCUpperBoundInterval = settings.RegisterDurationSetting(
 		"server.clock.persist_upper_bound_interval",
 		"the interval between persisting the wall time upper bound of the clock. The clock "+
 			"does not generate a wall time greater than the persisted timestamp and will panic if "+
@@ -111,7 +114,7 @@ var (
 			"time across server restarts. Not setting this or setting a value of 0 disables this "+
 			"feature.",
 		0,
-	)
+	).WithPublic()
 )
 
 // Server is the cockroach server node.
@@ -138,6 +141,7 @@ type Server struct {
 	registry     *metric.Registry
 	recorder     *status.MetricsRecorder
 	runtime      *status.RuntimeStatSampler
+	updates      *diagnostics.UpdateChecker
 
 	admin           *adminServer
 	status          *statusServer
@@ -155,7 +159,7 @@ type Server struct {
 	protectedtsProvider   protectedts.Provider
 	protectedtsReconciler *ptreconcile.Reconciler
 
-	sqlServer *sqlServer
+	sqlServer *SQLServer
 
 	// Created in NewServer but initialized (made usable) in `(*Server).Start`.
 	externalStorageBuilder *externalStorageBuilder
@@ -231,6 +235,10 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			return nil, errors.Wrap(err, "instantiating clock source")
 		}
 		clock = hlc.NewClock(clockSrc.UnixNano, time.Duration(cfg.MaxOffset))
+	} else if cfg.TestingKnobs.Server != nil &&
+		cfg.TestingKnobs.Server.(*TestingKnobs).ClockSource != nil {
+		clock = hlc.NewClock(cfg.TestingKnobs.Server.(*TestingKnobs).ClockSource,
+			time.Duration(cfg.MaxOffset))
 	} else {
 		clock = hlc.NewClock(hlc.UnixNano, time.Duration(cfg.MaxOffset))
 	}
@@ -303,7 +311,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	rpcContext.HeartbeatCB = func() {
 		if err := rpcContext.RemoteClocks.VerifyClockOffset(ctx); err != nil {
-			log.Fatalf(ctx, "%v", err)
+			log.Ops.Fatalf(ctx, "%v", err)
 		}
 	}
 	registry.AddMetricStruct(rpcContext.Metrics())
@@ -479,7 +487,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		user security.SQLUsername) (cloud.ExternalStorage, error) {
 		return externalStorageBuilder.makeExternalStorageFromURI(ctx, uri, user)
 	}
-
 	protectedtsProvider, err := ptprovider.New(ptprovider.Config{
 		DB:               db,
 		InternalExecutor: internalExecutor,
@@ -547,12 +554,26 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	recorder := status.NewMetricsRecorder(clock, nodeLiveness, rpcContext, g, st)
 	registry.AddMetricStruct(rpcContext.RemoteClocks.Metrics())
 
+	updates := &diagnostics.UpdateChecker{
+		StartTime:     timeutil.Now(),
+		AmbientCtx:    &cfg.AmbientCtx,
+		Config:        cfg.BaseConfig.Config,
+		Settings:      cfg.Settings,
+		ClusterID:     rpcContext.ClusterID.Get,
+		NodeID:        nodeIDContainer.Get,
+		SQLInstanceID: idContainer.SQLInstanceID,
+	}
+	if cfg.TestingKnobs.Server != nil {
+		updates.TestingKnobs = &cfg.TestingKnobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs
+	}
+
 	node := NewNode(
 		storeCfg, recorder, registry, stopper,
 		txnMetrics, nil /* execCfg */, &rpcContext.ClusterID)
 	lateBoundNode = node
 	roachpb.RegisterInternalServer(grpcServer.Server, node)
 	kvserver.RegisterPerReplicaServer(grpcServer.Server, node.perReplicaServer)
+	kvserver.RegisterPerStoreServer(grpcServer.Server, node.perReplicaServer)
 	node.storeCfg.ClosedTimestamp.RegisterClosedTimestampServer(grpcServer.Server)
 	replicationReporter := reports.NewReporter(
 		db, node.stores, storePool, st, nodeLiveness, internalExecutor)
@@ -663,6 +684,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		node:                   node,
 		registry:               registry,
 		recorder:               recorder,
+		updates:                updates,
 		runtime:                runtimeSampler,
 		admin:                  sAdmin,
 		status:                 sStatus,
@@ -848,7 +870,7 @@ func (s *Server) startMonitoringForwardClockJumps(ctx context.Context) error {
 		return errors.Wrap(err, "monitoring forward clock jumps")
 	}
 
-	log.Info(ctx, "monitoring forward clock jumps based on server.clock.forward_jump_check_enabled")
+	log.Ops.Info(ctx, "monitoring forward clock jumps based on server.clock.forward_jump_check_enabled")
 	return nil
 }
 
@@ -894,7 +916,7 @@ func ensureClockMonotonicity(
 	currentWallTime := currentWallTimeFn()
 	delta := time.Duration(sleepUntil - currentWallTime)
 	if delta > 0 {
-		log.Infof(
+		log.Ops.Infof(
 			ctx,
 			"Sleeping till wall time %v to catches up to %v to ensure monotonicity. Delta: %v",
 			currentWallTime,
@@ -938,7 +960,7 @@ func periodicallyPersistHLCUpperBound(
 			persistHLCUpperBoundFn,
 			int64(persistInterval*3), /* delta to compute upper bound */
 		); err != nil {
-			log.Fatalf(
+			log.Ops.Fatalf(
 				context.Background(),
 				"error persisting HLC upper bound: %v",
 				err,
@@ -957,16 +979,16 @@ func periodicallyPersistHLCUpperBound(
 			if persistInterval > 0 {
 				ticker = tickerFn(persistInterval)
 				persistHLCUpperBound()
-				log.Info(context.Background(), "persisting HLC upper bound is enabled")
+				log.Ops.Info(context.Background(), "persisting HLC upper bound is enabled")
 			} else {
 				if err := clock.ResetHLCUpperBound(persistHLCUpperBoundFn); err != nil {
-					log.Fatalf(
+					log.Ops.Fatalf(
 						context.Background(),
 						"error resetting hlc upper bound: %v",
 						err,
 					)
 				}
-				log.Info(context.Background(), "persisting HLC upper bound is disabled")
+				log.Ops.Info(context.Background(), "persisting HLC upper bound is disabled")
 			}
 
 		case <-ticker.C:
@@ -1019,15 +1041,16 @@ func (s *Server) startPersistingHLCUpperBound(
 		}
 	}
 
-	s.stopper.RunWorker(
+	_ = s.stopper.RunAsyncTask(
 		ctx,
+		"persist-hlc-upper-bound",
 		func(context.Context) {
 			periodicallyPersistHLCUpperBound(
 				s.clock,
 				persistHLCUpperBoundIntervalCh,
 				persistHLCUpperBoundFn,
 				tickerFn,
-				s.stopper.ShouldStop(),
+				s.stopper.ShouldQuiesce(),
 				nil, /* tick callback */
 			)
 		},
@@ -1251,12 +1274,15 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// loopback handles the HTTP <-> RPC loopback connection.
 	loopback := newLoopbackListener(workersCtx, s.stopper)
 
-	s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
+	waitQuiesce := func(context.Context) {
 		<-s.stopper.ShouldQuiesce()
 		_ = loopback.Close()
-	})
+	}
+	if err := s.stopper.RunAsyncTask(workersCtx, "gw-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(workersCtx)
+	}
 
-	s.stopper.RunWorker(workersCtx, func(context.Context) {
+	_ = s.stopper.RunAsyncTask(workersCtx, "serve-loopback", func(context.Context) {
 		netutil.FatalIfUnexpected(s.grpc.Serve(loopback))
 	})
 
@@ -1288,12 +1314,21 @@ func (s *Server) PreStart(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
-		<-s.stopper.ShouldQuiesce()
-		if err := conn.Close(); err != nil {
-			log.Fatalf(workersCtx, "%v", err)
+	{
+		waitQuiesce := func(workersCtx context.Context) {
+			<-s.stopper.ShouldQuiesce()
+			// NB: we can't do this as a Closer because (*Server).ServeWith is
+			// running in a worker and usually sits on accept() which unblocks
+			// only when the listener closes. In other words, the listener needs
+			// to close when quiescing starts to allow that worker to shut down.
+			if err := conn.Close(); err != nil {
+				log.Ops.Fatalf(workersCtx, "%v", err)
+			}
 		}
-	})
+		if err := s.stopper.RunAsyncTask(workersCtx, "wait-quiesce", waitQuiesce); err != nil {
+			waitQuiesce(workersCtx)
+		}
+	}
 
 	for _, gw := range []grpcGatewayServer{s.admin, s.status, s.authentication, s.tsServer} {
 		if err := gw.RegisterGateway(gwCtx, gwMux, conn); err != nil {
@@ -1460,10 +1495,10 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// but this gossip only happens once the first range has a leaseholder, i.e.
 	// when a quorum of nodes has gone fully operational.
 	_ = s.stopper.RunAsyncTask(ctx, "connect-gossip", func(ctx context.Context) {
-		log.Infof(ctx, "connecting to gossip network to verify cluster ID %q", state.clusterID)
+		log.Ops.Infof(ctx, "connecting to gossip network to verify cluster ID %q", state.clusterID)
 		select {
 		case <-s.gossip.Connected:
-			log.Infof(ctx, "node connected via gossip")
+			log.Ops.Infof(ctx, "node connected via gossip")
 		case <-ctx.Done():
 		case <-s.stopper.ShouldQuiesce():
 		}
@@ -1590,15 +1625,15 @@ func (s *Server) PreStart(ctx context.Context) error {
 	//   stores)
 	s.node.waitForAdditionalStoreInit()
 
-	log.Infof(ctx, "starting %s server at %s (use: %s)",
+	log.Ops.Infof(ctx, "starting %s server at %s (use: %s)",
 		redact.Safe(s.cfg.HTTPRequestScheme()), s.cfg.HTTPAddr, s.cfg.HTTPAdvertiseAddr)
 	rpcConnType := redact.SafeString("grpc/postgres")
 	if s.cfg.SplitListenSQL {
 		rpcConnType = "grpc"
-		log.Infof(ctx, "starting postgres server at %s (use: %s)", s.cfg.SQLAddr, s.cfg.SQLAdvertiseAddr)
+		log.Ops.Infof(ctx, "starting postgres server at %s (use: %s)", s.cfg.SQLAddr, s.cfg.SQLAdvertiseAddr)
 	}
-	log.Infof(ctx, "starting %s server at %s", rpcConnType, s.cfg.Addr)
-	log.Infof(ctx, "advertising CockroachDB node at %s", s.cfg.AdvertiseAddr)
+	log.Ops.Infof(ctx, "starting %s server at %s", rpcConnType, s.cfg.Addr)
+	log.Ops.Infof(ctx, "advertising CockroachDB node at %s", s.cfg.AdvertiseAddr)
 
 	log.Event(ctx, "accepting connections")
 
@@ -1613,13 +1648,15 @@ func (s *Server) PreStart(ctx context.Context) error {
 			if err := s.node.stores.VisitStores(func(s *kvserver.Store) error {
 				return s.WriteLastUpTimestamp(ctx, now)
 			}); err != nil {
-				log.Warningf(ctx, "writing last up timestamp: %v", err)
+				log.Ops.Warningf(ctx, "writing last up timestamp: %v", err)
 			}
 		},
 	})
 
 	// Begin recording status summaries.
-	s.node.startWriteNodeStatus(base.DefaultMetricsSampleInterval)
+	if err := s.node.startWriteNodeStatus(base.DefaultMetricsSampleInterval); err != nil {
+		return err
+	}
 
 	// Start the protected timestamp subsystem.
 	if err := s.protectedtsProvider.Start(ctx, s.stopper); err != nil {
@@ -1639,7 +1676,10 @@ func (s *Server) PreStart(ctx context.Context) error {
 
 	// OIDC Configuration must happen prior to the UI Handler being defined below so that we have
 	// the system settings initialized for it to pick up from the oidcAuthenticationServer.
-	oidc, err := ConfigureOIDC(ctx, s.ClusterSettings(), &s.mux, s.authentication.UserLoginFromSSO, s.cfg.AmbientCtx, s.ClusterID())
+	oidc, err := ConfigureOIDC(
+		ctx, s.ClusterSettings(), s.cfg.Locality,
+		&s.mux, s.authentication.UserLoginFromSSO, s.cfg.AmbientCtx, s.ClusterID(),
+	)
 	if err != nil {
 		return err
 	}
@@ -1684,6 +1724,10 @@ func (s *Server) PreStart(ctx context.Context) error {
 	s.mux.Handle(loginPath, gwMux)
 	s.mux.Handle(logoutPath, authHandler)
 
+	if s.cfg.EnableDemoLoginEndpoint {
+		s.mux.Handle(DemoLoginPath, http.HandlerFunc(s.authentication.demoLogin))
+	}
+
 	// The /_status/vars endpoint is not authenticated either. Useful for monitoring.
 	s.mux.Handle(statusVars, http.HandlerFunc(s.status.handleVars))
 
@@ -1703,7 +1747,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 					http.Error(w, "admin privilege required", http.StatusUnauthorized)
 					return
 				} else if err != nil {
-					log.Infof(authCtx, "web session error: %s", err)
+					log.Ops.Infof(authCtx, "web session error: %s", err)
 					http.Error(w, "error checking authentication", http.StatusInternalServerError)
 					return
 				}
@@ -1711,6 +1755,9 @@ func (s *Server) PreStart(ctx context.Context) error {
 			}))
 	}
 	s.mux.Handle(debug.Endpoint, debugHandler)
+
+	apiServer := newAPIV2Server(ctx, s)
+	s.mux.Handle(apiV2Path, apiServer)
 
 	log.Event(ctx, "added http endpoints")
 
@@ -1732,7 +1779,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 
 	// Record that this node joined the cluster in the event log. Since this
 	// executes a SQL query, this must be done after the SQL layer is ready.
-	s.node.recordJoinEvent()
+	s.node.recordJoinEvent(ctx)
 
 	if err := s.sqlServer.preStart(
 		workersCtx,
@@ -1812,12 +1859,20 @@ func (s *Server) startListenRPCAndSQL(
 		}
 		// The SQL listener shutdown worker, which closes everything under
 		// the SQL port when the stopper indicates we are shutting down.
-		s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
+		waitQuiesce := func(ctx context.Context) {
 			<-s.stopper.ShouldQuiesce()
+			// NB: we can't do this as a Closer because (*Server).ServeWith is
+			// running in a worker and usually sits on accept() which unblocks
+			// only when the listener closes. In other words, the listener needs
+			// to close when quiescing starts to allow that worker to shut down.
 			if err := pgL.Close(); err != nil {
-				log.Fatalf(workersCtx, "%v", err)
+				log.Ops.Fatalf(ctx, "%v", err)
 			}
-		})
+		}
+		if err := s.stopper.RunAsyncTask(workersCtx, "wait-quiesce", waitQuiesce); err != nil {
+			waitQuiesce(workersCtx)
+			return nil, nil, err
+		}
 		log.Eventf(ctx, "listening on sql port %s", s.cfg.SQLAddr)
 	}
 
@@ -1848,11 +1903,12 @@ func (s *Server) startListenRPCAndSQL(
 	}
 
 	// The remainder shutdown worker.
-	s.stopper.RunWorker(workersCtx, func(context.Context) {
+	waitForQuiesce := func(context.Context) {
 		<-s.stopper.ShouldQuiesce()
 		// TODO(bdarnell): Do we need to also close the other listeners?
 		netutil.FatalIfUnexpected(anyL.Close())
-		<-s.stopper.ShouldStop()
+	}
+	s.stopper.AddCloser(stop.CloserFn(func() {
 		s.grpc.Stop()
 		serveOnMux.Do(func() {
 			// The cmux matches don't shut down properly unless serve is called on the
@@ -1860,7 +1916,12 @@ func (s *Server) startListenRPCAndSQL(
 			// if we wouldn't otherwise reach the point where we start serving on it.
 			netutil.FatalIfUnexpected(m.Serve())
 		})
-	})
+	}))
+	if err := s.stopper.RunAsyncTask(
+		workersCtx, "grpc-quiesce", waitForQuiesce,
+	); err != nil {
+		return nil, nil, err
+	}
 
 	// startRPCServer starts the RPC server. We do not do this
 	// immediately because we want the cluster to be ready (or ready to
@@ -1868,11 +1929,11 @@ func (s *Server) startListenRPCAndSQL(
 	// (Server.Start) will call this at the right moment.
 	startRPCServer = func(ctx context.Context) {
 		// Serve the gRPC endpoint.
-		s.stopper.RunWorker(workersCtx, func(context.Context) {
+		_ = s.stopper.RunAsyncTask(workersCtx, "serve-grpc", func(context.Context) {
 			netutil.FatalIfUnexpected(s.grpc.Serve(anyL))
 		})
 
-		s.stopper.RunWorker(ctx, func(context.Context) {
+		_ = s.stopper.RunAsyncTask(ctx, "serve-mux", func(context.Context) {
 			serveOnMux.Do(func() {
 				netutil.FatalIfUnexpected(m.Serve())
 			})
@@ -1893,12 +1954,20 @@ func (s *Server) startServeUI(
 
 	// The HTTP listener shutdown worker, which closes everything under
 	// the HTTP port when the stopper indicates we are shutting down.
-	s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
+	waitQuiesce := func(ctx context.Context) {
+		// NB: we can't do this as a Closer because (*Server).ServeWith is
+		// running in a worker and usually sits on accept() which unblocks
+		// only when the listener closes. In other words, the listener needs
+		// to close when quiescing starts to allow that worker to shut down.
 		<-s.stopper.ShouldQuiesce()
 		if err := httpLn.Close(); err != nil {
-			log.Fatalf(workersCtx, "%v", err)
+			log.Ops.Fatalf(ctx, "%v", err)
 		}
-	})
+	}
+	if err := s.stopper.RunAsyncTask(workersCtx, "wait-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(workersCtx)
+		return err
+	}
 
 	if uiTLSConfig != nil {
 		httpMux := cmux.New(httpLn)
@@ -1906,15 +1975,17 @@ func (s *Server) startServeUI(
 		tlsL := httpMux.Match(cmux.Any())
 
 		// Dispatch incoming requests to either clearL or tlsL.
-		s.stopper.RunWorker(workersCtx, func(context.Context) {
+		if err := s.stopper.RunAsyncTask(workersCtx, "serve-ui", func(context.Context) {
 			netutil.FatalIfUnexpected(httpMux.Serve())
-		})
+		}); err != nil {
+			return err
+		}
 
 		// Serve the plain HTTP (non-TLS) connection over clearL.
 		// This produces a HTTP redirect to the `https` URL for the path /,
 		// handles the request normally (via s.ServeHTTP) for the path /health,
 		// and produces 404 for anything else.
-		s.stopper.RunWorker(workersCtx, func(context.Context) {
+		if err := s.stopper.RunAsyncTask(workersCtx, "serve-health", func(context.Context) {
 			mux := http.NewServeMux()
 			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 				http.Redirect(w, r, "https://"+r.Host+r.RequestURI, http.StatusTemporaryRedirect)
@@ -1924,7 +1995,9 @@ func (s *Server) startServeUI(
 			plainRedirectServer := netutil.MakeServer(s.stopper, uiTLSConfig, mux)
 
 			netutil.FatalIfUnexpected(plainRedirectServer.Serve(clearL))
-		})
+		}); err != nil {
+			return err
+		}
 
 		httpLn = tls.NewListener(tlsL, uiTLSConfig)
 	}
@@ -1933,22 +2006,20 @@ func (s *Server) startServeUI(
 	// listening on --http-addr without TLS if uiTLSConfig was
 	// nil, or overridden above if uiTLSConfig was not nil to come from
 	// the TLS negotiation over the HTTP port.
-	s.stopper.RunWorker(workersCtx, func(context.Context) {
+	return s.stopper.RunAsyncTask(workersCtx, "server-http", func(context.Context) {
 		netutil.FatalIfUnexpected(connManager.Serve(httpLn))
 	})
-
-	return nil
 }
 
 // TODO(tbg): move into server_sql.go.
-func (s *sqlServer) startServeSQL(
+func (s *SQLServer) startServeSQL(
 	ctx context.Context,
 	stopper *stop.Stopper,
 	connManager netutil.Server,
 	pgL net.Listener,
 	socketFile string,
 ) error {
-	log.Info(ctx, "serving sql connections")
+	log.Ops.Info(ctx, "serving sql connections")
 	// Start servicing SQL connections.
 
 	pgCtx := s.pgServer.AmbientCtx.AnnotateCtx(context.Background())
@@ -1956,20 +2027,20 @@ func (s *sqlServer) startServeSQL(
 		tcpKeepAlive: envutil.EnvOrDefaultDuration("COCKROACH_SQL_TCP_KEEP_ALIVE", time.Minute),
 	}
 
-	stopper.RunWorker(pgCtx, func(pgCtx context.Context) {
+	_ = stopper.RunAsyncTask(pgCtx, "serve-conn", func(pgCtx context.Context) {
 		netutil.FatalIfUnexpected(connManager.ServeWith(pgCtx, stopper, pgL, func(conn net.Conn) {
-			connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
+			connCtx := s.pgServer.AnnotateCtxForIncomingConn(pgCtx, conn)
 			tcpKeepAlive.configure(connCtx, conn)
 
 			if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketTCP); err != nil {
-				log.Errorf(connCtx, "serving SQL client conn: %v", err)
+				log.Ops.Errorf(connCtx, "serving SQL client conn: %v", err)
 			}
 		}))
 	})
 
 	// If a unix socket was requested, start serving there too.
 	if len(socketFile) != 0 {
-		log.Infof(ctx, "starting postgres server at unix:%s", socketFile)
+		log.Ops.Infof(ctx, "starting postgres server at unix:%s", socketFile)
 
 		// Unix socket enabled: postgres protocol only.
 		unixLn, err := net.Listen("unix", socketFile)
@@ -1977,22 +2048,37 @@ func (s *sqlServer) startServeSQL(
 			return err
 		}
 
-		stopper.RunWorker(ctx, func(workersCtx context.Context) {
+		waitQuiesce := func(ctx context.Context) {
 			<-stopper.ShouldQuiesce()
+			// NB: we can't do this as a Closer because (*Server).ServeWith is
+			// running in a worker and usually sits on accept() which unblocks
+			// only when the listener closes. In other words, the listener needs
+			// to close when quiescing starts to allow that worker to shut down.
 			if err := unixLn.Close(); err != nil {
-				log.Fatalf(workersCtx, "%v", err)
+				log.Ops.Fatalf(ctx, "%v", err)
 			}
-		})
+		}
+		if err := stopper.RunAsyncTask(ctx, "unix-ln-close", func(ctx context.Context) {
+			waitQuiesce(ctx)
+		}); err != nil {
+			waitQuiesce(ctx)
+			return err
+		}
 
-		stopper.RunWorker(pgCtx, func(pgCtx context.Context) {
+		if err := stopper.RunAsyncTask(pgCtx, "unix-ln-serve", func(pgCtx context.Context) {
 			netutil.FatalIfUnexpected(connManager.ServeWith(pgCtx, stopper, unixLn, func(conn net.Conn) {
-				connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
+				connCtx := s.pgServer.AnnotateCtxForIncomingConn(pgCtx, conn)
 				if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketUnix); err != nil {
-					log.Errorf(connCtx, "%v", err)
+					log.Ops.Errorf(connCtx, "%v", err)
 				}
 			}))
-		})
+		}); err != nil {
+			return err
+		}
 	}
+
+	s.acceptingClients.Set(true)
+
 	return nil
 }
 
@@ -2000,7 +2086,7 @@ func (s *sqlServer) startServeSQL(
 func (s *Server) Decommission(
 	ctx context.Context, targetStatus livenesspb.MembershipStatus, nodeIDs []roachpb.NodeID,
 ) error {
-	if !s.st.Version.IsActive(ctx, clusterversion.VersionNodeMembershipStatus) {
+	if !s.st.Version.IsActive(ctx, clusterversion.NodeMembershipStatus) {
 		if targetStatus.Decommissioned() {
 			// In mixed-version cluster settings, we need to ensure that we're
 			// on-the-wire compatible with nodes only familiar with the boolean
@@ -2011,17 +2097,25 @@ func (s *Server) Decommission(
 		}
 	}
 
-	eventLogger := sql.MakeEventLogger(s.sqlServer.execCfg)
-	var eventType sql.EventLogType
+	var event eventpb.EventPayload
+	var nodeDetails *eventpb.CommonNodeDecommissionDetails
 	if targetStatus.Decommissioning() {
-		eventType = sql.EventLogNodeDecommissioning
+		ev := &eventpb.NodeDecommissioning{}
+		nodeDetails = &ev.CommonNodeDecommissionDetails
+		event = ev
 	} else if targetStatus.Decommissioned() {
-		eventType = sql.EventLogNodeDecommissioned
+		ev := &eventpb.NodeDecommissioned{}
+		nodeDetails = &ev.CommonNodeDecommissionDetails
+		event = ev
 	} else if targetStatus.Active() {
-		eventType = sql.EventLogNodeRecommissioned
+		ev := &eventpb.NodeRecommissioned{}
+		nodeDetails = &ev.CommonNodeDecommissionDetails
+		event = ev
 	} else {
 		panic("unexpected target membership status")
 	}
+	event.CommonDetails().Timestamp = timeutil.Now().UnixNano()
+	nodeDetails.RequestingNodeID = int32(s.NodeID())
 
 	for _, nodeID := range nodeIDs {
 		statusChanged, err := s.nodeLiveness.SetMembershipStatus(ctx, nodeID, targetStatus)
@@ -2032,6 +2126,10 @@ func (s *Server) Decommission(
 			return err
 		}
 		if statusChanged {
+			nodeDetails.TargetNodeID = int32(nodeID)
+			// Ensure an entry is produced in the external log in all cases.
+			log.StructuredEvent(ctx, event)
+
 			// If we die right now or if this transaction fails to commit, the
 			// membership event will not be recorded to the event log. While we
 			// could insert the event record in the same transaction as the liveness
@@ -2039,11 +2137,29 @@ func (s *Server) Decommission(
 			// the node liveness range. Better to make the event logging best effort
 			// than to slow down future node liveness transactions.
 			if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				return eventLogger.InsertEventRecord(
-					ctx, txn, eventType, int32(nodeID), int32(s.NodeID()), struct{}{},
+				return sql.InsertEventRecord(
+					ctx,
+					s.sqlServer.execCfg.InternalExecutor,
+					txn,
+					int32(nodeID), int32(s.NodeID()),
+					true, /* skipExternalLog - we already call log.StructuredEvent above */
+					event,
+					false, /* onlyLog */
 				)
 			}); err != nil {
-				log.Errorf(ctx, "unable to record %s event for node %d: %s", eventType, nodeID, err)
+				log.Ops.Errorf(ctx, "unable to record event: %+v: %+v", event, err)
+			}
+		}
+
+		// Similarly to the log event above, we may not be able to clean up the
+		// status entry if we crash or fail -- the status entry is inline, and
+		// thus cannot be transactional. However, since decommissioning is
+		// idempotent, we can attempt to remove the key regardless of whether
+		// the status changed, such that a stale key can be removed by
+		// decommissioning the node again.
+		if targetStatus.Decommissioned() {
+			if err := s.db.PutInline(ctx, keys.NodeStatusKey(nodeID), nil); err != nil {
+				log.Errorf(ctx, "unable to clean up node status data for node %d: %s", nodeID, err)
 			}
 		}
 	}
@@ -2121,7 +2237,7 @@ func startSampleEnvironment(ctx context.Context, cfg sampleEnvironmentCfg) error
 		}
 	}
 
-	cfg.stopper.RunWorker(ctx, func(ctx context.Context) {
+	return cfg.stopper.RunAsyncTask(ctx, "mem-logger", func(ctx context.Context) {
 		var goMemStats atomic.Value // *status.GoMemStats
 		goMemStats.Store(&status.GoMemStats{})
 		var collectingMemStats int32 // atomic, 1 when stats call is ongoing
@@ -2132,7 +2248,7 @@ func startSampleEnvironment(ctx context.Context, cfg sampleEnvironmentCfg) error
 
 		for {
 			select {
-			case <-cfg.stopper.ShouldStop():
+			case <-cfg.stopper.ShouldQuiesce():
 				return
 			case <-timer.C:
 				timer.Read = true
@@ -2181,7 +2297,6 @@ func startSampleEnvironment(ctx context.Context, cfg sampleEnvironmentCfg) error
 			}
 		}
 	})
-	return nil
 }
 
 // Stop stops the server.
@@ -2214,7 +2329,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// which results in a 304 Not Modified.
 			if err := gzw.Close(); err != nil && !errors.Is(err, http.ErrBodyNotAllowed) {
 				ctx := s.AnnotateCtx(r.Context())
-				log.Warningf(ctx, "error closing gzip response writer: %v", err)
+				log.Ops.Warningf(ctx, "error closing gzip response writer: %v", err)
 			}
 		}()
 		w = gzw
@@ -2231,6 +2346,14 @@ func (s *Server) TempDir() string {
 // PGServer exports the pgwire server. Used by tests.
 func (s *Server) PGServer() *pgwire.Server {
 	return s.sqlServer.pgServer
+}
+
+// StartDiagnostics starts periodic diagnostics reporting and update checking.
+// NOTE: This is not called in PreStart so that it's disabled by default for
+// testing.
+func (s *Server) StartDiagnostics(ctx context.Context) {
+	s.updates.PeriodicallyCheckForUpdates(ctx, s.stopper)
+	s.sqlServer.StartDiagnostics(ctx)
 }
 
 // TODO(benesch): Use https://github.com/NYTimes/gziphandler instead.
@@ -2312,14 +2435,14 @@ func (k *tcpKeepAliveManager) configure(ctx context.Context, conn net.Conn) {
 	doLog := atomic.CompareAndSwapInt32(&k.loggedKeepAliveStatus, 0, 1)
 	if err := tcpConn.SetKeepAlive(true); err != nil {
 		if doLog {
-			log.Warningf(ctx, "failed to enable TCP keep-alive for pgwire: %v", err)
+			log.Ops.Warningf(ctx, "failed to enable TCP keep-alive for pgwire: %v", err)
 		}
 		return
 
 	}
 	if err := tcpConn.SetKeepAlivePeriod(k.tcpKeepAlive); err != nil {
 		if doLog {
-			log.Warningf(ctx, "failed to set TCP keep-alive duration for pgwire: %v", err)
+			log.Ops.Warningf(ctx, "failed to set TCP keep-alive duration for pgwire: %v", err)
 		}
 		return
 	}

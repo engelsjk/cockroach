@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
@@ -32,7 +33,8 @@ type reassignOwnedByNode struct {
 
 func (p *planner) ReassignOwnedBy(ctx context.Context, n *tree.ReassignOwnedBy) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"REASSIGN OWNED BY",
 	); err != nil {
 		return nil, err
@@ -55,14 +57,15 @@ func (p *planner) ReassignOwnedBy(ctx context.Context, n *tree.ReassignOwnedBy) 
 func (n *reassignOwnedByNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.CreateReassignOwnedByCounter())
 
-	allDescs, err := params.p.Descriptors().GetAllDescriptors(params.ctx, params.p.txn, true /* validate */)
+	allDescs, err := params.p.Descriptors().GetAllDescriptors(params.ctx, params.p.txn)
 	if err != nil {
 		return err
 	}
 
 	// Filter for all objects in current database.
 	currentDatabase := params.p.CurrentDatabase()
-	currentDbDesc, err := params.p.ResolveMutableDatabaseDescriptor(params.ctx, currentDatabase, true)
+	_, currentDbDesc, err := params.p.Descriptors().GetMutableDatabaseByName(
+		params.ctx, params.p.txn, currentDatabase, tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return err
 	}
@@ -148,10 +151,10 @@ func (n *reassignOwnedByNode) reassignSchemaOwner(
 }
 
 func (n *reassignOwnedByNode) reassignTableOwner(
-	tbDesc *tabledesc.Immutable, params runParams,
+	tbDesc catalog.TableDescriptor, params runParams,
 ) error {
 	mutableTbDesc, err := params.p.Descriptors().GetMutableDescriptorByID(
-		params.ctx, tbDesc.ID, params.p.txn)
+		params.ctx, tbDesc.GetID(), params.p.txn)
 	if err != nil {
 		return err
 	}

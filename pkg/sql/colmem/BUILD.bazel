@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "colmem",
@@ -13,7 +13,23 @@ go_library(
         "//pkg/sql/types",
         "//pkg/util/duration",
         "//pkg/util/mon",
-        "//vendor/github.com/cockroachdb/apd/v2:apd",
-        "//vendor/github.com/cockroachdb/errors",
+        "@com_github_cockroachdb_apd_v2//:apd",
+        "@com_github_cockroachdb_errors//:errors",
+    ],
+)
+
+go_test(
+    name = "colmem_test",
+    srcs = ["allocator_test.go"],
+    deps = [
+        ":colmem",
+        "//pkg/col/coldata",
+        "//pkg/col/coldataext",
+        "//pkg/settings/cluster",
+        "//pkg/sql/colexecbase/colexecerror",
+        "//pkg/sql/execinfra",
+        "//pkg/sql/sem/tree",
+        "//pkg/sql/types",
+        "@com_github_stretchr_testify//require",
     ],
 )

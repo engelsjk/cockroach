@@ -19,9 +19,11 @@
   border solid 1px transparent
   background-color transparent
   color $colors--primary-blue-3
+  fill $colors--primary-blue-3
 
   &:hover
     color $colors--primary-blue-4
+    fill $colors--primary-blue-4
 
   &:active
     border solid 2px $colors--primary-blue-1
@@ -32,6 +34,7 @@
 
   &.crl-button--disabled
     color $colors--neutral-4
+    fill $colors--neutral-4
     pointer-events none
     cursor default
 
@@ -43,13 +46,14 @@
     line-height 22px
     letter-spacing 0.1px
     color $colors--neutral-7
+    fill $colors--neutral-7
     &:hover
       text-decoration underline
 
 .crl-button--type-primary
-  background-color $colors--primary-green-3
+  background-color $colors--primary-purple-3
   color $colors--white
-  border solid 1px $colors--primary-green-3
+  border solid 1px $colors--primary-purple-3
 
   &:hover
     color $colors--white
@@ -62,8 +66,8 @@
     border solid 1px $colors--primary-green-4
 
   &.crl-button--disabled
-    border solid 1px #c4e6ba
-    background #c4e6ba
+    border solid 1px $colors--primary-purple-2 
+    background $colors--primary-purple-2 
     color $colors--white
     pointer-events none
     cursor default

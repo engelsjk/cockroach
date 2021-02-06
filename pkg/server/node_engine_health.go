@@ -29,7 +29,7 @@ func (n *Node) startAssertEngineHealth(
 ) {
 	maxSyncDuration := storage.MaxSyncDuration.Get(&settings.SV)
 	fatalOnExceeded := storage.MaxSyncDurationFatalOnExceeded.Get(&settings.SV)
-	n.stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = n.stopper.RunAsyncTask(ctx, "engine-health", func(ctx context.Context) {
 		t := timeutil.NewTimer()
 		t.Reset(0)
 
@@ -48,7 +48,7 @@ func (n *Node) startAssertEngineHealth(
 
 func guaranteedExitFatal(ctx context.Context, msg string, args ...interface{}) {
 	// NB: log.Shout sets up a timer that guarantees process termination.
-	log.Shoutf(ctx, severity.FATAL, msg, args...)
+	log.Health.Shoutf(ctx, severity.FATAL, msg, args...)
 }
 
 func (n *Node) assertEngineHealth(

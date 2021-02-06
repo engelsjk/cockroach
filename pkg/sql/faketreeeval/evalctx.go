@@ -14,6 +14,7 @@ package faketreeeval
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -68,10 +69,25 @@ func (so *DummySequenceOperators) IncrementSequence(
 	return 0, errors.WithStack(errSequenceOperators)
 }
 
+// IncrementSequenceByID is part of the tree.SequenceOperators interface.
+func (so *DummySequenceOperators) IncrementSequenceByID(
+	ctx context.Context, seqID int64,
+) (int64, error) {
+	return 0, errors.WithStack(errSequenceOperators)
+}
+
 // GetLatestValueInSessionForSequence implements the tree.SequenceOperators
 // interface.
 func (so *DummySequenceOperators) GetLatestValueInSessionForSequence(
 	ctx context.Context, seqName *tree.TableName,
+) (int64, error) {
+	return 0, errors.WithStack(errSequenceOperators)
+}
+
+// GetLatestValueInSessionForSequenceByID implements the tree.SequenceOperators
+// interface.
+func (so *DummySequenceOperators) GetLatestValueInSessionForSequenceByID(
+	ctx context.Context, seqID int64,
 ) (int64, error) {
 	return 0, errors.WithStack(errSequenceOperators)
 }
@@ -83,19 +99,28 @@ func (so *DummySequenceOperators) SetSequenceValue(
 	return errors.WithStack(errSequenceOperators)
 }
 
+// SetSequenceValueByID implements the tree.SequenceOperators interface.
+func (so *DummySequenceOperators) SetSequenceValueByID(
+	ctx context.Context, seqID int64, newVal int64, isCalled bool,
+) error {
+	return errors.WithStack(errSequenceOperators)
+}
+
 // DummyEvalPlanner implements the tree.EvalPlanner interface by returning
 // errors.
 type DummyEvalPlanner struct{}
 
 // UnsafeUpsertDescriptor is part of the EvalPlanner interface.
 func (ep *DummyEvalPlanner) UnsafeUpsertDescriptor(
-	ctx context.Context, descID int64, encodedDescriptor []byte,
+	ctx context.Context, descID int64, encodedDescriptor []byte, force bool,
 ) error {
 	return errors.WithStack(errEvalPlanner)
 }
 
 // UnsafeDeleteDescriptor is part of the EvalPlanner interface.
-func (ep *DummyEvalPlanner) UnsafeDeleteDescriptor(ctx context.Context, descID int64) error {
+func (ep *DummyEvalPlanner) UnsafeDeleteDescriptor(
+	ctx context.Context, descID int64, force bool,
+) error {
 	return errors.WithStack(errEvalPlanner)
 }
 
@@ -108,9 +133,23 @@ func (ep *DummyEvalPlanner) UnsafeUpsertNamespaceEntry(
 
 // UnsafeDeleteNamespaceEntry is part of the EvalPlanner interface.
 func (ep *DummyEvalPlanner) UnsafeDeleteNamespaceEntry(
-	ctx context.Context, parentID, parentSchemaID int64, name string, descID int64,
+	ctx context.Context, parentID, parentSchemaID int64, name string, descID int64, force bool,
 ) error {
 	return errors.WithStack(errEvalPlanner)
+}
+
+// CompactEngineSpan is part of the EvalPlanner interface.
+func (ep *DummyEvalPlanner) CompactEngineSpan(
+	ctx context.Context, nodeID int32, storeID int32, startKey []byte, endKey []byte,
+) error {
+	return errors.WithStack(errEvalPlanner)
+}
+
+// MemberOfWithAdminOption is part of the EvalPlanner interface.
+func (ep *DummyEvalPlanner) MemberOfWithAdminOption(
+	ctx context.Context, member security.SQLUsername,
+) (map[security.SQLUsername]bool, error) {
+	return nil, errors.WithStack(errEvalPlanner)
 }
 
 var _ tree.EvalPlanner = &DummyEvalPlanner{}
@@ -137,8 +176,8 @@ func (ep *DummyEvalPlanner) ResolveTableName(
 	return 0, errors.WithStack(errEvalPlanner)
 }
 
-// ParseType is part of the tree.EvalPlanner interface.
-func (ep *DummyEvalPlanner) ParseType(sql string) (*types.T, error) {
+// GetTypeFromValidSQLSyntax is part of the tree.EvalPlanner interface.
+func (ep *DummyEvalPlanner) GetTypeFromValidSQLSyntax(sql string) (*types.T, error) {
 	return nil, errors.WithStack(errEvalPlanner)
 }
 

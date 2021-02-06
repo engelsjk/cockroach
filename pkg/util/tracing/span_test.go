@@ -11,16 +11,15 @@
 package tracing
 
 import (
-	"context"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
+	"github.com/gogo/protobuf/types"
 	"github.com/opentracing/opentracing-go"
-	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,8 +28,8 @@ func TestRecordingString(t *testing.T) {
 	tr2 := NewTracer()
 
 	root := tr.StartSpan("root", WithForceRealSpan())
-	root.StartRecording(SnowballRecording)
-	root.LogFields(otlog.String(tracingpb.LogMessageField, "root 1"))
+	root.SetVerbose(true)
+	root.Record("root 1")
 	// Hackily fix the timing on the first log message, so that we can check it later.
 	root.crdb.mu.recording.recordedLogs[0].Timestamp = root.crdb.startTime.Add(time.Millisecond)
 	// Sleep a bit so that everything that comes afterwards has higher timestamps
@@ -42,8 +41,8 @@ func TestRecordingString(t *testing.T) {
 	require.NoError(t, err)
 	wireContext, err := tr2.Extract(opentracing.HTTPHeaders, carrier)
 	remoteChild := tr2.StartSpan("remote child", WithParentAndManualCollection(wireContext))
-	root.LogFields(otlog.String(tracingpb.LogMessageField, "root 2"))
-	remoteChild.LogFields(otlog.String(tracingpb.LogMessageField, "remote child 1"))
+	root.Record("root 2")
+	remoteChild.Record("remote child 1")
 	require.NoError(t, err)
 	remoteChild.Finish()
 	remoteRec := remoteChild.GetRecording()
@@ -51,14 +50,14 @@ func TestRecordingString(t *testing.T) {
 	require.NoError(t, err)
 	root.Finish()
 
-	root.LogFields(otlog.String(tracingpb.LogMessageField, "root 3"))
+	root.Record("root 3")
 
 	ch2 := tr.StartSpan("local child", WithParentAndAutoCollection(root))
-	root.LogFields(otlog.String(tracingpb.LogMessageField, "root 4"))
-	ch2.LogFields(otlog.String(tracingpb.LogMessageField, "local child 1"))
+	root.Record("root 4")
+	ch2.Record("local child 1")
 	ch2.Finish()
 
-	root.LogFields(otlog.String(tracingpb.LogMessageField, "root 5"))
+	root.Record("root 5")
 	root.Finish()
 
 	rec := root.GetRecording()
@@ -66,28 +65,28 @@ func TestRecordingString(t *testing.T) {
 	// its String() representation; this just list all the spans in order.
 	err = TestingCheckRecordedSpans(rec, `
 Span root:
-	tags: sb=1
+	tags: _verbose=1
 	event: root 1
 	event: root 2
 	event: root 3
 	event: root 4
 	event: root 5
 Span remote child:
-	tags: sb=1
+	tags: _verbose=1
 	event: remote child 1
 Span local child:
-	tags: sb=1
+	tags: _verbose=1
 	event: local child 1
 `)
 	require.NoError(t, err)
 
-	exp := `=== operation:root sb:1
+	exp := `=== operation:root _verbose:1
 event:root 1
-    === operation:remote child sb:1
+    === operation:remote child _verbose:1
     event:remote child 1
 event:root 2
 event:root 3
-    === operation:local child sb:1
+    === operation:local child _verbose:1
     event:local child 1
 event:root 4
 event:root 5
@@ -101,7 +100,7 @@ event:root 5
 	require.Equal(t, traceLine{
 		timeSinceTraceStart: "0.000ms",
 		timeSincePrev:       "0.000ms",
-		text:                "=== operation:root sb:1",
+		text:                "=== operation:root _verbose:1",
 	}, l)
 	l, err = parseLine(lines[1])
 	require.Equal(t, traceLine{
@@ -147,9 +146,9 @@ func TestRecordingInRecording(t *testing.T) {
 	tr := NewTracer()
 
 	root := tr.StartSpan("root", WithForceRealSpan())
-	root.StartRecording(SnowballRecording)
+	root.SetVerbose(true)
 	child := tr.StartSpan("child", WithParentAndAutoCollection(root), WithForceRealSpan())
-	child.StartRecording(SnowballRecording)
+	child.SetVerbose(true)
 	// The remote grandchild is also recording, however since it's remote the spans
 	// have to be imported into the parent manually (this would usually happen via
 	// code at the RPC boundaries).
@@ -162,39 +161,72 @@ func TestRecordingInRecording(t *testing.T) {
 	rootRec := root.GetRecording()
 	require.NoError(t, TestingCheckRecordedSpans(rootRec, `
 Span root:
-	tags: sb=1
+	tags: _verbose=1
 Span child:
-	tags: sb=1
+	tags: _verbose=1
 Span grandchild:
-	tags: sb=1
+	tags: _verbose=1
 `))
 
 	childRec := child.GetRecording()
 	require.NoError(t, TestingCheckRecordedSpans(childRec, `
 Span child:
-	tags: sb=1
+	tags: _verbose=1
 Span grandchild:
-	tags: sb=1
+	tags: _verbose=1
 `))
 
-	exp := `=== operation:child sb:1
-    === operation:grandchild sb:1
+	exp := `=== operation:child _verbose:1
+    === operation:grandchild _verbose:1
 `
 	require.Equal(t, exp, recToStrippedString(childRec))
 }
 
-func TestChildSpan(t *testing.T) {
+func TestSpan_LogStructured(t *testing.T) {
 	tr := NewTracer()
-	// Set up non-recording span.
-	sp := tr.StartSpan("foo", WithForceRealSpan())
-	ctx := ContextWithSpan(context.Background(), sp)
-	// Since the parent span was not recording, we would expect the
-	// noop span back. However - we don't, we get our inputs instead.
-	// This is a performance optimization; there is a to-do in
-	// childSpan asking for its removal, but for now it's here to stay.
-	{
-		newCtx, newSp := ChildSpan(ctx, "foo")
-		require.Equal(t, ctx, newCtx)
-		require.Equal(t, sp, newSp)
+	tr._mode = int32(modeBackground)
+	sp := tr.StartSpan("root", WithForceRealSpan())
+	defer sp.Finish()
+
+	sp.LogStructured(&types.Int32Value{Value: 4})
+	rec := sp.GetRecording()
+	require.Len(t, rec, 1)
+	require.Len(t, rec[0].InternalStructured, 1)
+	item := rec[0].InternalStructured[0]
+	var d1 types.DynamicAny
+	require.NoError(t, types.UnmarshalAny(item, &d1))
+	require.IsType(t, (*types.Int32Value)(nil), d1.Message)
+}
+
+func TestNonVerboseChildSpanRegisteredWithParent(t *testing.T) {
+	tr := NewTracer()
+	tr._mode = int32(modeBackground)
+	sp := tr.StartSpan("root", WithForceRealSpan())
+	defer sp.Finish()
+	ch := tr.StartSpan("child", WithParentAndAutoCollection(sp), WithForceRealSpan())
+	defer ch.Finish()
+	require.Len(t, sp.crdb.mu.recording.children, 1)
+	require.Equal(t, ch.crdb, sp.crdb.mu.recording.children[0])
+	ch.LogStructured(&types.Int32Value{Value: 5})
+	// Check that the child span (incl its payload) is in the recording.
+	rec := sp.GetRecording()
+	require.Len(t, rec, 2)
+	require.Len(t, rec[1].InternalStructured, 1)
+}
+
+// TestSpanMaxChildren verifies that a Span can
+// track at most maxChildrenPerSpan direct children.
+func TestSpanMaxChildren(t *testing.T) {
+	tr := NewTracer()
+	sp := tr.StartSpan("root", WithForceRealSpan())
+	defer sp.Finish()
+	for i := 0; i < maxChildrenPerSpan+123; i++ {
+		ch := tr.StartSpan(fmt.Sprintf("child %d", i), WithParentAndAutoCollection(sp), WithForceRealSpan())
+		ch.Finish()
+		exp := i + 1
+		if exp > maxChildrenPerSpan {
+			exp = maxChildrenPerSpan
+		}
+		require.Len(t, sp.crdb.mu.recording.children, exp)
 	}
 }

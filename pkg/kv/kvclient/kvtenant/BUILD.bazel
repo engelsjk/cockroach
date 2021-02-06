@@ -10,11 +10,12 @@ go_library(
         "//pkg/config/zonepb",
         "//pkg/keys",
         "//pkg/kv/kvclient/kvcoord",
+        "//pkg/kv/kvclient/rangecache",
         "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/rpc/nodedialer",
         "//pkg/util/log",
         "//pkg/util/retry",
-        "//vendor/github.com/cockroachdb/errors",
+        "@com_github_cockroachdb_errors//:errors",
     ],
 )

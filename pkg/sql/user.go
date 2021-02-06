@@ -111,7 +111,8 @@ func retrieveUserAndPassword(
 
 	// Perform the lookup with a timeout.
 	err = runFn(func(ctx context.Context) error {
-		const getHashedPassword = `SELECT "hashedPassword" FROM system.users ` +
+		// Use fully qualified table name to avoid looking up "".system.users.
+		const getHashedPassword = `SELECT "hashedPassword" FROM system.public.users ` +
 			`WHERE username=$1`
 		values, err := ie.QueryRowEx(
 			ctx, "get-hashed-pwd", nil, /* txn */
@@ -131,7 +132,8 @@ func retrieveUserAndPassword(
 			return nil
 		}
 
-		getLoginDependencies := `SELECT option, value FROM system.role_options ` +
+		// Use fully qualified table name to avoid looking up "".system.role_options.
+		getLoginDependencies := `SELECT option, value FROM system.public.role_options ` +
 			`WHERE username=$1 AND option IN ('NOLOGIN', 'VALID UNTIL')`
 
 		loginDependencies, err := ie.QueryEx(
@@ -181,11 +183,12 @@ func retrieveUserAndPassword(
 	return exists, canLogin, hashedPassword, validUntil, err
 }
 
-var userLoginTimeout = settings.RegisterPublicNonNegativeDurationSetting(
+var userLoginTimeout = settings.RegisterDurationSetting(
 	"server.user_login.timeout",
 	"timeout after which client authentication times out if some system range is unavailable (0 = no timeout)",
 	10*time.Second,
-)
+	settings.NonNegativeDuration,
+).WithPublic()
 
 // GetAllRoles returns a "set" (map) of Roles -> true.
 func (p *planner) GetAllRoles(ctx context.Context) (map[security.SQLUsername]bool, error) {

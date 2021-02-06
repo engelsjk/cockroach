@@ -11,8 +11,8 @@
 package cli
 
 import (
+	"bytes"
 	"context"
-	"flag"
 	"fmt"
 	"math/rand"
 	"os"
@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	// intentionally not all the workloads in pkg/ccl/workloadccl/allccl
 	_ "github.com/cockroachdb/cockroach/pkg/workload/bank"       // registers workloads
@@ -51,23 +50,14 @@ func Main() {
 		os.Args = append(os.Args, "help")
 	}
 
-	// Change the logging defaults for the main cockroach binary.
-	// The value is overridden after command-line parsing.
-	if err := flag.Lookup(logflags.LogToStderrName).Value.Set("NONE"); err != nil {
-		panic(err)
-	}
+	// We ignore the error in this lookup, because
+	// we want cobra to handle lookup errors with a verbose
+	// help message in Run() below.
+	cmd, _, _ := cockroachCmd.Find(os.Args[1:])
 
-	cmdName := commandName(os.Args[1:])
+	cmdName := commandName(cmd)
 
-	logcrash.SetupCrashReporter(
-		context.Background(),
-		cmdName,
-	)
-
-	defer logcrash.RecoverAndReportPanic(context.Background(), &serverCfg.Settings.SV)
-
-	err := Run(os.Args[1:])
-
+	err := doMain(cmd, cmdName)
 	errCode := exit.Success()
 	if err != nil {
 		// Display the error and its details/hints.
@@ -88,15 +78,51 @@ func Main() {
 	exit.WithCode(errCode)
 }
 
+func doMain(cmd *cobra.Command, cmdName string) error {
+	if cmd != nil && !cmdHasCustomLoggingSetup(cmd) {
+		// the customLoggingSetupCmds do their own calls to setupLogging().
+		if err := setupLogging(context.Background(), cmd,
+			false /* isServerCmd */, true /* applyConfig */); err != nil {
+			return err
+		}
+	}
+
+	logcrash.SetupCrashReporter(
+		context.Background(),
+		cmdName,
+	)
+
+	defer logcrash.RecoverAndReportPanic(context.Background(), &serverCfg.Settings.SV)
+
+	return Run(os.Args[1:])
+}
+
+func cmdHasCustomLoggingSetup(thisCmd *cobra.Command) bool {
+	if thisCmd == nil {
+		return false
+	}
+	for _, cmd := range customLoggingSetupCmds {
+		if cmd == thisCmd {
+			return true
+		}
+	}
+	hasCustomLogging := false
+	thisCmd.VisitParents(func(parent *cobra.Command) {
+		for _, cmd := range customLoggingSetupCmds {
+			if cmd == parent {
+				hasCustomLogging = true
+			}
+		}
+	})
+	return hasCustomLogging
+}
+
 // commandName computes the name of the command that args would invoke. For
 // example, the full name of "cockroach debug zip" is "debug zip". If args
 // specify a nonexistent command, commandName returns "cockroach".
-func commandName(args []string) string {
+func commandName(cmd *cobra.Command) string {
 	rootName := cockroachCmd.CommandPath()
-	// Ask Cobra to find the command so that flags and their arguments are
-	// ignored. The name of "cockroach --log-dir foo start" is "start", not
-	// "--log-dir" or "foo".
-	if cmd, _, _ := cockroachCmd.Find(os.Args[1:]); cmd != nil {
+	if cmd != nil {
 		return strings.TrimPrefix(cmd.CommandPath(), rootName+" ")
 	}
 	return rootName
@@ -137,22 +163,34 @@ Output build version information.
 `,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		info := build.GetInfo()
-		tw := tabwriter.NewWriter(os.Stdout, 2, 1, 2, ' ', 0)
-		fmt.Fprintf(tw, "Build Tag:        %s\n", info.Tag)
-		fmt.Fprintf(tw, "Build Time:       %s\n", info.Time)
-		fmt.Fprintf(tw, "Distribution:     %s\n", info.Distribution)
-		fmt.Fprintf(tw, "Platform:         %s", info.Platform)
-		if info.CgoTargetTriple != "" {
-			fmt.Fprintf(tw, " (%s)", info.CgoTargetTriple)
+		if cliCtx.showVersionUsingOnlyBuildTag {
+			info := build.GetInfo()
+			fmt.Println(info.Tag)
+		} else {
+			fmt.Println(fullVersionString())
 		}
-		fmt.Fprintln(tw)
-		fmt.Fprintf(tw, "Go Version:       %s\n", info.GoVersion)
-		fmt.Fprintf(tw, "C Compiler:       %s\n", info.CgoCompiler)
-		fmt.Fprintf(tw, "Build Commit ID:  %s\n", info.Revision)
-		fmt.Fprintf(tw, "Build Type:       %s\n", info.Type)
-		return tw.Flush()
+		return nil
 	},
+}
+
+func fullVersionString() string {
+	info := build.GetInfo()
+	var buf bytes.Buffer
+	tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
+	fmt.Fprintf(tw, "Build Tag:        %s\n", info.Tag)
+	fmt.Fprintf(tw, "Build Time:       %s\n", info.Time)
+	fmt.Fprintf(tw, "Distribution:     %s\n", info.Distribution)
+	fmt.Fprintf(tw, "Platform:         %s", info.Platform)
+	if info.CgoTargetTriple != "" {
+		fmt.Fprintf(tw, " (%s)", info.CgoTargetTriple)
+	}
+	fmt.Fprintln(tw)
+	fmt.Fprintf(tw, "Go Version:       %s\n", info.GoVersion)
+	fmt.Fprintf(tw, "C Compiler:       %s\n", info.CgoCompiler)
+	fmt.Fprintf(tw, "Build Commit ID:  %s\n", info.Revision)
+	fmt.Fprintf(tw, "Build Type:       %s", info.Type) // No final newline: cobra prints one for us.
+	_ = tw.Flush()
+	return buf.String()
 }
 
 var cockroachCmd = &cobra.Command{
@@ -171,7 +209,13 @@ var cockroachCmd = &cobra.Command{
 	// details and hints, which cobra does not do for us. Instead
 	// we do the printing in Main().
 	SilenceErrors: true,
+	// Version causes cobra to automatically support a --version flag
+	// that reports this string.
+	Version: "details:\n" + fullVersionString() +
+		"\n(use '" + os.Args[0] + " version --build-tag' to display only the build tag)",
 }
+
+var workloadCmd = workloadcli.WorkloadCmd(true /* userFacing */)
 
 func init() {
 	cobra.EnableCommandSorting = false
@@ -210,9 +254,33 @@ func init() {
 		versionCmd,
 		DebugCmd,
 		sqlfmtCmd,
-		workloadcli.WorkloadCmd(true /* userFacing */),
+		workloadCmd,
 		systemBenchCmd,
 	)
+}
+
+// isWorkloadCmd returns true iff cmd is a sub-command of 'workload'.
+func isWorkloadCmd(cmd *cobra.Command) bool {
+	return hasParentCmd(cmd, workloadCmd)
+}
+
+// isDemoCmd returns true iff cmd is a sub-command of `demo`.
+func isDemoCmd(cmd *cobra.Command) bool {
+	return hasParentCmd(cmd, demoCmd)
+}
+
+// hasParentCmd returns true iff cmd is a sub-command of refParent.
+func hasParentCmd(cmd, refParent *cobra.Command) bool {
+	if cmd == refParent {
+		return true
+	}
+	hasParent := false
+	cmd.VisitParents(func(thisParent *cobra.Command) {
+		if thisParent == refParent {
+			hasParent = true
+		}
+	})
+	return hasParent
 }
 
 // AddCmd adds a command to the cli.

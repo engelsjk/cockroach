@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -54,11 +53,22 @@ func (ex *connExecutor) execPrepare(
 	// type OIDs into types.T's.
 	if parseCmd.TypeHints != nil {
 		for i := range parseCmd.TypeHints {
-			if parseCmd.TypeHints[i] == nil && types.IsOIDUserDefinedType(parseCmd.RawTypeHints[i]) {
-				var err error
-				parseCmd.TypeHints[i], err = ex.planner.ResolveTypeByOID(ctx, parseCmd.RawTypeHints[i])
-				if err != nil {
-					return retErr(err)
+			if parseCmd.TypeHints[i] == nil {
+				if i >= len(parseCmd.RawTypeHints) {
+					return retErr(
+						pgwirebase.NewProtocolViolationErrorf(
+							"expected %d arguments, got %d",
+							len(parseCmd.TypeHints),
+							len(parseCmd.RawTypeHints),
+						),
+					)
+				}
+				if types.IsOIDUserDefinedType(parseCmd.RawTypeHints[i]) {
+					var err error
+					parseCmd.TypeHints[i], err = ex.planner.ResolveTypeByOID(ctx, parseCmd.RawTypeHints[i])
+					if err != nil {
+						return retErr(err)
+					}
 				}
 			}
 		}
@@ -235,17 +245,11 @@ func (ex *connExecutor) populatePrepared(
 	}
 	p.extendedEvalCtx.PrepareOnly = true
 
-	protoTS, timestampType, err := p.isAsOf(ctx, stmt.AST)
+	protoTS, err := p.isAsOf(ctx, stmt.AST)
 	if err != nil {
 		return 0, err
 	}
 	if protoTS != nil {
-		if timestampType != transactionTimestamp {
-			// Can't handle this: we don't know how to do a CTAS with a historical
-			// read timestamp and a present write timestamp.
-			return 0, unimplemented.NewWithIssueDetailf(35712, "historical prepared backfill",
-				"historical CREATE TABLE AS unsupported in explicit transaction")
-		}
 		p.semaCtx.AsOfTimestamp = protoTS
 		txn.SetFixedTimestamp(ctx, *protoTS)
 	}

@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -42,7 +43,8 @@ type renameTableNode struct {
 //          on the new table (and does not copy privileges over).
 func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"RENAME TABLE/VIEW/SEQUENCE",
 	); err != nil {
 		return nil, err
@@ -112,7 +114,8 @@ func (n *renameTableNode) startExec(params runParams) error {
 	if !newTn.ExplicitSchema && !newTn.ExplicitCatalog {
 		newTn.ObjectNamePrefix = oldTn.ObjectNamePrefix
 		var err error
-		targetDbDesc, err = p.ResolveUncachedDatabaseByName(ctx, string(oldTn.CatalogName), true /* required */)
+		_, targetDbDesc, err = p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
+			string(oldTn.CatalogName), tree.DatabaseLookupFlags{Required: true})
 		if err != nil {
 			return err
 		}
@@ -256,19 +259,12 @@ func (n *renameTableNode) startExec(params runParams) error {
 
 	// Log Rename Table event. This is an auditable log event and is recorded
 	// in the same transaction as the table descriptor update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogRenameTable,
-		int32(tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			TableName    string
-			Statement    string
-			User         string
-			NewTableName string
-		}{oldTn.FQString(), n.n.String(), params.p.User().Normalized(), newTn.FQString()},
-	)
+	return p.logEvent(ctx,
+		tableDesc.ID,
+		&eventpb.RenameTable{
+			TableName:    oldTn.FQString(),
+			NewTableName: newTn.FQString(),
+		})
 }
 
 func (n *renameTableNode) Next(runParams) (bool, error) { return false, nil }
@@ -284,8 +280,8 @@ func (p *planner) dependentViewError(
 	if err != nil {
 		return err
 	}
-	viewName := viewDesc.Name
-	if viewDesc.ParentID != parentID {
+	viewName := viewDesc.GetName()
+	if viewDesc.GetParentID() != parentID {
 		viewFQName, err := p.getQualifiedTableName(ctx, viewDesc)
 		if err != nil {
 			log.Warningf(ctx, "unable to retrieve name of view %d: %v", viewID, err)

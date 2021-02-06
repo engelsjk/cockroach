@@ -100,14 +100,14 @@ func (b *Builder) buildDataSource(
 			return outScope
 		}
 
-		priv := privilege.SELECT
+		ds, depName, resName := b.resolveDataSource(tn, privilege.SELECT)
+
 		locking = locking.filter(tn.ObjectName)
 		if locking.isSet() {
-			// SELECT ... FOR [KEY] UPDATE/SHARE requires UPDATE privileges.
-			priv = privilege.UPDATE
+			// SELECT ... FOR [KEY] UPDATE/SHARE also requires UPDATE privileges.
+			b.checkPrivilege(depName, ds, privilege.UPDATE)
 		}
 
-		ds, resName := b.resolveDataSource(tn, priv)
 		switch t := ds.(type) {
 		case cat.Table:
 			tabMeta := b.addTable(t, &resName)
@@ -117,7 +117,7 @@ func (b *Builder) buildDataSource(
 					includeMutations:       false,
 					includeSystem:          true,
 					includeVirtualInverted: false,
-					includeVirtualComputed: false,
+					includeVirtualComputed: true,
 				}),
 				indexFlags, locking, inScope,
 			)
@@ -206,14 +206,14 @@ func (b *Builder) buildDataSource(
 		return outScope
 
 	case *tree.TableRef:
-		priv := privilege.SELECT
+		ds, depName := b.resolveDataSourceRef(source, privilege.SELECT)
+
 		locking = locking.filter(source.As.Alias)
 		if locking.isSet() {
-			// SELECT ... FOR [KEY] UPDATE/SHARE requires UPDATE privileges.
-			priv = privilege.UPDATE
+			// SELECT ... FOR [KEY] UPDATE/SHARE also requires UPDATE privileges.
+			b.checkPrivilege(depName, ds, privilege.UPDATE)
 		}
 
-		ds := b.resolveDataSourceRef(source, priv)
 		switch t := ds.(type) {
 		case cat.Table:
 			outScope = b.buildScanFromTableRef(t, source, indexFlags, locking, inScope)
@@ -357,7 +357,7 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 					))
 				}
 				col := &scope.cols[colIdx]
-				if col.hidden {
+				if col.visibility != cat.Visible {
 					continue
 				}
 				col.name = colAlias[aliasIdx]
@@ -401,7 +401,7 @@ func (b *Builder) buildScanFromTableRef(
 			includeMutations:       false,
 			includeSystem:          true,
 			includeVirtualInverted: false,
-			includeVirtualComputed: false,
+			includeVirtualComputed: true,
 		})
 	}
 
@@ -419,17 +419,24 @@ func (b *Builder) addTable(tab cat.Table, alias *tree.TableName) *opt.TableMeta 
 	return md.TableMeta(tabID)
 }
 
-// buildScan builds a memo group for a ScanOp expression on the given table.
+// buildScan builds a memo group for a ScanOp expression on the given table. If
+// the ordinals list contains any VirtualComputed columns, a ProjectOp is built
+// on top.
 //
-// The scan projects the given table ordinals.
+// The resulting scope and expression output the given table ordinals. If an
+// ordinal is for a VirtualComputed column, the ordinals it depends on must also
+// be in the list (in practice, this coincides with all "ordinary" table columns
+// being in the list).
 //
 // If scanMutationCols is true, then include columns being added or dropped from
 // the table. These are currently required by the execution engine as "fetch
 // columns", when performing mutation DML statements (INSERT, UPDATE, UPSERT,
 // DELETE).
 //
-// NOTE: Callers must take care that these mutation columns are never used in
-//       any other way, since they may not have been initialized yet by the
+// NOTE: Callers must take care that mutation columns (columns that are being
+//       added or dropped from the table) are only used when performing mutation
+//       DML statements (INSERT, UPDATE, UPSERT, DELETE). They cannot be used in
+//       any other way because they may not have been initialized yet by the
 //       backfiller!
 //
 // See Builder.buildStmt for a description of the remaining input and return
@@ -453,20 +460,26 @@ func (b *Builder) buildScan(
 
 	outScope = inScope.push()
 
-	var tabColIDs opt.ColSet
+	// We collect VirtualComputed columns separately; these cannot be scanned,
+	// they can only be projected afterward.
+	var scanColIDs, virtualColIDs opt.ColSet
 	outScope.cols = make([]scopeColumn, len(ordinals))
 	for i, ord := range ordinals {
 		col := tab.Column(ord)
 		colID := tabID.ColumnID(ord)
-		tabColIDs.Add(colID)
 		name := col.ColName()
+		if col.IsVirtualComputed() {
+			virtualColIDs.Add(colID)
+		} else {
+			scanColIDs.Add(colID)
+		}
 		kind := col.Kind()
 		outScope.cols[i] = scopeColumn{
 			id:           colID,
 			name:         name,
 			table:        tabMeta.Alias,
 			typ:          col.DatumType(),
-			hidden:       col.IsHidden() || kind != cat.Ordinary,
+			visibility:   col.Visibility(),
 			kind:         kind,
 			mutation:     kind == cat.WriteOnly || kind == cat.DeleteOnly,
 			tableOrdinal: ord,
@@ -482,82 +495,83 @@ func (b *Builder) buildScan(
 			panic(pgerror.Newf(pgcode.Syntax,
 				"%s not allowed with virtual tables", locking.get().Strength))
 		}
-		private := memo.ScanPrivate{Table: tabID, Cols: tabColIDs}
+		private := memo.ScanPrivate{Table: tabID, Cols: scanColIDs}
 		outScope.expr = b.factory.ConstructScan(&private)
 
-		// Virtual tables should not be collected as view dependencies.
-	} else {
-		private := memo.ScanPrivate{Table: tabID, Cols: tabColIDs}
-		if indexFlags != nil {
-			private.Flags.NoIndexJoin = indexFlags.NoIndexJoin
-			if indexFlags.Index != "" || indexFlags.IndexID != 0 {
-				idx := -1
-				for i := 0; i < tab.IndexCount(); i++ {
-					if tab.Index(i).Name() == tree.Name(indexFlags.Index) ||
-						tab.Index(i).ID() == cat.StableID(indexFlags.IndexID) {
-						idx = i
-						break
-					}
-				}
-				if idx == -1 {
-					var err error
-					if indexFlags.Index != "" {
-						err = errors.Errorf("index %q not found", tree.ErrString(&indexFlags.Index))
-					} else {
-						err = errors.Errorf("index [%d] not found", indexFlags.IndexID)
-					}
-					panic(err)
-				}
-				private.Flags.ForceIndex = true
-				private.Flags.Index = idx
-				private.Flags.Direction = indexFlags.Direction
-			}
-		}
-		if locking.isSet() {
-			private.Locking = locking.get()
-		}
+		// Note: virtual tables should not be collected as view dependencies.
+		return outScope
+	}
 
-		b.addCheckConstraintsForTable(tabMeta)
-		b.addComputedColsForTable(tabMeta)
-
-		outScope.expr = b.factory.ConstructScan(&private)
-
-		// Add the partial indexes after constructing the scan so we can use the
-		// logical properties of the scan to fully normalize the index
-		// predicates. Partial index predicates are only added if the outScope
-		// contains all the table's ordinary columns. If it does not, partial
-		// index predicates cannot be built because they may reference columns
-		// not in outScope. In the most common case, the outScope has the same
-		// number of columns as the table and we can skip checking that each
-		// ordinary column exists in outScope.
-		containsAllOrdinaryTableColumns := true
-		if len(outScope.cols) != tab.ColumnCount() {
-			for i := 0; i < tab.ColumnCount(); i++ {
-				col := tab.Column(i)
-				if col.Kind() == cat.Ordinary && !outScope.colSet().Contains(tabID.ColumnID(col.Ordinal())) {
-					containsAllOrdinaryTableColumns = false
+	private := memo.ScanPrivate{Table: tabID, Cols: scanColIDs}
+	if indexFlags != nil {
+		private.Flags.NoIndexJoin = indexFlags.NoIndexJoin
+		if indexFlags.Index != "" || indexFlags.IndexID != 0 {
+			idx := -1
+			for i := 0; i < tab.IndexCount(); i++ {
+				if tab.Index(i).Name() == tree.Name(indexFlags.Index) ||
+					tab.Index(i).ID() == cat.StableID(indexFlags.IndexID) {
+					idx = i
 					break
 				}
 			}
+			if idx == -1 {
+				var err error
+				if indexFlags.Index != "" {
+					err = errors.Errorf("index %q not found", tree.ErrString(&indexFlags.Index))
+				} else {
+					err = errors.Errorf("index [%d] not found", indexFlags.IndexID)
+				}
+				panic(err)
+			}
+			private.Flags.ForceIndex = true
+			private.Flags.Index = idx
+			private.Flags.Direction = indexFlags.Direction
 		}
-		if containsAllOrdinaryTableColumns {
-			b.addPartialIndexPredicatesForTable(tabMeta, outScope)
-		}
+	}
+	if locking.isSet() {
+		private.Locking = locking.get()
+	}
 
-		if b.trackViewDeps {
-			dep := opt.ViewDep{DataSource: tab}
-			dep.ColumnIDToOrd = make(map[opt.ColumnID]int)
-			// We will track the ColumnID to Ord mapping so Ords can be added
-			// when a column is referenced.
-			for i, col := range outScope.cols {
-				dep.ColumnIDToOrd[col.id] = ordinals[i]
+	b.addCheckConstraintsForTable(tabMeta)
+	b.addComputedColsForTable(tabMeta)
+
+	outScope.expr = b.factory.ConstructScan(&private)
+
+	// Add the partial indexes after constructing the scan so we can use the
+	// logical properties of the scan to fully normalize the index predicates.
+	// We don't need to add deletable partial index predicates in the context of
+	// a scan.
+	b.addPartialIndexPredicatesForTable(tabMeta, outScope.expr)
+
+	if !virtualColIDs.Empty() {
+		// Project the expressions for the virtual columns (and pass through all
+		// scanned columns).
+		// TODO(radu): we don't currently support virtual columns depending on other
+		// virtual columns.
+		proj := make(memo.ProjectionsExpr, 0, virtualColIDs.Len())
+		virtualColIDs.ForEach(func(col opt.ColumnID) {
+			item := b.factory.ConstructProjectionsItem(tabMeta.ComputedCols[col], col)
+			if !item.ScalarProps().OuterCols.SubsetOf(scanColIDs) {
+				panic(errors.AssertionFailedf("scanned virtual column depends on non-scanned column"))
 			}
-			if private.Flags.ForceIndex {
-				dep.SpecificIndex = true
-				dep.Index = private.Flags.Index
-			}
-			b.viewDeps = append(b.viewDeps, dep)
+			proj = append(proj, item)
+		})
+		outScope.expr = b.factory.ConstructProject(outScope.expr, proj, scanColIDs)
+	}
+
+	if b.trackViewDeps {
+		dep := opt.ViewDep{DataSource: tab}
+		dep.ColumnIDToOrd = make(map[opt.ColumnID]int)
+		// We will track the ColumnID to Ord mapping so Ords can be added
+		// when a column is referenced.
+		for i, col := range outScope.cols {
+			dep.ColumnIDToOrd[col.id] = ordinals[i]
 		}
+		if private.Flags.ForceIndex {
+			dep.SpecificIndex = true
+			dep.Index = private.Flags.Index
+		}
+		b.viewDeps = append(b.viewDeps, dep)
 	}
 	return outScope
 }
@@ -674,56 +688,6 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 				tabMeta.AddComputedCol(colID, scalar)
 			}
 		}
-	}
-}
-
-// addPartialIndexPredicatesForTable finds all partial indexes in the table and
-// adds their predicates to the table metadata (see
-// TableMeta.PartialIndexPredicates). The predicates are converted from strings
-// to ScalarExprs here.
-//
-// The predicates are used as "known truths" about table data. Any predicates
-// containing non-immutable operators are omitted.
-func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta, tableScope *scope) {
-	tab := tabMeta.Table
-
-	// Find the first partial index.
-	numIndexes := tab.IndexCount()
-	indexOrd := 0
-	for ; indexOrd < numIndexes; indexOrd++ {
-		if _, ok := tab.Index(indexOrd).Predicate(); ok {
-			break
-		}
-	}
-
-	// Return early if there are no partial indexes. Only partial indexes have
-	// predicates.
-	if indexOrd == numIndexes {
-		return
-	}
-
-	// Skip to the first partial index we found above.
-	for ; indexOrd < numIndexes; indexOrd++ {
-		index := tab.Index(indexOrd)
-		pred, ok := index.Predicate()
-
-		// If the index is not a partial index, do nothing.
-		if !ok {
-			continue
-		}
-
-		expr, err := parser.ParseExpr(pred)
-		if err != nil {
-			panic(err)
-		}
-
-		// Build the partial index predicate as a memo.FiltersExpr and add it
-		// to the table metadata.
-		predExpr, err := b.buildPartialIndexPredicate(tableScope, expr, "index predicate")
-		if err != nil {
-			panic(err)
-		}
-		tabMeta.AddPartialIndexPredicate(indexOrd, &predExpr)
 	}
 }
 
@@ -1011,10 +975,10 @@ func (b *Builder) buildSelectStmtWithoutParens(
 		projectionsScope.cols = make([]scopeColumn, 0, len(outScope.cols))
 		for i := range outScope.cols {
 			expr := &outScope.cols[i]
-			col := b.addColumn(projectionsScope, "" /* alias */, expr)
+			col := projectionsScope.addColumn("" /* alias */, expr)
 			b.buildScalar(expr, outScope, projectionsScope, col, nil)
 		}
-		orderByScope := b.analyzeOrderBy(orderBy, outScope, projectionsScope)
+		orderByScope := b.analyzeOrderBy(orderBy, outScope, projectionsScope, tree.RejectGenerators|tree.RejectAggregates|tree.RejectWindowApplications)
 		b.buildOrderBy(outScope, projectionsScope, orderByScope)
 		b.constructProjectForScope(outScope, projectionsScope)
 		outScope = projectionsScope
@@ -1059,7 +1023,7 @@ func (b *Builder) buildSelectClause(
 	// Any aggregates in the HAVING, ORDER BY and DISTINCT ON clauses (if they
 	// exist) will be added here.
 	havingExpr := b.analyzeHaving(sel.Having, fromScope)
-	orderByScope := b.analyzeOrderBy(orderBy, fromScope, projectionsScope)
+	orderByScope := b.analyzeOrderBy(orderBy, fromScope, projectionsScope, tree.RejectGenerators)
 	distinctOnScope := b.analyzeDistinctOnArgs(sel.DistinctOn, fromScope, projectionsScope)
 
 	var having opt.ScalarExpr
@@ -1299,19 +1263,14 @@ func (b *Builder) validateAsOf(asOf tree.AsOfClause) {
 		panic(err)
 	}
 
-	if b.semaCtx.AsOfTimestamp != nil {
-		if *b.semaCtx.AsOfTimestamp != ts {
-			panic(unimplementedWithIssueDetailf(35712, "",
-				"cannot specify AS OF SYSTEM TIME with different timestamps"))
-		}
-	} else if b.semaCtx.AsOfTimestampForBackfill != nil {
-		if *b.semaCtx.AsOfTimestampForBackfill != ts {
-			panic(unimplementedWithIssueDetailf(35712, "",
-				"cannot specify AS OF SYSTEM TIME with different timestamps"))
-		}
-	} else {
+	if b.semaCtx.AsOfTimestamp == nil {
 		panic(pgerror.Newf(pgcode.Syntax,
 			"AS OF SYSTEM TIME must be provided on a top-level statement"))
+	}
+
+	if *b.semaCtx.AsOfTimestamp != ts {
+		panic(unimplementedWithIssueDetailf(35712, "",
+			"cannot specify AS OF SYSTEM TIME with different timestamps"))
 	}
 }
 

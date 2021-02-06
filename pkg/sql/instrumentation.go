@@ -11,14 +11,17 @@
 package sql
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -28,8 +31,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/gogo/protobuf/types"
+	"github.com/cockroachdb/errors"
+)
+
+var collectTxnStatsSampleRate = settings.RegisterFloatSetting(
+	"sql.txn_stats.sample_rate",
+	"the probability that a given transaction will collect execution statistics (displayed in the DB Console)",
+	0,
+	func(f float64) error {
+		if f < 0 || f > 1 {
+			return errors.New("value must be between 0 and 1 inclusive")
+		}
+		return nil
+	},
 )
 
 // instrumentationHelper encapsulates the logic around extracting information
@@ -40,7 +54,7 @@ import (
 //
 //  - Setup() is called before query execution.
 //
-//  - SetDiscardRows(), ShouldDiscardRows(), ShouldCollectBundle(),
+//  - SetDiscardRows(), ShouldDiscardRows(), ShouldSaveFlows(),
 //    ShouldBuildExplainPlan(), RecordExplainPlan(), RecordPlanInfo(),
 //    PlanForStats() can be called at any point during execution.
 //
@@ -48,7 +62,8 @@ import (
 //
 type instrumentationHelper struct {
 	outputMode outputMode
-	// explainFlags is used when outputMode is explainAnalyzePlanOutput.
+	// explainFlags is used when outputMode is explainAnalyzePlanOutput or
+	// explainAnalyzeDistSQLOutput.
 	explainFlags explain.Flags
 
 	// Query fingerprint (anonymized statement).
@@ -61,6 +76,10 @@ type instrumentationHelper struct {
 	// collectBundle is set when we are collecting a diagnostics bundle for a
 	// statement; it triggers saving of extra information like the plan string.
 	collectBundle bool
+
+	// collectExecStats is set when we are collecting execution statistics for a
+	// statement.
+	collectExecStats bool
 
 	// discardRows is set if we want to discard any results rather than sending
 	// them back to the client. Used for testing/benchmarking. Note that the
@@ -95,6 +114,7 @@ const (
 	unmodifiedOutput outputMode = iota
 	explainAnalyzeDebugOutput
 	explainAnalyzePlanOutput
+	explainAnalyzeDistSQLOutput
 )
 
 // SetOutputMode can be called before Setup, if we are running an EXPLAIN
@@ -104,7 +124,7 @@ func (ih *instrumentationHelper) SetOutputMode(outputMode outputMode, explainFla
 	ih.explainFlags = explainFlags
 }
 
-// Setup potentially enables snowball tracing for the statement, depending on
+// Setup potentially enables verbose tracing for the statement, depending on
 // output mode or statement diagnostic activation requests. Finish() must be
 // called after the statement finishes execution (unless needFinish=false, in
 // which case Finish() is a no-op).
@@ -116,6 +136,7 @@ func (ih *instrumentationHelper) Setup(
 	stmtDiagnosticsRecorder *stmtdiagnostics.Registry,
 	fingerprint string,
 	implicitTxn bool,
+	collectExecStats bool,
 ) (newCtx context.Context, needFinish bool) {
 	ih.fingerprint = fingerprint
 	ih.implicitTxn = implicitTxn
@@ -130,7 +151,7 @@ func (ih *instrumentationHelper) Setup(
 		// bundle.
 		ih.discardRows = true
 
-	case explainAnalyzePlanOutput:
+	case explainAnalyzePlanOutput, explainAnalyzeDistSQLOutput:
 		ih.discardRows = true
 
 	default:
@@ -142,20 +163,39 @@ func (ih *instrumentationHelper) Setup(
 
 	ih.savePlanForStats = appStats.shouldSaveLogicalPlanDescription(fingerprint, implicitTxn)
 
-	if !ih.collectBundle && ih.withStatementTrace == nil && ih.outputMode == unmodifiedOutput {
+	if sp := tracing.SpanFromContext(ctx); sp != nil && sp.IsVerbose() {
+		// If verbose tracing was enabled at a higher level, stats collection is
+		// enabled so that stats are shown in the traces, but no extra work is
+		// needed by the instrumentationHelper.
+		ih.collectExecStats = true
 		return ctx, false
 	}
 
+	ih.collectExecStats = collectExecStats
+
+	if !ih.collectBundle && ih.withStatementTrace == nil && ih.outputMode == unmodifiedOutput {
+		if ih.collectExecStats {
+			// If we need to collect stats, create a non-verbose child span. Stats
+			// will be added as structured metadata and processed in Finish.
+			ih.origCtx = ctx
+			newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement")
+			return newCtx, true
+		}
+		return ctx, false
+	}
+
+	ih.collectExecStats = true
 	ih.traceMetadata = make(execNodeTraceMetadata)
 	ih.origCtx = ctx
 	ih.evalCtx = p.EvalContext()
-	newCtx, ih.sp = tracing.StartSnowballTrace(ctx, cfg.AmbientCtx.Tracer, "traced statement")
+	newCtx, ih.sp = tracing.StartVerboseTrace(ctx, cfg.AmbientCtx.Tracer, "traced statement")
 	return newCtx, true
 }
 
 func (ih *instrumentationHelper) Finish(
 	cfg *ExecutorConfig,
 	appStats *appStats,
+	txnStats *execstats.QueryLevelStats,
 	statsCollector *sqlStatsCollector,
 	p *planner,
 	ast tree.Statement,
@@ -173,70 +213,79 @@ func (ih *instrumentationHelper) Finish(
 	ctx := ih.origCtx
 
 	trace := ih.sp.GetRecording()
-	ie := p.extendedEvalCtx.InternalExecutor.(*InternalExecutor)
-	placeholders := p.extendedEvalCtx.Placeholders
-	if ih.collectBundle {
-		bundle := buildStatementBundle(
-			ih.origCtx, cfg.DB, ie, &p.curPlan, ih.planStringForBundle(), trace, placeholders,
-		)
-		bundle.insert(ctx, ih.fingerprint, ast, cfg.StmtDiagnosticsRecorder, ih.diagRequestID)
-		if ih.finishCollectionDiagnostics != nil {
-			ih.finishCollectionDiagnostics()
-			telemetry.Inc(sqltelemetry.StatementDiagnosticsCollectedCounter)
-		}
-
-		// Handle EXPLAIN ANALYZE (DEBUG). If there was a communication error
-		// already, no point in setting any results.
-		if ih.outputMode == explainAnalyzeDebugOutput && retErr == nil {
-			retErr = setExplainBundleResult(ctx, res, bundle, cfg)
-		}
-	}
 
 	if ih.withStatementTrace != nil {
 		ih.withStatementTrace(trace, stmtRawSQL)
 	}
 
 	if ih.traceMetadata != nil && ih.explainPlan != nil {
-		ih.traceMetadata.addSpans(trace)
-		ih.traceMetadata.annotateExplain(ih.explainPlan)
-	}
-
-	if ih.outputMode == explainAnalyzePlanOutput && retErr == nil {
-		phaseTimes := &statsCollector.phaseTimes
-		retErr = ih.setExplainAnalyzePlanResult(ctx, res, phaseTimes)
+		ih.traceMetadata.annotateExplain(ih.explainPlan, trace, cfg.TestingKnobs.DeterministicExplainAnalyze)
 	}
 
 	// TODO(radu): this should be unified with other stmt stats accesses.
 	stmtStats, _ := appStats.getStatsForStmt(ih.fingerprint, ih.implicitTxn, retErr, false)
 	if stmtStats != nil {
-		networkBytesSent := int64(0)
+		var flowMetadata []*execstats.FlowMetadata
 		for _, flowInfo := range p.curPlan.distSQLFlowInfos {
-			analyzer := flowInfo.analyzer
-			if err := analyzer.AddTrace(trace); err != nil {
-				log.VInfof(ctx, 1, "error analyzing trace statistics for stmt %s: %v", ast, err)
-				continue
-			}
-
-			networkBytesSentGroupedByNode, err := analyzer.GetNetworkBytesSent()
-			if err != nil {
-				log.VInfof(ctx, 1, "error calculating network bytes sent for stmt %s: %v", ast, err)
-				continue
-			}
-			for _, bytesSentByNode := range networkBytesSentGroupedByNode {
-				networkBytesSent += bytesSentByNode
-			}
+			flowMetadata = append(flowMetadata, flowInfo.flowMetadata)
 		}
-
-		stmtStats.mu.Lock()
-		// Record trace-related statistics. A count of 1 is passed given that this
-		// statistic is only recorded when statement diagnostics are enabled.
-		// TODO(asubiotto): NumericStat properties will be properly calculated
-		//  once this statistic is always collected.
-		stmtStats.mu.data.BytesSentOverNetwork.Record(1 /* count */, float64(networkBytesSent))
-		stmtStats.mu.Unlock()
+		queryLevelStats, err := execstats.GetQueryLevelStats(trace, cfg.TestingKnobs.DeterministicExplainAnalyze, flowMetadata)
+		if err != nil {
+			log.VInfof(ctx, 1, "error getting query level stats for statement %s: %+v", ast, err)
+		} else {
+			stmtStats.mu.Lock()
+			stmtStats.mu.data.ExecStatCollectionCount++
+			// Record trace-related statistics.
+			stmtStats.mu.data.BytesSentOverNetwork.Record(
+				stmtStats.mu.data.ExecStatCollectionCount, float64(queryLevelStats.NetworkBytesSent),
+			)
+			stmtStats.mu.data.MaxMemUsage.Record(
+				stmtStats.mu.data.ExecStatCollectionCount, float64(queryLevelStats.MaxMemUsage),
+			)
+			stmtStats.mu.data.ContentionTime.Record(
+				stmtStats.mu.data.ExecStatCollectionCount, queryLevelStats.ContentionTime.Seconds(),
+			)
+			stmtStats.mu.Unlock()
+		}
+		txnStats.Accumulate(queryLevelStats)
 	}
 
-	return retErr
+	var bundle diagnosticsBundle
+	if ih.collectBundle {
+		ie := p.extendedEvalCtx.InternalExecutor.(*InternalExecutor)
+		placeholders := p.extendedEvalCtx.Placeholders
+		planStr := ih.planStringForBundle(&statsCollector.phaseTimes)
+		bundle = buildStatementBundle(
+			ih.origCtx, cfg.DB, ie, &p.curPlan, planStr, trace, placeholders,
+		)
+		bundle.insert(ctx, ih.fingerprint, ast, cfg.StmtDiagnosticsRecorder, ih.diagRequestID)
+		if ih.finishCollectionDiagnostics != nil {
+			ih.finishCollectionDiagnostics()
+			telemetry.Inc(sqltelemetry.StatementDiagnosticsCollectedCounter)
+		}
+	}
+
+	// If there was a communication error already, no point in setting any
+	// results.
+	if retErr != nil {
+		return retErr
+	}
+
+	switch ih.outputMode {
+	case explainAnalyzeDebugOutput:
+		return setExplainBundleResult(ctx, res, bundle, cfg)
+
+	case explainAnalyzePlanOutput, explainAnalyzeDistSQLOutput:
+		phaseTimes := &statsCollector.phaseTimes
+		var flows []flowInfo
+		if ih.outputMode == explainAnalyzeDistSQLOutput {
+			flows = p.curPlan.distSQLFlowInfos
+		}
+		return ih.setExplainAnalyzeResult(ctx, res, phaseTimes, flows, trace)
+
+	default:
+		return nil
+	}
 }
 
 // SetDiscardRows should be called when we want to discard rows for a
@@ -251,15 +300,31 @@ func (ih *instrumentationHelper) ShouldDiscardRows() bool {
 	return ih.discardRows
 }
 
-// ShouldCollectBundle is true if we are collecting a support bundle.
-func (ih *instrumentationHelper) ShouldCollectBundle() bool {
-	return ih.collectBundle
+// ShouldSaveFlows is true if we should save the flow specifications (to be able
+// to generate diagrams).
+func (ih *instrumentationHelper) ShouldSaveFlows() bool {
+	return ih.collectBundle || ih.outputMode == explainAnalyzeDistSQLOutput || ih.collectExecStats
+}
+
+// ShouldUseJobForCreateStats indicates if we should run CREATE STATISTICS as a
+// job (normally true). It is false if we are running a statement under
+// EXPLAIN ANALYZE, in which case we want to run the CREATE STATISTICS plan
+// directly.
+func (ih *instrumentationHelper) ShouldUseJobForCreateStats() bool {
+	return ih.outputMode == unmodifiedOutput
 }
 
 // ShouldBuildExplainPlan returns true if we should build an explain plan and
 // call RecordExplainPlan.
 func (ih *instrumentationHelper) ShouldBuildExplainPlan() bool {
-	return ih.collectBundle || ih.savePlanForStats || ih.outputMode == explainAnalyzePlanOutput
+	return ih.collectBundle || ih.savePlanForStats || ih.outputMode == explainAnalyzePlanOutput ||
+		ih.outputMode == explainAnalyzeDistSQLOutput
+}
+
+// ShouldCollectExecStats returns true if we should collect statement execution
+// statistics.
+func (ih *instrumentationHelper) ShouldCollectExecStats() bool {
+	return ih.collectExecStats
 }
 
 // RecordExplainPlan records the explain.Plan for this query.
@@ -286,7 +351,9 @@ func (ih *instrumentationHelper) PlanForStats(ctx context.Context) *roachpb.Expl
 	ob := explain.NewOutputBuilder(explain.Flags{
 		HideValues: true,
 	})
-	if err := emitExplain(ob, ih.evalCtx, ih.codec, ih.explainPlan, ih.distribution, ih.vectorized); err != nil {
+	ob.AddDistribution(ih.distribution.String())
+	ob.AddVectorized(ih.vectorized)
+	if err := emitExplain(ob, ih.evalCtx, ih.codec, ih.explainPlan); err != nil {
 		log.Warningf(ctx, "unable to emit explain plan tree: %v", err)
 		return nil
 	}
@@ -294,7 +361,7 @@ func (ih *instrumentationHelper) PlanForStats(ctx context.Context) *roachpb.Expl
 }
 
 // planStringForBundle generates the plan tree as a string; used internally for bundles.
-func (ih *instrumentationHelper) planStringForBundle() string {
+func (ih *instrumentationHelper) planStringForBundle(phaseTimes *phaseTimes) string {
 	if ih.explainPlan == nil {
 		return ""
 	}
@@ -302,7 +369,11 @@ func (ih *instrumentationHelper) planStringForBundle() string {
 		Verbose:   true,
 		ShowTypes: true,
 	})
-	if err := emitExplain(ob, ih.evalCtx, ih.codec, ih.explainPlan, ih.distribution, ih.vectorized); err != nil {
+	ob.AddPlanningTime(phaseTimes.getPlanningLatency())
+	ob.AddExecutionTime(phaseTimes.getRunLatency())
+	ob.AddDistribution(ih.distribution.String())
+	ob.AddVectorized(ih.vectorized)
+	if err := emitExplain(ob, ih.evalCtx, ih.codec, ih.explainPlan); err != nil {
 		return fmt.Sprintf("error emitting plan: %v", err)
 	}
 	return ob.BuildString()
@@ -310,7 +381,7 @@ func (ih *instrumentationHelper) planStringForBundle() string {
 
 // planRowsForExplainAnalyze generates the plan tree as a list of strings (one
 // for each line).
-// Used in explainAnalyzePlanOutput mode.
+// Used in explainAnalyzePlanOutput and explainAnalyzeDistSQLOutput modes.
 func (ih *instrumentationHelper) planRowsForExplainAnalyze(phaseTimes *phaseTimes) []string {
 	if ih.explainPlan == nil {
 		return nil
@@ -318,17 +389,24 @@ func (ih *instrumentationHelper) planRowsForExplainAnalyze(phaseTimes *phaseTime
 	ob := explain.NewOutputBuilder(ih.explainFlags)
 	ob.AddPlanningTime(phaseTimes.getPlanningLatency())
 	ob.AddExecutionTime(phaseTimes.getRunLatency())
-	if err := emitExplain(ob, ih.evalCtx, ih.codec, ih.explainPlan, ih.distribution, ih.vectorized); err != nil {
+	ob.AddDistribution(ih.distribution.String())
+	ob.AddVectorized(ih.vectorized)
+	if err := emitExplain(ob, ih.evalCtx, ih.codec, ih.explainPlan); err != nil {
 		return []string{fmt.Sprintf("error emitting plan: %v", err)}
 	}
 	return ob.BuildStringRows()
 }
 
-// setExplainAnalyzePlanResult sets the result for an EXPLAIN ANALYZE (PLAN)
-// statement. It returns an error only if there was an error adding rows to the
-// result.
-func (ih *instrumentationHelper) setExplainAnalyzePlanResult(
-	ctx context.Context, res RestrictedCommandResult, phaseTimes *phaseTimes,
+// setExplainAnalyzeResult sets the result for an EXPLAIN ANALYZE or EXPLAIN
+// ANALYZE (DISTSQL) statement (in the former case, distSQLFlowInfos and trace
+// are nil).
+// Returns an error only if there was an error adding rows to the result.
+func (ih *instrumentationHelper) setExplainAnalyzeResult(
+	ctx context.Context,
+	res RestrictedCommandResult,
+	phaseTimes *phaseTimes,
+	distSQLFlowInfos []flowInfo,
+	trace tracing.Recording,
 ) (commErr error) {
 	res.ResetStmtType(&tree.ExplainAnalyze{})
 	res.SetColumns(ctx, colinfo.ExplainPlanColumns)
@@ -339,6 +417,25 @@ func (ih *instrumentationHelper) setExplainAnalyzePlanResult(
 	}
 
 	rows := ih.planRowsForExplainAnalyze(phaseTimes)
+	if distSQLFlowInfos != nil {
+		rows = append(rows, "")
+		for i, d := range distSQLFlowInfos {
+			var buf bytes.Buffer
+			if len(distSQLFlowInfos) > 1 {
+				fmt.Fprintf(&buf, "Diagram %d (%s): ", i+1, d.typ)
+			} else {
+				buf.WriteString("Diagram: ")
+			}
+			d.diagram.AddSpans(trace)
+			_, url, err := d.diagram.ToURL()
+			if err != nil {
+				buf.WriteString(err.Error())
+			} else {
+				buf.WriteString(url.String())
+			}
+			rows = append(rows, buf.String())
+		}
+	}
 	rows = append(rows, "")
 	rows = append(rows, "WARNING: this statement is experimental!")
 	for _, row := range rows {
@@ -359,93 +456,45 @@ func (ih *instrumentationHelper) setExplainAnalyzePlanResult(
 // easier.
 type execNodeTraceMetadata map[exec.Node]execComponents
 
-type execComponents struct {
-	flowID     uuid.UUID
-	processors []processorTraceMetadata
-}
+type execComponents []execinfrapb.ComponentID
 
-type processorTraceMetadata struct {
-	id    execinfrapb.ProcessorID
-	stats *execinfrapb.ComponentStats
-}
-
-// associateNodeWithProcessors is called during planning, as processors are
+// associateNodeWithComponents is called during planning, as processors are
 // planned for an execution operator.
-func (m execNodeTraceMetadata) associateNodeWithProcessors(
-	node exec.Node, flowID uuid.UUID, processors []processorTraceMetadata,
+func (m execNodeTraceMetadata) associateNodeWithComponents(
+	node exec.Node, components execComponents,
 ) {
-	m[node] = execComponents{
-		flowID:     flowID,
-		processors: processors,
-	}
+	m[node] = components
 }
 
-// addSpans populates the processorTraceMetadata.fields with the statistics
-// recorded in a trace.
-func (m execNodeTraceMetadata) addSpans(spans []tracingpb.RecordedSpan) {
-	// Build a map from <flow-id, processor-id> pair (encoded as a string)
-	// to the corresponding processorTraceMetadata entry.
-	processorKeyToMetadata := make(map[string]*processorTraceMetadata)
-	for _, v := range m {
-		for i := range v.processors {
-			key := fmt.Sprintf("%s-p-%d", v.flowID.String(), v.processors[i].id)
-			processorKeyToMetadata[key] = &v.processors[i]
-		}
-	}
-
-	for i := range spans {
-		span := &spans[i]
-		if span.Stats == nil {
-			continue
-		}
-
-		fid, ok := span.Tags[execinfrapb.FlowIDTagKey]
-		if !ok {
-			continue
-		}
-		pid, ok := span.Tags[execinfrapb.ProcessorIDTagKey]
-		if !ok {
-			continue
-		}
-		key := fmt.Sprintf("%s-p-%s", fid, pid)
-		procMetadata := processorKeyToMetadata[key]
-		if procMetadata == nil {
-			// Processor not associated with an exec.Node; ignore.
-			continue
-		}
-
-		var stats execinfrapb.ComponentStats
-		if err := types.UnmarshalAny(span.Stats, &stats); err != nil {
-			continue
-		}
-		procMetadata.stats = &stats
-	}
-}
-
-// annotateExplain aggregates the statistics that were collected and annotates
+// annotateExplain aggregates the statistics in the trace and annotates
 // explain.Nodes with execution stats.
-func (m execNodeTraceMetadata) annotateExplain(plan *explain.Plan) {
+func (m execNodeTraceMetadata) annotateExplain(
+	plan *explain.Plan, spans []tracingpb.RecordedSpan, makeDeterministic bool,
+) {
+	statsMap := execinfrapb.ExtractStatsFromSpans(spans, makeDeterministic)
+
 	var walk func(n *explain.Node)
 	walk = func(n *explain.Node) {
 		wrapped := n.WrappedNode()
-		if meta, ok := m[wrapped]; ok {
-			var rowCount uint64
+		if components, ok := m[wrapped]; ok {
+			var nodeStats exec.ExecutionStats
+
 			incomplete := false
-			for i := range meta.processors {
-				stats := meta.processors[i].stats
+			for i := range components {
+				stats := statsMap[components[i]]
 				if stats == nil {
 					incomplete = true
 					break
 				}
-				rowCount += stats.Output.NumTuples.Value()
+				nodeStats.RowCount.MaybeAdd(stats.Output.NumTuples)
+				nodeStats.KVBytesRead.MaybeAdd(stats.KV.BytesRead)
+				nodeStats.KVRowsRead.MaybeAdd(stats.KV.TuplesRead)
 			}
 			// If we didn't get statistics for all processors, we don't show the
 			// incomplete results. In the future, we may consider an incomplete flag
 			// if we want to show them with a warning.
 			if !incomplete {
-				n.Annotate(exec.ExecutionStatsID, &exec.ExecutionStats{
-					RowCount: rowCount,
-				})
+				n.Annotate(exec.ExecutionStatsID, &nodeStats)
 			}
 		}
 

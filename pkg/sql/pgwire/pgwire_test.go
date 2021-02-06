@@ -556,7 +556,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Results("users", "primary", false, 1, "username", "ASC", false, false),
 		}},
 		{"SHOW TABLES FROM system", []preparedQueryTest{
-			baseTest.Results("public", "comments", "table", gosql.NullString{}, gosql.NullString{}).Others(28),
+			baseTest.Results("public", "comments", "table", gosql.NullString{}, gosql.NullString{}, gosql.NullString{}).Others(28),
 		}},
 		{"SHOW SCHEMAS FROM system", []preparedQueryTest{
 			baseTest.Results("crdb_internal", gosql.NullString{}).Others(4),
@@ -736,7 +736,7 @@ func TestPGPreparedQuery(t *testing.T) {
 		{"EXPLAIN SELECT 1", []preparedQueryTest{
 			baseTest.SetArgs().
 				Results("distribution: local").
-				Results("vectorized: false").
+				Results("vectorized: true").
 				Results("").
 				Results("• values").
 				Results("  size: 1 column, 1 row"),

@@ -21,9 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 )
 
@@ -95,6 +93,12 @@ type orderedAggregator struct {
 	// function operators write directly to this output batch.
 	scratch struct {
 		coldata.Batch
+		// tempBuffer is used when we need to shift the second part of the
+		// scratch batch into the beginning. This can occur when we aggregated
+		// more tuples than can fit into a single output batch, and we need some
+		// scratch space to copy the overflow tuples into before resetting the
+		// scratch.Batch.
+		tempBuffer coldata.Batch
 		// shouldResetInternalBatch keeps track of whether the scratch.Batch should
 		// be reset. It is false in cases where we have overflow results still to
 		// return and therefore do not want to modify the batch.
@@ -122,8 +126,6 @@ type orderedAggregator struct {
 	// groups.
 	bucket    aggBucket
 	aggHelper aggregatorHelper
-	// isScalar indicates whether an aggregator is in scalar context.
-	isScalar bool
 	// seenNonEmptyBatch indicates whether a non-empty input batch has been
 	// observed.
 	seenNonEmptyBatch bool
@@ -131,60 +133,25 @@ type orderedAggregator struct {
 	toClose           colexecbase.Closers
 }
 
+var _ ResettableOperator = &orderedAggregator{}
 var _ closableOperator = &orderedAggregator{}
 
-// NewOrderedAggregator creates an ordered aggregator on the given grouping
-// columns. aggCols is a slice where each index represents a new aggregation
-// function. The slice at that index specifies the columns of the input batch
-// that the aggregate function should work on.
-func NewOrderedAggregator(
-	allocator *colmem.Allocator,
-	memAccount *mon.BoundAccount,
-	input colexecbase.Operator,
-	inputTypes []*types.T,
-	spec *execinfrapb.AggregatorSpec,
-	evalCtx *tree.EvalContext,
-	constructors []execinfrapb.AggregateConstructor,
-	constArguments []tree.Datums,
-	outputTypes []*types.T,
-	isScalar bool,
-) (colexecbase.Operator, error) {
-	for _, aggFn := range spec.Aggregations {
+// NewOrderedAggregator creates an ordered aggregator.
+func NewOrderedAggregator(args *colexecagg.NewAggregatorArgs) (ResettableOperator, error) {
+	for _, aggFn := range args.Spec.Aggregations {
 		if aggFn.FilterColIdx != nil {
 			return nil, errors.AssertionFailedf("filtering ordered aggregation is not supported")
 		}
 	}
-	op, groupCol, err := OrderedDistinctColsToOperators(input, spec.GroupCols, inputTypes)
+	op, groupCol, err := OrderedDistinctColsToOperators(args.Input, args.Spec.GroupCols, args.InputTypes)
 	if err != nil {
 		return nil, err
-	}
-
-	a := &orderedAggregator{}
-	// The contract of AggregateFunc.Init requires that the very first group in
-	// the whole input is not marked as a start of a new group with 'true'
-	// value in groupCol. In order to satisfy that requirement we plan a
-	// oneShotOp that explicitly sets groupCol for the very first tuple it
-	// sees to 'false' and then deletes itself from the operator tree.
-	op = &oneShotOp{
-		OneInputNode: NewOneInputNode(op),
-		fn: func(batch coldata.Batch) {
-			if batch.Length() == 0 {
-				return
-			}
-			if sel := batch.Selection(); sel != nil {
-				groupCol[sel[0]] = false
-			} else {
-				groupCol[0] = false
-			}
-		},
-		outputSourceRef: &a.input,
 	}
 
 	// We will be reusing the same aggregate functions, so we use 1 as the
 	// allocation size.
 	funcsAlloc, inputArgsConverter, toClose, err := colexecagg.NewAggregateFuncsAlloc(
-		allocator, inputTypes, spec, evalCtx, constructors, constArguments,
-		outputTypes, 1 /* allocSize */, false, /* isHashAgg */
+		args, 1 /* allocSize */, false, /* isHashAgg */
 	)
 	if err != nil {
 		return nil, errors.AssertionFailedf(
@@ -192,18 +159,17 @@ func NewOrderedAggregator(
 		)
 	}
 
-	*a = orderedAggregator{
+	a := &orderedAggregator{
 		OneInputNode:       NewOneInputNode(op),
-		allocator:          allocator,
-		spec:               spec,
+		allocator:          args.Allocator,
+		spec:               args.Spec,
 		groupCol:           groupCol,
 		bucket:             aggBucket{fns: funcsAlloc.MakeAggregateFuncs()},
-		isScalar:           isScalar,
-		outputTypes:        outputTypes,
+		outputTypes:        args.OutputTypes,
 		inputArgsConverter: inputArgsConverter,
 		toClose:            toClose,
 	}
-	a.aggHelper = newAggregatorHelper(allocator, memAccount, inputTypes, spec, &a.datumAlloc, false /* isHashAgg */, coldata.BatchSize())
+	a.aggHelper = newAggregatorHelper(args, &a.datumAlloc, false /* isHashAgg */, coldata.BatchSize())
 	return a, nil
 }
 
@@ -255,7 +221,7 @@ func (a *orderedAggregator) Next(ctx context.Context) coldata.Batch {
 			a.seenNonEmptyBatch = a.seenNonEmptyBatch || batchLength > 0
 			if !a.seenNonEmptyBatch {
 				// The input has zero rows.
-				if a.isScalar {
+				if a.spec.IsScalar() {
 					for _, fn := range a.bucket.fns {
 						fn.HandleEmptyInputScalar()
 					}
@@ -309,13 +275,19 @@ func (a *orderedAggregator) Next(ctx context.Context) coldata.Batch {
 				// coldata.BatchSize(), but we actually want a batch with larger
 				// capacity, so we choose to instantiate the batch with fixed
 				// maximal capacity that can be needed by the aggregator.
-				if a.scratch.Batch != nil {
-					a.allocator.ReleaseBatch(a.scratch.Batch)
-				}
+				a.allocator.ReleaseMemory(colmem.GetBatchMemSize(a.scratch.Batch))
 				a.scratch.Batch = a.allocator.NewMemBatchWithFixedCapacity(a.outputTypes, 2*coldata.BatchSize())
 			} else {
 				a.scratch.Batch, _ = a.allocator.ResetMaybeReallocate(a.outputTypes, a.scratch.Batch, newMinCapacity)
 			}
+			// We will never copy more than coldata.BatchSize() into the
+			// temporary buffer, so a half of the scratch's capacity will always
+			// be sufficient.
+			tempBufferCapacity := newMinCapacity / 2
+			if tempBufferCapacity == 0 {
+				tempBufferCapacity = 1
+			}
+			a.scratch.tempBuffer, _ = a.allocator.ResetMaybeReallocate(a.outputTypes, a.scratch.tempBuffer, tempBufferCapacity)
 			for fnIdx, fn := range a.bucket.fns {
 				fn.SetOutput(a.scratch.ColVec(fnIdx))
 			}
@@ -352,42 +324,51 @@ func (a *orderedAggregator) Next(ctx context.Context) coldata.Batch {
 				})
 				batchToReturn = a.unsafeBatch
 
-				// Copy the second part of the scratch batch into the first and
-				// we will resume from there on the next iteration.
+				// Copy the second part of the scratch batch into the temporary
+				// buffer first, reset the scratch batch, and copy over that
+				// second part into the beginning of the scratch batch.
+				//
+				// This two-step process is necessary because we cannot do
+				// resetting (needed to copy to the beginning) and copying (in
+				// order to move the data) on the same scratch batch since then
+				// the source and the destination would be the same, and
+				// resetting it would lead to the loss of data.
 				newResumeIdx := a.scratch.resumeIdx - coldata.BatchSize()
-				a.allocator.PerformOperation(a.scratch.ColVecs(), func() {
+				a.scratch.tempBuffer.ResetInternalBatch()
+				a.allocator.PerformOperation(a.scratch.tempBuffer.ColVecs(), func() {
 					for i := 0; i < len(a.outputTypes); i++ {
-						vec := a.scratch.ColVec(i)
-						// Note that we're using Append here instead of Copy
-						// because we want the "truncation" behavior, i.e. we
-						// want to copy over the remaining tuples such the
-						// "lengths" of the vectors are equal to the number of
-						// copied elements.
-						vec.Append(
-							coldata.SliceArgs{
-								Src:         vec,
-								DestIdx:     0,
-								SrcStartIdx: coldata.BatchSize(),
-								SrcEndIdx:   a.scratch.resumeIdx,
+						a.scratch.tempBuffer.ColVec(i).Copy(
+							coldata.CopySliceArgs{
+								SliceArgs: coldata.SliceArgs{
+									Src:         a.scratch.ColVec(i),
+									SrcStartIdx: coldata.BatchSize(),
+									SrcEndIdx:   a.scratch.resumeIdx,
+								},
 							},
 						)
-						// Now we need to restore the length for the Vec.
-						vec.SetLength(a.scratch.Capacity())
-						a.bucket.fns[i].SetOutputIndex(newResumeIdx)
-						// There might have been some NULLs set in the part that
-						// we have just copied over, so we need to unset the
-						// NULLs.
-						a.scratch.ColVec(i).Nulls().UnsetNullsAfter(newResumeIdx)
+					}
+				})
+				a.scratch.ResetInternalBatch()
+				a.allocator.PerformOperation(a.scratch.ColVecs(), func() {
+					for i := 0; i < len(a.outputTypes); i++ {
+						a.scratch.ColVec(i).Copy(
+							coldata.CopySliceArgs{
+								SliceArgs: coldata.SliceArgs{
+									Src:       a.scratch.tempBuffer.ColVec(i),
+									SrcEndIdx: newResumeIdx,
+								},
+							},
+						)
 					}
 				})
 				a.scratch.resumeIdx = newResumeIdx
 			} else {
 				a.scratch.SetLength(a.scratch.resumeIdx)
-				for _, fn := range a.bucket.fns {
-					fn.SetOutputIndex(0 /* idx */)
-				}
 				a.scratch.resumeIdx = 0
 				a.scratch.shouldResetInternalBatch = true
+			}
+			for _, fn := range a.bucket.fns {
+				fn.SetOutputIndex(a.scratch.resumeIdx)
 			}
 			a.state = stateAfterOutputting
 			stateAfterOutputting = orderedAggregatorUnknown
@@ -399,6 +380,22 @@ func (a *orderedAggregator) Next(ctx context.Context) coldata.Batch {
 		default:
 			colexecerror.InternalError(errors.AssertionFailedf("unexpected orderedAggregatorState %d", a.state))
 		}
+	}
+}
+
+func (a *orderedAggregator) reset(ctx context.Context) {
+	if r, ok := a.input.(resetter); ok {
+		r.reset(ctx)
+	}
+	a.state = orderedAggregatorAggregating
+	// In some cases we might reset the aggregator before Next() is called for
+	// the first time, so there might not be a scratch batch allocated yet.
+	a.scratch.shouldResetInternalBatch = a.scratch.Batch != nil
+	a.scratch.resumeIdx = 0
+	a.lastReadBatch = nil
+	a.seenNonEmptyBatch = false
+	for _, fn := range a.bucket.fns {
+		fn.Reset()
 	}
 }
 

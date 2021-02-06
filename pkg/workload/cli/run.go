@@ -28,8 +28,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
-	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
@@ -58,6 +57,8 @@ var sharedFlags = pflag.NewFlagSet(`shared`, pflag.ContinueOnError)
 var pprofport = sharedFlags.Int("pprofport", 33333, "Port for pprof endpoint.")
 var dataLoader = sharedFlags.String("data-loader", `INSERT`,
 	"How to load initial table data. Options are INSERT and IMPORT")
+var initConns = sharedFlags.Int("init-conns", 16,
+	"The number of connections to use during INSERT init")
 
 var displayEvery = runFlags.Duration("display-every", time.Second, "How much time between every one-line activity reports.")
 
@@ -152,11 +153,14 @@ func CmdHelper(
 	const crdbDefaultURL = `postgres://root@localhost:26257?sslmode=disable`
 
 	return HandleErrs(func(cmd *cobra.Command, args []string) error {
-		if ls := cmd.Flags().Lookup(logflags.LogToStderrName); ls != nil {
-			if !ls.Changed {
-				// Unless the settings were overridden by the user, default to logging
-				// to stderr.
-				_ = ls.Value.Set(severity.INFO.String())
+		// Apply the logging configuration if none was set already.
+		if active, _ := log.IsActive(); !active {
+			cfg := logconfig.DefaultStderrConfig()
+			if err := cfg.Validate(nil /* no default log directory */); err != nil {
+				return err
+			}
+			if _, err := log.ApplyConfig(cfg); err != nil {
+				return err
 			}
 		}
 
@@ -275,10 +279,7 @@ func runInitImpl(
 	switch strings.ToLower(*dataLoader) {
 	case `insert`, `inserts`:
 		l = workloadsql.InsertsDataLoader{
-			// TODO(dan): Don't hardcode this. Similar to dbOverride, this should be
-			// hooked up to a flag directly once once more of run.go moves inside
-			// workload.
-			Concurrency: 16,
+			Concurrency: *initConns,
 		}
 	case `import`, `imports`:
 		l = workload.ImportDataLoader

@@ -10,7 +10,7 @@
 
 package catalog
 
-// chart_catalog.go represents a catalog of pre-defined Admin UI charts
+// chart_catalog.go represents a catalog of pre-defined DB Console charts
 // to aid users in debugging CockroachDB clusters. This file represents
 // a simplified structure of the catalog, meant to make it easier for
 // developers to add charts to the catalog. You can find more detail at
@@ -305,6 +305,7 @@ var charts = []sectionDescription{
 					"distsender.rpc.initput.sent",
 					"distsender.rpc.leaseinfo.sent",
 					"distsender.rpc.merge.sent",
+					"distsender.rpc.migrate.sent",
 					"distsender.rpc.pushtxn.sent",
 					"distsender.rpc.put.sent",
 					"distsender.rpc.queryintent.sent",
@@ -347,6 +348,7 @@ var charts = []sectionDescription{
 					"distsender.rpc.err.integeroverflowerrtype",
 					"distsender.rpc.err.intentmissingerrtype",
 					"distsender.rpc.err.internalerrtype",
+					"distsender.rpc.err.invalidleaseerrtype",
 					"distsender.rpc.err.leaserejectederrtype",
 					"distsender.rpc.err.mergeinprogresserrtype",
 					"distsender.rpc.err.nodeunavailableerrtype",
@@ -1238,6 +1240,10 @@ var charts = []sectionDescription{
 				Title:   "Log Commit",
 				Metrics: []string{"raft.process.logcommit.latency"},
 			},
+			{
+				Title:   "Scheduler",
+				Metrics: []string{"raft.scheduler.latency"},
+			},
 		},
 	},
 	{
@@ -1525,6 +1531,17 @@ var charts = []sectionDescription{
 		},
 	},
 	{
+		Organization: [][]string{{SQLLayer, "SQL Catalog", "SQL Leases"}},
+		Charts: []chartDescription{
+			{
+				Title: "Outstanding SQL Leases",
+				Metrics: []string{
+					"sql.leases.active",
+				},
+			},
+		},
+	},
+	{
 		Organization: [][]string{{SQLLayer, "SQL Catalog", "Hydrated Descriptor Cache"}},
 		Charts: []chartDescription{
 			{
@@ -1604,6 +1621,10 @@ var charts = []sectionDescription{
 			{
 				Title:   "Total Queries",
 				Metrics: []string{"sql.distsql.queries.total"},
+			},
+			{
+				Title:   "Contended Queries",
+				Metrics: []string{"sql.distsql.contended_queries.count"},
 			},
 			{
 				Title:   "Vectorized Temporary Storage Open File Descriptors",
@@ -1843,6 +1864,22 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Open Transactions",
+				Metrics: []string{
+					"sql.txns.open",
+					"sql.txns.open.internal",
+				},
+				AxisLabel: "Transactions",
+			},
+			{
+				Title: "Full Table Index Scans",
+				Metrics: []string{
+					"sql.full.scan.count",
+					"sql.full.scan.count.internal",
+				},
+				AxisLabel: "SQL Statements",
+			},
+			{
 				Title: "Byte I/O",
 				Metrics: []string{
 					"sql.bytesin",
@@ -2016,6 +2053,17 @@ var charts = []sectionDescription{
 					"sql.restart_savepoint.started.count.internal",
 					"sql.restart_savepoint.release.started.count.internal",
 					"sql.restart_savepoint.rollback.started.count.internal",
+				},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{SQLLayer, "SQL", "Feature Flag"}},
+		Charts: []chartDescription{
+			{
+				Title: "Feature Flag Denials",
+				Metrics: []string{
+					"sql.feature_flag_denial",
 				},
 			},
 		},
@@ -2269,8 +2317,10 @@ var charts = []sectionDescription{
 					"jobs.import.currently_running",
 					"jobs.restore.currently_running",
 					"jobs.schema_change.currently_running",
+					"jobs.new_schema_change.currently_running",
 					"jobs.schema_change_gc.currently_running",
 					"jobs.typedesc_schema_change.currently_running",
+					"jobs.stream_ingestion.currently_running",
 				},
 			},
 			{
@@ -2358,6 +2408,18 @@ var charts = []sectionDescription{
 				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
 			},
 			{
+				Title: "Schema Change (New Implementation)",
+				Metrics: []string{
+					"jobs.new_schema_change.fail_or_cancel_completed",
+					"jobs.new_schema_change.fail_or_cancel_failed",
+					"jobs.new_schema_change.fail_or_cancel_retry_error",
+					"jobs.new_schema_change.resume_completed",
+					"jobs.new_schema_change.resume_failed",
+					"jobs.new_schema_change.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
 				Title: "Schema Change GC",
 				Metrics: []string{
 					"jobs.schema_change_gc.fail_or_cancel_completed",
@@ -2380,6 +2442,17 @@ var charts = []sectionDescription{
 					"jobs.typedesc_schema_change.resume_retry_error",
 				},
 				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Stream Ingestion",
+				Metrics: []string{
+					"jobs.stream_ingestion.fail_or_cancel_completed",
+					"jobs.stream_ingestion.fail_or_cancel_failed",
+					"jobs.stream_ingestion.fail_or_cancel_retry_error",
+					"jobs.stream_ingestion.resume_completed",
+					"jobs.stream_ingestion.resume_failed",
+					"jobs.stream_ingestion.resume_retry_error",
+				},
 			},
 		},
 	},

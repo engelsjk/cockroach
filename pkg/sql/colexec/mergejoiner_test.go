@@ -1671,7 +1671,6 @@ func TestMergeJoiner(t *testing.T) {
 							DiskQueueCfg:        queueCfg,
 							FDSemaphore:         colexecbase.NewTestingSemaphore(mjFDLimit),
 						}
-						args.TestingKnobs.UseStreamingMemAccountForBuffering = true
 						flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = memoryLimit
 						result, err := TestNewColOperator(ctx, flowCtx, args)
 						if err != nil {
@@ -1846,7 +1845,7 @@ func TestMergeJoinCrossProduct(t *testing.T) {
 			right: hashJoinerSourceSpec{
 				eqCols: []uint32{0}, sourceTypes: typs,
 			},
-		}, leftHJSource, rightHJSource)
+		}, leftHJSource, rightHJSource, HashJoinerInitialNumBuckets)
 	hj.Init()
 
 	var mjOutputTuples, hjOutputTuples tuples
@@ -2233,9 +2232,9 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			rightBatchCreator: repeatedBatchCreator,
 		},
 	} {
-		rowsOptions := []int{1, 16, 128, coldata.BatchSize(), 8 * coldata.BatchSize(), 64 * coldata.BatchSize()}
+		rowsOptions := []int{32, 512, 4 * coldata.BatchSize(), 32 * coldata.BatchSize()}
 		if testing.Short() {
-			rowsOptions = []int{16, coldata.BatchSize(), 64 * coldata.BatchSize()}
+			rowsOptions = []int{512, 4 * coldata.BatchSize()}
 		}
 		for _, nRows := range rowsOptions {
 			b.Run(fmt.Sprintf("%srows=%d", c.namePrefix, nRows), func(b *testing.B) {

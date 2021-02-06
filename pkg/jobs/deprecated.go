@@ -264,29 +264,17 @@ WHERE status IN ($1, $2, $3, $4, $5) ORDER BY created DESC`
 			return errors.Wrap(err, "unable to acquire lease")
 		}
 
-		resultsCh := make(chan tree.Datums)
 		resumer, err := r.createResumer(job, r.settings)
 		if err != nil {
 			r.unregister(*id)
 			return err
 		}
 		log.Infof(ctx, "job %d: resuming execution", *id)
-		errCh, err := r.deprecatedResume(resumeCtx, resumer, resultsCh, job, nil)
+		err = r.deprecatedResume(resumeCtx, resumer, job)
 		if err != nil {
 			r.unregister(*id)
 			return err
 		}
-		go func() {
-			// Drain and ignore results.
-			for range resultsCh {
-			}
-		}()
-		go func() {
-			// Wait for the job to finish. No need to print the error because if there
-			// was one it's been set in the job status already.
-			<-errCh
-			close(resultsCh)
-		}()
 
 		adopted++
 	}
@@ -338,18 +326,9 @@ func (r *Registry) deprecatedCancelAll(ctx context.Context) {
 
 // deprecatedResume starts or resumes a job. If no error is returned then the
 // job was asynchronously executed. The job is executed with the ctx, so ctx
-// must only by canceled if the job should also be canceled. resultsCh is passed
-// to the resumable func and should be closed by the caller after errCh sends
-// a value. The onDone function is called when the async task completes or if
-// an error is returned.
-func (r *Registry) deprecatedResume(
-	ctx context.Context, resumer Resumer, resultsCh chan<- tree.Datums, job *Job, onDone func(),
-) (<-chan error, error) {
-	errCh := make(chan error, 1)
+// must only by canceled if the job should also be canceled.
+func (r *Registry) deprecatedResume(ctx context.Context, resumer Resumer, job *Job) error {
 	if err := r.stopper.RunAsyncTask(ctx, job.taskName(), func(ctx context.Context) {
-		if onDone != nil {
-			defer onDone()
-		}
 		// Bookkeeping.
 		payload := job.Payload()
 		execCtx, cleanup := r.execCtx("resume-"+job.taskName(), payload.UsernameProto.Decode())
@@ -366,17 +345,8 @@ func (r *Registry) deprecatedResume(
 			if job.Payload().FinalResumeError != nil {
 				finalResumeError = errors.DecodeError(ctx, *job.Payload().FinalResumeError)
 			}
-			err = r.stepThroughStateMachine(ctx, execCtx, resumer, resultsCh, job, status, finalResumeError)
+			err = r.stepThroughStateMachine(ctx, execCtx, resumer, job, status, finalResumeError)
 			if err != nil {
-				// TODO (lucy): This needs to distinguish between assertion errors in
-				// the job registry and assertion errors in job execution returned from
-				// Resume() or OnFailOrCancel(), and only fail on the former. We have
-				// tests that purposely introduce bad state in order to produce
-				// assertion errors, which shouldn't cause the test to panic. For now,
-				// comment this out.
-				// if errors.HasAssertionFailure(err) {
-				// 	logcrash.ReportOrPanic(ctx, nil, err.Error())
-				// }
 				log.Errorf(ctx, "job %d: adoption completed with error %v", *job.ID(), err)
 			}
 			status, err := job.CurrentStatus(ctx)
@@ -387,14 +357,10 @@ func (r *Registry) deprecatedResume(
 			}
 		}
 		r.unregister(*job.ID())
-		errCh <- err
 	}); err != nil {
-		if onDone != nil {
-			onDone()
-		}
-		return nil, err
+		return err
 	}
-	return errCh, nil
+	return nil
 }
 
 func (j *Job) deprecatedInsert(

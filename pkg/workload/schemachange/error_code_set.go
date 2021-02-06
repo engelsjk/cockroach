@@ -23,6 +23,12 @@ func makeExpectedErrorSet() errorCodeSet {
 	return errorCodeSet(map[pgcode.Code]bool{})
 }
 
+func (set errorCodeSet) merge(otherSet errorCodeSet) {
+	for code := range otherSet {
+		set[code] = true
+	}
+}
+
 func (set errorCodeSet) add(code pgcode.Code) {
 	set[code] = true
 }
@@ -38,7 +44,7 @@ func (set errorCodeSet) contains(code pgcode.Code) bool {
 	return ok
 }
 
-func (set errorCodeSet) string() string {
+func (set errorCodeSet) String() string {
 	var codes []string
 	for code := range set {
 		codes = append(codes, code.String())

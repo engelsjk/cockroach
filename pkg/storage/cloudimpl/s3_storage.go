@@ -12,6 +12,7 @@ package cloudimpl
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/url"
 	"path"
@@ -36,7 +37,7 @@ type s3Storage struct {
 	conf     *roachpb.ExternalStorage_S3
 	ioConf   base.ExternalIODirConfig
 	prefix   string
-	s3       *s3.S3
+	opts     session.Options
 	settings *cluster.Settings
 }
 
@@ -49,7 +50,8 @@ const (
 	aes256Enc serverSideEncMode = "AES256"
 )
 
-func s3QueryParams(conf *roachpb.ExternalStorage_S3) string {
+// S3URI returns the string URI for a given bucket and path.
+func S3URI(bucket, path string, conf *roachpb.ExternalStorage_S3) string {
 	q := make(url.Values)
 	setIf := func(key, value string) {
 		if value != "" {
@@ -65,7 +67,14 @@ func s3QueryParams(conf *roachpb.ExternalStorage_S3) string {
 	setIf(AWSServerSideEncryptionMode, conf.ServerEncMode)
 	setIf(AWSServerSideEncryptionKMSID, conf.ServerKMSID)
 
-	return q.Encode()
+	s3URL := url.URL{
+		Scheme:   "s3",
+		Host:     bucket,
+		Path:     path,
+		RawQuery: q.Encode(),
+	}
+
+	return s3URL.String()
 }
 
 // MakeS3Storage returns an instance of S3 ExternalStorage.
@@ -78,7 +87,6 @@ func MakeS3Storage(
 	if conf == nil {
 		return nil, errors.Errorf("s3 upload requested but info missing")
 	}
-	region := conf.Region
 	config := conf.Keys()
 	if conf.Endpoint != "" {
 		if ioConf.DisableHTTP {
@@ -87,7 +95,7 @@ func MakeS3Storage(
 		}
 		config.Endpoint = &conf.Endpoint
 		if conf.Region == "" {
-			region = "default-region"
+			conf.Region = "default-region"
 		}
 		client, err := makeHTTPClient(settings)
 		if err != nil {
@@ -130,29 +138,17 @@ func MakeS3Storage(
 		return nil, errors.Errorf("unsupported value %s for %s", conf.Auth, AuthParam)
 	}
 
-	sess, err := session.NewSessionWithOptions(opts)
-	if err != nil {
-		return nil, errors.Wrap(err, "new aws session")
-	}
-	if region == "" {
-		err = delayedRetry(ctx, func() error {
-			var err error
-			region, err = s3manager.GetBucketRegion(ctx, sess, conf.Bucket, "us-east-1")
-			return err
-		})
-		if err != nil {
-			return nil, errors.Wrap(err, "could not find s3 bucket's region")
-		}
-	}
-	sess.Config.Region = aws.String(region)
+	// TODO(yevgeniy): Revisit retry logic.  Retrying 10 times seems arbitrary.
+	maxRetries := 10
+	opts.Config.MaxRetries = &maxRetries
+
 	if conf.Endpoint != "" {
-		sess.Config.S3ForcePathStyle = aws.Bool(true)
+		opts.Config.S3ForcePathStyle = aws.Bool(true)
 	}
 	if log.V(2) {
-		sess.Config.LogLevel = aws.LogLevel(aws.LogDebugWithRequestRetries | aws.LogDebugWithRequestErrors)
+		opts.Config.LogLevel = aws.LogLevel(aws.LogDebugWithRequestRetries | aws.LogDebugWithRequestErrors)
+		opts.Config.CredentialsChainVerboseErrors = aws.Bool(true)
 	}
-	maxRetries := 10
-	sess.Config.MaxRetries = &maxRetries
 
 	// Ensure that a KMS ID is specified if server side encryption is set to use
 	// KMS.
@@ -175,9 +171,27 @@ func MakeS3Storage(
 		conf:     conf,
 		ioConf:   ioConf,
 		prefix:   conf.Prefix,
-		s3:       s3.New(sess),
+		opts:     opts,
 		settings: settings,
 	}, nil
+}
+
+func (s *s3Storage) newS3Client(ctx context.Context) (*s3.S3, error) {
+	sess, err := session.NewSessionWithOptions(s.opts)
+	if err != nil {
+		return nil, errors.Wrap(err, "new aws session")
+	}
+	if s.conf.Region == "" {
+		if err := delayedRetry(ctx, func() error {
+			var err error
+			s.conf.Region, err = s3manager.GetBucketRegion(ctx, sess, s.conf.Bucket, "us-east-1")
+			return err
+		}); err != nil {
+			return nil, errors.Wrap(err, "could not find s3 bucket's region")
+		}
+	}
+	sess.Config.Region = aws.String(s.conf.Region)
+	return s3.New(sess), nil
 }
 
 func (s *s3Storage) Conf() roachpb.ExternalStorage {
@@ -196,7 +210,11 @@ func (s *s3Storage) Settings() *cluster.Settings {
 }
 
 func (s *s3Storage) WriteFile(ctx context.Context, basename string, content io.ReadSeeker) error {
-	err := contextutil.RunWithTimeout(ctx, "put s3 object",
+	client, err := s.newS3Client(ctx)
+	if err != nil {
+		return err
+	}
+	err = contextutil.RunWithTimeout(ctx, "put s3 object",
 		timeoutSetting.Get(&s.settings.SV),
 		func(ctx context.Context) error {
 			putObjectInput := s3.PutObjectInput{
@@ -220,18 +238,25 @@ func (s *s3Storage) WriteFile(ctx context.Context, basename string, content io.R
 						"Supported values are `aws:kms` and `AES256`.", s.conf.ServerEncMode)
 				}
 			}
-			_, err := s.s3.PutObjectWithContext(ctx, &putObjectInput)
+			_, err := client.PutObjectWithContext(ctx, &putObjectInput)
 			return err
 		})
 	return errors.Wrap(err, "failed to put s3 object")
 }
 
-func (s *s3Storage) ReadFile(ctx context.Context, basename string) (io.ReadCloser, error) {
-	// https://github.com/cockroachdb/cockroach/issues/23859
-	out, err := s.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
-		Bucket: s.bucket,
-		Key:    aws.String(path.Join(s.prefix, basename)),
-	})
+func (s *s3Storage) openStreamAt(
+	ctx context.Context, basename string, pos int64,
+) (*s3.GetObjectOutput, error) {
+	client, err := s.newS3Client(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req := &s3.GetObjectInput{Bucket: s.bucket, Key: aws.String(path.Join(s.prefix, basename))}
+	if pos != 0 {
+		req.Range = aws.String(fmt.Sprintf("bytes=%d-", pos))
+	}
+
+	out, err := client.GetObjectWithContext(ctx, req)
 	if err != nil {
 		if aerr := (awserr.Error)(nil); errors.As(err, &aerr) {
 			switch aerr.Code() {
@@ -242,7 +267,51 @@ func (s *s3Storage) ReadFile(ctx context.Context, basename string) (io.ReadClose
 		}
 		return nil, errors.Wrap(err, "failed to get s3 object")
 	}
-	return out.Body, nil
+	return out, nil
+}
+
+// ReadFile is shorthand for ReadFileAt with offset 0.
+func (s *s3Storage) ReadFile(ctx context.Context, basename string) (io.ReadCloser, error) {
+	reader, _, err := s.ReadFileAt(ctx, basename, 0)
+	return reader, err
+}
+
+// ReadFileAt opens a reader at the requested offset.
+func (s *s3Storage) ReadFileAt(
+	ctx context.Context, basename string, offset int64,
+) (io.ReadCloser, int64, error) {
+	stream, err := s.openStreamAt(ctx, basename, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	var size int64
+	if offset != 0 {
+		if stream.ContentRange == nil {
+			return nil, 0, errors.New("expected content range for read at offset")
+		}
+		size, err = checkHTTPContentRangeHeader(*stream.ContentRange, offset)
+		if err != nil {
+			return nil, 0, err
+		}
+	} else {
+		if stream.ContentLength == nil {
+			return nil, 0, errors.New("expected content length")
+		}
+		size = *stream.ContentLength
+	}
+
+	return &resumingReader{
+		ctx: ctx,
+		opener: func(ctx context.Context, pos int64) (io.ReadCloser, error) {
+			s, err := s.openStreamAt(ctx, basename, pos)
+			if err != nil {
+				return nil, err
+			}
+			return s.Body, nil
+		},
+		reader: stream.Body,
+		pos:    offset,
+	}, size, nil
 }
 
 func (s *s3Storage) ListFiles(ctx context.Context, patternSuffix string) ([]string, error) {
@@ -255,9 +324,13 @@ func (s *s3Storage) ListFiles(ctx context.Context, patternSuffix string) ([]stri
 		}
 		pattern = path.Join(pattern, patternSuffix)
 	}
+	client, err := s.newS3Client(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	var matchErr error
-	err := s.s3.ListObjectsPagesWithContext(
+	err = client.ListObjectsPagesWithContext(
 		ctx,
 		&s3.ListObjectsInput{
 			Bucket: s.bucket,
@@ -279,13 +352,8 @@ func (s *s3Storage) ListFiles(ctx context.Context, patternSuffix string) ([]stri
 						}
 						fileList = append(fileList, strings.TrimPrefix(strings.TrimPrefix(*fileObject.Key, s.prefix), "/"))
 					} else {
-						s3URL := url.URL{
-							Scheme:   "s3",
-							Host:     *s.bucket,
-							Path:     *fileObject.Key,
-							RawQuery: s3QueryParams(s.conf),
-						}
-						fileList = append(fileList, s3URL.String())
+
+						fileList = append(fileList, S3URI(*s.bucket, *fileObject.Key, s.conf))
 					}
 				}
 			}
@@ -303,10 +371,14 @@ func (s *s3Storage) ListFiles(ctx context.Context, patternSuffix string) ([]stri
 }
 
 func (s *s3Storage) Delete(ctx context.Context, basename string) error {
+	client, err := s.newS3Client(ctx)
+	if err != nil {
+		return err
+	}
 	return contextutil.RunWithTimeout(ctx, "delete s3 object",
 		timeoutSetting.Get(&s.settings.SV),
 		func(ctx context.Context) error {
-			_, err := s.s3.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
+			_, err := client.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
 				Bucket: s.bucket,
 				Key:    aws.String(path.Join(s.prefix, basename)),
 			})
@@ -315,12 +387,16 @@ func (s *s3Storage) Delete(ctx context.Context, basename string) error {
 }
 
 func (s *s3Storage) Size(ctx context.Context, basename string) (int64, error) {
+	client, err := s.newS3Client(ctx)
+	if err != nil {
+		return 0, err
+	}
 	var out *s3.HeadObjectOutput
-	err := contextutil.RunWithTimeout(ctx, "get s3 object header",
+	err = contextutil.RunWithTimeout(ctx, "get s3 object header",
 		timeoutSetting.Get(&s.settings.SV),
 		func(ctx context.Context) error {
 			var err error
-			out, err = s.s3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
+			out, err = client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
 				Bucket: s.bucket,
 				Key:    aws.String(path.Join(s.prefix, basename)),
 			})

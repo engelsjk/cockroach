@@ -11,12 +11,24 @@
 package storage
 
 import (
+	"bytes"
+	"fmt"
+	"sync"
+
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+)
+
+type intentInterleavingIterConstraint int8
+
+const (
+	notConstrained intentInterleavingIterConstraint = iota
+	constrainedToLocal
+	constrainedToGlobal
 )
 
 // intentInterleavingIter makes separated intents appear as interleaved. It
@@ -46,8 +58,28 @@ import (
 // The one exception to the minimal distance rule is a sub-case of prefix
 // iteration, when we know that no separated intents need to be seen, and so
 // don't bother positioning intentIter.
+//
+// The implementation of intentInterleavingIter assumes callers iterating
+// forward (reverse) are setting an upper (lower) bound. There is protection
+// for misbehavior by the callers that don't set such bounds, by manufacturing
+// bounds. These manufactured bounds prevent the lock table iterator from
+// leaving the lock table key space. We also need to manufacture bounds for
+// the MVCCIterator to prevent it from iterating into the lock table. Note
+// that any manufactured bounds for both the lock table iterator and
+// MVCCIterator must be consistent since the intentInterleavingIter does not
+// like to see a lock with no corresponding provisional value (it will
+// consider than an error). Manufacturing of bounds is complicated by the fact
+// that the MVCC key space is split into two spans: local keys preceding the
+// lock table key space, and global keys. To manufacture a bound, we need to
+// know whether the caller plans to iterate over local or global keys. Setting
+// aside prefix iteration, which doesn't need any of these manufactured
+// bounds, the call to newIntentInterleavingIter must have specified at least
+// one of the lower or upper bound. We use that to "constrain" the iterator as
+// either a local key iterator or global key iterator and panic if a caller
+// violates that in a subsequent SeekGE/SeekLT/SetUpperBound call.
 type intentInterleavingIter struct {
-	prefix bool
+	prefix     bool
+	constraint intentInterleavingIterConstraint
 
 	// iter is for iterating over MVCC keys and interleaved intents.
 	iter MVCCIterator
@@ -88,43 +120,113 @@ type intentInterleavingIter struct {
 	valid bool
 	err   error
 
-	hasUpperBound bool
-
 	intentKeyBuf []byte
 }
 
 var _ MVCCIterator = &intentInterleavingIter{}
 
+var intentInterleavingIterPool = sync.Pool{
+	New: func() interface{} {
+		return &intentInterleavingIter{}
+	},
+}
+
+func isLocal(k roachpb.Key) bool {
+	return len(k) == 0 || keys.IsLocal(k)
+}
+
 func newIntentInterleavingIterator(reader Reader, opts IterOptions) MVCCIterator {
 	if !opts.MinTimestampHint.IsEmpty() || !opts.MaxTimestampHint.IsEmpty() {
 		panic("intentInterleavingIter must not be used with timestamp hints")
 	}
+	var lowerIsLocal, upperIsLocal bool
+	var constraint intentInterleavingIterConstraint
+	if opts.LowerBound != nil {
+		lowerIsLocal = isLocal(opts.LowerBound)
+		if lowerIsLocal {
+			constraint = constrainedToLocal
+		} else {
+			constraint = constrainedToGlobal
+		}
+	}
+	if opts.UpperBound != nil {
+		upperIsLocal = isLocal(opts.UpperBound) || bytes.Equal(opts.UpperBound, keys.LocalMax)
+		if opts.LowerBound != nil && lowerIsLocal != upperIsLocal {
+			panic(fmt.Sprintf(
+				"intentInterleavingIter cannot span from lowerIsLocal %t, %s to upperIsLocal %t, %s",
+				lowerIsLocal, opts.LowerBound.String(), upperIsLocal, opts.UpperBound.String()))
+		}
+		if upperIsLocal {
+			constraint = constrainedToLocal
+		} else {
+			constraint = constrainedToGlobal
+		}
+	}
+	if !opts.Prefix {
+		if opts.LowerBound == nil && opts.UpperBound == nil {
+			// This is the same requirement as pebbleIterator.
+			panic("iterator must set prefix or upper bound or lower bound")
+		}
+		// At least one bound is specified, so constraint != notConstrained. But
+		// may need to manufacture a bound for the currently unbounded side.
+		if opts.LowerBound == nil && constraint == constrainedToGlobal {
+			// Iterating over global keys, and need a lower-bound, to prevent the MVCCIterator
+			// from iterating into the lock table.
+			opts.LowerBound = keys.LocalMax
+		}
+		if opts.UpperBound == nil && constraint == constrainedToLocal {
+			// Iterating over local keys, and need an upper-bound, to prevent the MVCCIterator
+			// from iterating into the lock table.
+			opts.UpperBound = keys.LocalRangeLockTablePrefix
+		}
+	}
+	// Else prefix iteration, so do not need to manufacture bounds for both
+	// iterators since the pebble.Iterator implementation will hide the keys
+	// that do not match the prefix. Note that this is not equivalent to
+	// constraint==notConstrained -- it is acceptable for a caller to specify a
+	// bound for prefix iteration, though since they don't need to, most callers
+	// don't.
+
 	intentOpts := opts
 	var intentKeyBuf []byte
 	if opts.LowerBound != nil {
 		intentOpts.LowerBound, intentKeyBuf = keys.LockTableSingleKey(opts.LowerBound, nil)
+	} else if !opts.Prefix {
+		// Make sure we don't step outside the lock table key space. Note that
+		// this is the case where the lower bound was not set and
+		// constrainedToLocal.
+		intentOpts.LowerBound = keys.LockTableSingleKeyStart
 	}
 	if opts.UpperBound != nil {
 		intentOpts.UpperBound, _ = keys.LockTableSingleKey(opts.UpperBound, nil)
+	} else if !opts.Prefix {
+		// Make sure we don't step outside the lock table key space. Note that
+		// this is the case where the upper bound was not set and
+		// constrainedToGlobal.
+		intentOpts.UpperBound = keys.LockTableSingleKeyEnd
 	}
 	// Note that we can reuse intentKeyBuf after NewEngineIterator returns.
 	intentIter := reader.NewEngineIterator(intentOpts)
 
-	// We assume that callers iterating forward will set an upper bound,
-	// and callers iterating in reverse will set a lower bound, which
-	// will prevent them from accidentally iterating into the lock-table
-	// key space. The MVCCIterator implementations require one of the bounds
-	// or prefix iteration. We remember whether the upper bound has been
-	// set, so if not set, we can set the upper bound when SeekGE is called
-	// for prefix iteration.
-	iter := reader.NewMVCCIterator(MVCCKeyIterKind, opts)
-	return &intentInterleavingIter{
-		prefix:        opts.Prefix,
-		iter:          iter,
-		intentIter:    intentIter,
-		hasUpperBound: opts.UpperBound != nil,
-		intentKeyBuf:  intentKeyBuf,
+	// The creation of these iterators can race with concurrent mutations, which
+	// may make them inconsistent with each other. So we clone here, to ensure
+	// consistency (certain Reader implementations already ensure consistency,
+	// and we use that when possible to save allocations).
+	var iter MVCCIterator
+	if reader.ConsistentIterators() {
+		iter = reader.NewMVCCIterator(MVCCKeyIterKind, opts)
+	} else {
+		iter = newMVCCIteratorByCloningEngineIter(intentIter, opts)
 	}
+	iiIter := intentInterleavingIterPool.Get().(*intentInterleavingIter)
+	*iiIter = intentInterleavingIter{
+		prefix:       opts.Prefix,
+		constraint:   constraint,
+		iter:         iter,
+		intentIter:   intentIter,
+		intentKeyBuf: intentKeyBuf,
+	}
+	return iiIter
 }
 
 func (i *intentInterleavingIter) SeekGE(key MVCCKey) {
@@ -132,15 +234,8 @@ func (i *intentInterleavingIter) SeekGE(key MVCCKey) {
 	i.valid = true
 	i.err = nil
 
-	if i.prefix {
-		// Caller will use a mix of SeekGE and Next. If key is before the lock table key
-		// space, make sure there is an upper bound, if not explicitly set at creation time
-		// or using SetUpperBound. We do not set hasUpperBound to true since this is
-		// an implicit (not set by the user) upper-bound, and we want to change it on
-		// a subsequent call to SeekGE.
-		if !i.hasUpperBound && keys.IsLocal(key.Key) && !keys.IsLocalStoreKey(key.Key) {
-			i.iter.SetUpperBound(keys.LocalRangeLockTablePrefix)
-		}
+	if i.constraint != notConstrained {
+		i.checkConstraint(key.Key, false)
 	}
 	var intentSeekKey roachpb.Key
 	if key.Timestamp.IsEmpty() {
@@ -168,6 +263,24 @@ func (i *intentInterleavingIter) SeekGE(key MVCCKey) {
 	}
 	i.iter.SeekGE(key)
 	i.computePos()
+}
+
+func (i *intentInterleavingIter) checkConstraint(k roachpb.Key, isExclusiveUpper bool) {
+	kConstraint := constrainedToGlobal
+	if isLocal(k) {
+		if bytes.Compare(k, keys.LocalRangeLockTablePrefix) > 0 {
+			panic(fmt.Sprintf("intentInterleavingIter cannot be used with invalid local keys %s",
+				k.String()))
+		}
+		kConstraint = constrainedToLocal
+	} else if isExclusiveUpper && bytes.Equal(k, keys.LocalMax) {
+		kConstraint = constrainedToLocal
+	}
+	if kConstraint != i.constraint {
+		panic(fmt.Sprintf(
+			"iterator with constraint=%d is being used with key %s that has constraint=%d",
+			i.constraint, k.String(), kConstraint))
+	}
 }
 
 func (i *intentInterleavingIter) computePos() {
@@ -468,6 +581,8 @@ func (i *intentInterleavingIter) Value() []byte {
 func (i *intentInterleavingIter) Close() {
 	i.iter.Close()
 	i.intentIter.Close()
+	*i = intentInterleavingIter{}
+	intentInterleavingIterPool.Put(i)
 }
 
 func (i *intentInterleavingIter) SeekLT(key MVCCKey) {
@@ -475,19 +590,31 @@ func (i *intentInterleavingIter) SeekLT(key MVCCKey) {
 	i.valid = true
 	i.err = nil
 
+	if i.prefix {
+		i.err = errors.Errorf("prefix iteration is not permitted with SeekLT")
+		i.valid = false
+		return
+	}
+	if i.constraint != notConstrained {
+		i.checkConstraint(key.Key, true)
+		if i.constraint == constrainedToLocal && bytes.Equal(key.Key, keys.LocalMax) {
+			// Move it down to below the lock table so can iterate down cleanly into
+			// the local key space. Note that we disallow anyone using a seek key
+			// that is a local key above the lock table, and there should no keys in
+			// the engine there either (at least not keys that we need to see using
+			// an MVCCIterator).
+			key.Key = keys.LocalRangeLockTablePrefix
+		}
+	}
+
 	var intentSeekKey roachpb.Key
 	if key.Timestamp.IsEmpty() {
 		// Common case.
 		intentSeekKey, i.intentKeyBuf = keys.LockTableSingleKey(key.Key, i.intentKeyBuf)
 	} else {
-		// Seeking to a specific version, so need to see the intent.
-		if i.prefix {
-			i.err = errors.Errorf("prefix iteration is not permitted with SeekLT")
-			i.valid = false
-			return
-		}
-		// Since we need to see the intent for key.Key, and we don't have SeekLE, call
-		// Next() on the key before doing SeekLT.
+		// Seeking to a specific version, so need to see the intent. Since we need
+		// to see the intent for key.Key, and we don't have SeekLE, call Next() on
+		// the key before doing SeekLT.
 		intentSeekKey, i.intentKeyBuf = keys.LockTableSingleKey(key.Key.Next(), i.intentKeyBuf)
 	}
 	valid, err := i.intentIter.SeekEngineKeyLT(EngineKey{Key: intentSeekKey})
@@ -681,11 +808,13 @@ func (i *intentInterleavingIter) CheckForKeyCollisions(
 
 func (i *intentInterleavingIter) SetUpperBound(key roachpb.Key) {
 	i.iter.SetUpperBound(key)
+	// Preceding call to SetUpperBound has confirmed that key != nil.
+	if i.constraint != notConstrained {
+		i.checkConstraint(key, true)
+	}
 	var intentUpperBound roachpb.Key
 	intentUpperBound, i.intentKeyBuf = keys.LockTableSingleKey(key, i.intentKeyBuf)
-	// Note that we can reuse intentKeyBuf after SetUpperBound returns.
 	i.intentIter.SetUpperBound(intentUpperBound)
-	i.hasUpperBound = key != nil
 }
 
 func (i *intentInterleavingIter) Stats() IteratorStats {
@@ -695,4 +824,16 @@ func (i *intentInterleavingIter) Stats() IteratorStats {
 
 func (i *intentInterleavingIter) SupportsPrev() bool {
 	return true
+}
+
+// newMVCCIteratorByCloningEngineIter assumes MVCCKeyIterKind and no timestamp
+// hints. It uses pebble.Iterator.Clone to ensure that the two iterators see
+// the identical engine state.
+func newMVCCIteratorByCloningEngineIter(iter EngineIterator, opts IterOptions) MVCCIterator {
+	pIter := iter.GetRawIter()
+	it := newPebbleIterator(nil, pIter, opts)
+	if iter == nil {
+		panic("couldn't create a new iterator")
+	}
+	return it
 }

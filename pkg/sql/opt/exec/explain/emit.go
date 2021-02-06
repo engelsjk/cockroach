@@ -23,7 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/dustin/go-humanize"
 )
 
 // Emit produces the EXPLAIN output against the given OutputBuilder. The
@@ -104,7 +106,7 @@ func Emit(plan *Plan, ob *OutputBuilder, spanFormatFn SpanFormatFn) error {
 		ob.LeaveNode()
 	}
 	for _, n := range plan.Checks {
-		ob.EnterMetaNode("fk-check")
+		ob.EnterMetaNode("constraint-check")
 		if err := walk(n); err != nil {
 			return err
 		}
@@ -114,8 +116,9 @@ func Emit(plan *Plan, ob *OutputBuilder, spanFormatFn SpanFormatFn) error {
 	return nil
 }
 
-// SpanFormatFn is a function used to format spans for EXPLAIN. Only called when
-// there is an index constraint or an inverted constraint.
+// SpanFormatFn is a function used to format spans for EXPLAIN. Only called on
+// non-virtual tables, when there is an index constraint or an inverted
+// constraint.
 type SpanFormatFn func(table cat.Table, index cat.Index, scanParams exec.ScanParams) string
 
 // omitTrivialProjections returns the given node and its result columns and
@@ -250,6 +253,7 @@ var nodeNames = [...]string{
 	cancelSessionsOp:       "cancel sessions",
 	controlJobsOp:          "control jobs",
 	controlSchedulesOp:     "control schedules",
+	createStatisticsOp:     "create statistics",
 	createTableOp:          "create table",
 	createTableAsOp:        "create table as",
 	createViewOp:           "create view",
@@ -259,7 +263,6 @@ var nodeNames = [...]string{
 	errorIfRowsOp:          "error if rows",
 	explainOp:              "explain",
 	explainOptOp:           "explain",
-	explainPlanOp:          "explain",
 	exportOp:               "export",
 	filterOp:               "filter",
 	groupByOp:              "group",
@@ -328,7 +331,15 @@ func (e *emitter) joinNodeName(algo string, joinType descpb.JoinType) string {
 func (e *emitter) emitNodeAttributes(n *Node) error {
 	if stats, ok := n.annotations[exec.ExecutionStatsID]; ok {
 		s := stats.(*exec.ExecutionStats)
-		e.ob.Attr("actual row count", s.RowCount)
+		if s.RowCount.HasValue() {
+			e.ob.AddField("actual row count", humanizeutil.Count(s.RowCount.Value()))
+		}
+		if s.KVRowsRead.HasValue() {
+			e.ob.AddField("KV rows read", humanizeutil.Count(s.KVRowsRead.Value()))
+		}
+		if s.KVBytesRead.HasValue() {
+			e.ob.AddField("KV bytes read", humanize.IBytes(s.KVBytesRead.Value()))
+		}
 	}
 
 	if stats, ok := n.annotations[exec.EstimatedStatsID]; ok {
@@ -339,19 +350,19 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		// scans (and when it is based on real statistics), where it is most useful
 		// and accurate.
 		if n.op != valuesOp && (e.ob.flags.Verbose || n.op == scanOp) {
-			count := int(math.Round(s.RowCount))
+			count := uint64(math.Round(s.RowCount))
 			if s.TableStatsAvailable {
-				e.ob.Attr("estimated row count", count)
+				e.ob.AddField("estimated row count", humanizeutil.Count(count))
 			} else {
 				// No stats available.
 				if e.ob.flags.Verbose {
-					e.ob.Attrf("estimated row count", "%d (missing stats)", count)
+					e.ob.Attrf("estimated row count", "%s (missing stats)", humanizeutil.Count(count))
 				} else {
 					// In non-verbose mode, don't show the row count (which is not based
 					// on reality); only show a "missing stats" field. Don't show it for
 					// virtual tables though, where we expect no stats.
 					if !n.args.(*scanArgs).Table.IsVirtualTable() {
-						e.ob.Attr("missing stats", "")
+						e.ob.AddField("missing stats", "")
 					}
 				}
 			}
@@ -392,7 +403,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		if ob.flags.Verbose {
 			a := n.args.(*renderArgs)
 			for i := range a.Exprs {
-				ob.Expr(fmt.Sprintf("render %d", i), a.Exprs[i], a.Input.Columns())
+				ob.Expr(fmt.Sprintf("render %s", a.Columns[i].Name), a.Exprs[i], a.Input.Columns())
 			}
 		}
 
@@ -579,9 +590,9 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		if a.AutoCommit {
 			ob.Attr("auto commit", "")
 		}
-		if len(a.Arbiters) > 0 {
+		if len(a.ArbiterIndexes) > 0 {
 			var sb strings.Builder
-			for i, idx := range a.Arbiters {
+			for i, idx := range a.ArbiterIndexes {
 				index := a.Table.Index(idx)
 				if i > 0 {
 					sb.WriteString(", ")
@@ -589,6 +600,17 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 				sb.WriteString(string(index.Name()))
 			}
 			ob.Attr("arbiter indexes", sb.String())
+		}
+		if len(a.ArbiterConstraints) > 0 {
+			var sb strings.Builder
+			for i, uc := range a.ArbiterConstraints {
+				uniqueConstraint := a.Table.Unique(uc)
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(uniqueConstraint.Name())
+			}
+			ob.Attr("arbiter constraints", sb.String())
 		}
 
 	case insertFastPathOp:
@@ -618,9 +640,9 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		if a.AutoCommit {
 			ob.Attr("auto commit", "")
 		}
-		if len(a.Arbiters) > 0 {
+		if len(a.ArbiterIndexes) > 0 {
 			var sb strings.Builder
-			for i, idx := range a.Arbiters {
+			for i, idx := range a.ArbiterIndexes {
 				index := a.Table.Index(idx)
 				if i > 0 {
 					sb.WriteString(", ")
@@ -628,6 +650,17 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 				sb.WriteString(string(index.Name()))
 			}
 			ob.Attr("arbiter indexes", sb.String())
+		}
+		if len(a.ArbiterConstraints) > 0 {
+			var sb strings.Builder
+			for i, uc := range a.ArbiterConstraints {
+				uniqueConstraint := a.Table.Unique(uc)
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(uniqueConstraint.Name())
+			}
+			ob.Attr("arbiter constraints", sb.String())
 		}
 
 	case updateOp:
@@ -665,7 +698,6 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		max1RowOp,
 		explainOptOp,
 		explainOp,
-		explainPlanOp,
 		showTraceOp,
 		createTableOp,
 		createTableAsOp,
@@ -683,6 +715,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		controlSchedulesOp,
 		cancelQueriesOp,
 		cancelSessionsOp,
+		createStatisticsOp,
 		exportOp:
 
 	default:
@@ -713,8 +746,8 @@ func (e *emitter) spansStr(table cat.Table, index cat.Index, scanParams exec.Sca
 		return "FULL SCAN"
 	}
 
-	// In verbose mode show the physical spans.
-	if e.ob.flags.Verbose {
+	// In verbose mode show the physical spans, unless the table is virtual.
+	if e.ob.flags.Verbose && !table.IsVirtualTable() {
 		return e.spanFormatFn(table, index, scanParams)
 	}
 

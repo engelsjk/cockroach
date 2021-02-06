@@ -12,11 +12,12 @@ package sql
 
 import (
 	"context"
+	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
@@ -70,7 +71,11 @@ func setupGenerator(
 ) (next virtualTableGenerator, cleanup cleanupFunc) {
 	var cancel func()
 	ctx, cancel = context.WithCancel(ctx)
-	cleanup = cancel
+	var wg sync.WaitGroup
+	cleanup = func() {
+		cancel()
+		wg.Wait()
+	}
 
 	// comm is the channel to manage communication between the row receiver
 	// and the generator. The row receiver notifies the worker to begin
@@ -101,7 +106,9 @@ func setupGenerator(
 		return nil
 	}
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		// We wait until a call to next before starting the worker. This prevents
 		// concurrent transaction usage during the startup phase. We also have to
 		// wait on done here if cleanup is called before any calls to next() to
@@ -196,7 +203,7 @@ type vTableLookupJoinNode struct {
 
 	dbName string
 	db     *dbdesc.Immutable
-	table  *tabledesc.Immutable
+	table  catalog.TableDescriptor
 	index  *descpb.IndexDescriptor
 	// eqCol is the single equality column ordinal into the lookup table. Virtual
 	// indexes only support a single indexed column currently.
@@ -247,10 +254,9 @@ func (v *vTableLookupJoinNode) startExec(params runParams) error {
 	)
 	v.run.indexKeyDatums = make(tree.Datums, len(v.columns))
 	var err error
-	db, err := params.p.LogicalSchemaAccessor().GetDatabaseDesc(
+	_, db, err := params.p.Descriptors().GetImmutableDatabaseByName(
 		params.ctx,
 		params.p.txn,
-		params.p.ExecCfg().Codec,
 		v.dbName,
 		tree.DatabaseLookupFlags{
 			Required: true, AvoidCached: params.p.avoidCachedDescriptors,
@@ -259,7 +265,7 @@ func (v *vTableLookupJoinNode) startExec(params runParams) error {
 	if err != nil {
 		return err
 	}
-	v.db = db.(*dbdesc.Immutable)
+	v.db = db
 	return err
 }
 
@@ -294,7 +300,7 @@ func (v *vTableLookupJoinNode) Next(params runParams) (bool, error) {
 		genFunc := v.virtualTableEntry.makeConstrainedRowsGenerator(params.ctx,
 			params.p, v.db, v.index,
 			v.run.indexKeyDatums,
-			v.table.ColumnIdxMap(),
+			catalog.ColumnIDToOrdinalMap(v.table.PublicColumns()),
 			&idxConstraint,
 			v.vtableCols,
 		)

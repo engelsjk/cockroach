@@ -51,12 +51,13 @@ const (
 // minLeaseTransferInterval controls how frequently leases can be transferred
 // for rebalancing. It does not prevent transferring leases in order to allow
 // a replica to be removed from a range.
-var minLeaseTransferInterval = settings.RegisterNonNegativeDurationSetting(
+var minLeaseTransferInterval = settings.RegisterDurationSetting(
 	"kv.allocator.min_lease_transfer_interval",
 	"controls how frequently leases can be transferred for rebalancing. "+
 		"It does not prevent transferring leases in order to allow a "+
 		"replica to be removed from a range.",
 	1*time.Second,
+	settings.NonNegativeDuration,
 )
 
 // TODO(aayush): Expand this metric set to include metrics about non-voting replicas.
@@ -210,7 +211,7 @@ func newReplicateQueue(store *Store, g *gossip.Gossip, allocator Allocator) *rep
 }
 
 func (rq *replicateQueue) shouldQueue(
-	ctx context.Context, now hlc.Timestamp, repl *Replica, sysCfg *config.SystemConfig,
+	ctx context.Context, now hlc.ClockTimestamp, repl *Replica, sysCfg *config.SystemConfig,
 ) (shouldQ bool, priority float64) {
 	desc, zone := repl.DescAndZone()
 	action, priority := rq.allocator.ComputeAction(ctx, zone, desc)
@@ -221,7 +222,7 @@ func (rq *replicateQueue) shouldQueue(
 	if action == AllocatorRemoveLearner {
 		return true, priority
 	}
-	voterReplicas := desc.Replicas().Voters()
+	voterReplicas := desc.Replicas().VoterDescriptors()
 
 	if action == AllocatorNoop {
 		log.VEventf(ctx, 2, "no action to take")
@@ -243,13 +244,13 @@ func (rq *replicateQueue) shouldQueue(
 	}
 
 	// If the lease is valid, check to see if we should transfer it.
-	if lease, _ := repl.GetLease(); repl.IsLeaseValid(ctx, lease, now) {
-		if rq.canTransferLease() &&
-			rq.allocator.ShouldTransferLease(
-				ctx, zone, voterReplicas, lease.Replica.StoreID, repl.leaseholderStats) {
-			log.VEventf(ctx, 2, "lease transfer needed, enqueuing")
-			return true, 0
-		}
+	status := repl.LeaseStatusAt(ctx, now)
+	if status.IsValid() &&
+		rq.canTransferLease() &&
+		rq.allocator.ShouldTransferLease(ctx, zone, voterReplicas, status.Lease.Replica.StoreID, repl.leaseholderStats) {
+
+		log.VEventf(ctx, 2, "lease transfer needed, enqueuing")
+		return true, 0
 	}
 
 	return false, 0
@@ -271,7 +272,7 @@ func (rq *replicateQueue) process(
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		for {
 			requeue, err := rq.processOneChange(ctx, repl, rq.canTransferLease, false /* dryRun */)
-			if IsSnapshotError(err) {
+			if isSnapshotError(err) {
 				// If ChangeReplicas failed because the snapshot failed, we log the
 				// error but then return success indicating we should retry the
 				// operation. The most likely causes of the snapshot failing are a
@@ -320,25 +321,12 @@ func (rq *replicateQueue) processOneChange(
 
 	// Avoid taking action if the range has too many dead replicas to make
 	// quorum.
-	voterReplicas := desc.Replicas().Voters()
+	voterReplicas := desc.Replicas().VoterDescriptors()
 	liveVoterReplicas, deadVoterReplicas := rq.allocator.storePool.liveAndDeadReplicas(voterReplicas)
-	{
-		unavailable := !desc.Replicas().CanMakeProgress(func(rDesc roachpb.ReplicaDescriptor) bool {
-			for _, inner := range liveVoterReplicas {
-				if inner.ReplicaID == rDesc.ReplicaID {
-					return true
-				}
-			}
-			return false
-		})
-		if unavailable {
-			return false, newQuorumError(
-				"range requires a replication change, but live replicas %v don't constitute a quorum for %v:",
-				liveVoterReplicas,
-				desc.Replicas().All(),
-			)
-		}
-	}
+
+	// NB: the replication layer ensures that the below operations don't cause
+	// unavailability; see:
+	_ = execChangeReplicasTxn
 
 	action, _ := rq.allocator.ComputeAction(ctx, zone, desc)
 	log.VEventf(ctx, 1, "next replica action: %s", action)
@@ -665,7 +653,7 @@ func (rq *replicateQueue) maybeTransferLeaseAway(
 	// out of situations where this store is overfull and yet holds all the
 	// leases. The fullness checks need to be ignored for cases where
 	// a replica needs to be removed for constraint violations.
-	return rq.findTargetAndTransferLease(
+	transferred, err := rq.shedLease(
 		ctx,
 		repl,
 		desc,
@@ -674,6 +662,7 @@ func (rq *replicateQueue) maybeTransferLeaseAway(
 			dryRun: dryRun,
 		},
 	)
+	return transferred == transferOK, err
 }
 
 func (rq *replicateQueue) remove(
@@ -721,7 +710,7 @@ func (rq *replicateQueue) removeDecommissioning(
 	ctx context.Context, repl *Replica, dryRun bool,
 ) (requeue bool, _ error) {
 	desc, _ := repl.DescAndZone()
-	decommissioningReplicas := rq.allocator.storePool.decommissioningReplicas(desc.Replicas().All())
+	decommissioningReplicas := rq.allocator.storePool.decommissioningReplicas(desc.Replicas().Descriptors())
 	if len(decommissioningReplicas) == 0 {
 		log.VEventf(ctx, 1, "range of replica %s was identified as having decommissioning replicas, "+
 			"but no decommissioning replicas were found", repl)
@@ -795,7 +784,7 @@ func (rq *replicateQueue) removeLearner(
 	ctx context.Context, repl *Replica, dryRun bool,
 ) (requeue bool, _ error) {
 	desc := repl.Desc()
-	learnerReplicas := desc.Replicas().Learners()
+	learnerReplicas := desc.Replicas().LearnerDescriptors()
 	if len(learnerReplicas) == 0 {
 		log.VEventf(ctx, 1, "range of replica %s was identified as having learner replicas, "+
 			"but no learner replicas were found", repl)
@@ -908,32 +897,26 @@ func (rq *replicateQueue) considerRebalance(
 		}
 	}
 
-	if canTransferLease() {
-		// We require the lease in order to process replicas, so
-		// repl.store.StoreID() corresponds to the lease-holder's store ID.
-		transferred, err := rq.findTargetAndTransferLease(
-			ctx,
-			repl,
-			desc,
-			zone,
-			transferLeaseOptions{
-				checkTransferLeaseSource: true,
-				checkCandidateFullness:   true,
-				dryRun:                   dryRun,
-			},
-		)
-		if err != nil {
-			return false, err
-		}
-		// Do not requeue as we transferred our lease away.
-		if transferred {
-			return false, nil
-		}
+	if !canTransferLease() {
+		// No action was necessary and no rebalance target was found. Return
+		// without re-queuing this replica.
+		return false, nil
 	}
 
-	// No action was necessary and no rebalance target was found. Return
-	// without re-queuing this replica.
-	return false, nil
+	// We require the lease in order to process replicas, so
+	// repl.store.StoreID() corresponds to the lease-holder's store ID.
+	_, err := rq.shedLease(
+		ctx,
+		repl,
+		desc,
+		zone,
+		transferLeaseOptions{
+			checkTransferLeaseSource: true,
+			checkCandidateFullness:   true,
+			dryRun:                   dryRun,
+		},
+	)
+	return false, err
 }
 
 type transferLeaseOptions struct {
@@ -942,19 +925,47 @@ type transferLeaseOptions struct {
 	dryRun                   bool
 }
 
-func (rq *replicateQueue) findTargetAndTransferLease(
+// leaseTransferOutcome represents the result of shedLease().
+type leaseTransferOutcome int
+
+const (
+	transferErr leaseTransferOutcome = iota
+	transferOK
+	noTransferDryRun
+	noSuitableTarget
+)
+
+func (o leaseTransferOutcome) String() string {
+	switch o {
+	case transferErr:
+		return "err"
+	case transferOK:
+		return "ok"
+	case noTransferDryRun:
+		return "no transfer; dry run"
+	case noSuitableTarget:
+		return "no suitable transfer target found"
+	default:
+		return fmt.Sprintf("unexpected status value: %d", o)
+	}
+}
+
+// shedLease takes in a leaseholder replica, looks for a target for transferring
+// the lease and, if a suitable target is found (e.g. alive, not draining),
+// transfers the lease away.
+func (rq *replicateQueue) shedLease(
 	ctx context.Context,
 	repl *Replica,
 	desc *roachpb.RangeDescriptor,
 	zone *zonepb.ZoneConfig,
 	opts transferLeaseOptions,
-) (bool, error) {
+) (leaseTransferOutcome, error) {
 	// Learner replicas aren't allowed to become the leaseholder or raft leader,
-	// so only consider the `Voters` replicas.
+	// so only consider the `VoterDescriptors` replicas.
 	target := rq.allocator.TransferLeaseTarget(
 		ctx,
 		zone,
-		desc.Replicas().Voters(),
+		desc.Replicas().VoterDescriptors(),
 		repl.store.StoreID(),
 		repl.leaseholderStats,
 		opts.checkTransferLeaseSource,
@@ -962,20 +973,22 @@ func (rq *replicateQueue) findTargetAndTransferLease(
 		false, /* alwaysAllowDecisionWithoutStats */
 	)
 	if target == (roachpb.ReplicaDescriptor{}) {
-		return false, nil
+		return noSuitableTarget, nil
 	}
 
 	if opts.dryRun {
 		log.VEventf(ctx, 1, "transferring lease to s%d", target.StoreID)
-		return false, nil
+		return noTransferDryRun, nil
 	}
 
 	avgQPS, qpsMeasurementDur := repl.leaseholderStats.avgQPS()
 	if qpsMeasurementDur < MinStatsDuration {
 		avgQPS = 0
 	}
-	err := rq.transferLease(ctx, repl, target, avgQPS)
-	return err == nil, err
+	if err := rq.transferLease(ctx, repl, target, avgQPS); err != nil {
+		return transferErr, err
+	}
+	return transferOK, nil
 }
 
 func (rq *replicateQueue) transferLease(
@@ -1005,7 +1018,10 @@ func (rq *replicateQueue) changeReplicas(
 	if dryRun {
 		return nil
 	}
-	if _, err := repl.ChangeReplicas(ctx, desc, priority, reason, details, chgs); err != nil {
+	// NB: this calls the impl rather than ChangeReplicas because
+	// the latter traps tests that try to call it while the replication
+	// queue is active.
+	if _, err := repl.changeReplicasImpl(ctx, desc, priority, reason, details, chgs); err != nil {
 		return err
 	}
 	rangeUsageInfo := rangeUsageInfoForRepl(repl)

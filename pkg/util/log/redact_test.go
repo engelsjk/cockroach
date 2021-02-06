@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -33,9 +34,9 @@ const escapeMark = "?"
 // when redactable logs are enabled, and no mark indicator when they
 // are not.
 func TestRedactedLogOutput(t *testing.T) {
-	s := ScopeWithoutShowLogs(t)
-	defer s.Close(t)
-	setFlags()
+	defer leaktest.AfterTest(t)()
+	defer ScopeWithoutShowLogs(t).Close(t)
+
 	defer capture()()
 
 	defer TestingSetRedactable(false)()
@@ -59,7 +60,7 @@ func TestRedactedLogOutput(t *testing.T) {
 	resetCaptured()
 	_ = TestingSetRedactable(true)
 	Errorf(context.Background(), "test3 %v end", "hello")
-	if !contains(redactableIndicator+" test3", t) {
+	if !contains(redactableIndicator+" [-] 3  test3", t) {
 		t.Errorf("expected marker indicator, got %q", contents())
 	}
 	if !contains("test3 "+startRedactable+"hello"+endRedactable+" end", t) {
@@ -71,7 +72,7 @@ func TestRedactedLogOutput(t *testing.T) {
 	Errorf(context.Background(), "test3e %v end",
 		errors.AssertionFailedf("hello %v",
 			errors.Newf("error-in-error %s", "world")))
-	if !contains(redactableIndicator+" test3e", t) {
+	if !contains(redactableIndicator+" [-] 4  test3e", t) {
 		t.Errorf("expected marker indicator, got %q", contents())
 	}
 	if !contains("test3e hello error-in-error "+startRedactable+"world"+endRedactable+" end", t) {
@@ -118,13 +119,15 @@ func TestRedactTags(t *testing.T) {
 	}
 
 	for _, tc := range testData {
-		var buf strings.Builder
-		renderTagsAsRedactable(tc.ctx, &buf)
-		assert.Equal(t, tc.expected, buf.String())
+		tags := logtags.FromContext(tc.ctx)
+		actual := renderTagsAsRedactable(tags)
+		assert.Equal(t, tc.expected, string(actual))
 	}
 }
 
 func TestRedactedDecodeFile(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
 	testData := []struct {
 		redactMode    EditSensitiveData
 		expRedactable bool
@@ -143,8 +146,6 @@ func TestRedactedDecodeFile(t *testing.T) {
 			// The log file go to a different directory in each sub-test.
 			s := ScopeWithoutShowLogs(t)
 			defer s.Close(t)
-			setFlags()
-			defer TestingSetRedactable(true)()
 
 			// Force file re-initialization.
 			s.Rotate(t)
@@ -183,7 +184,8 @@ func TestRedactedDecodeFile(t *testing.T) {
 				}
 				if strings.HasSuffix(entry.File, "redact_test.go") {
 					assert.Equal(t, tc.expRedactable, entry.Redactable)
-					assert.Equal(t, tc.expMessage, entry.Message)
+					msg := strings.TrimPrefix(strings.TrimSpace(entry.Message), "1  ")
+					assert.Equal(t, tc.expMessage, msg)
 					foundMessage = true
 				}
 			}
@@ -194,26 +196,13 @@ func TestRedactedDecodeFile(t *testing.T) {
 	}
 }
 
-// TestRedactableFlag checks that --redactable-logs does its job.
-// TODO(knz): Remove this with
-// https://github.com/cockroachdb/cockroach/pull/51987.
-func TestRedactableFlag(t *testing.T) {
-	s := ScopeWithoutShowLogs(t)
-	defer s.Close(t)
-	setFlags()
+// TestDefaultRedactable checks that redaction markers are enabled by
+// default.
+func TestDefaultRedactable(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer ScopeWithoutShowLogs(t).Close(t)
 
-	TestingResetActive()
-
-	// Request redaction markers in generated files.
-	defer func(p bool) { logging.redactableLogsRequested = p }(logging.redactableLogsRequested)
-	logging.redactableLogsRequested = true
-	// Propagate the flag.
-	cleanup, err := SetupRedactionAndStderrRedirects()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	// Now we check that they are present.
+	// Check redaction markers in the output.
 	defer capture()()
 	Infof(context.Background(), "safe %s", "unsafe")
 

@@ -69,11 +69,11 @@ var MinLeaseTransferStatsDuration = 30 * time.Second
 // enableLoadBasedLeaseRebalancing controls whether lease rebalancing is done
 // via the new heuristic based on request load and latency or via the simpler
 // approach that purely seeks to balance the number of leases per node evenly.
-var enableLoadBasedLeaseRebalancing = settings.RegisterPublicBoolSetting(
+var enableLoadBasedLeaseRebalancing = settings.RegisterBoolSetting(
 	"kv.allocator.load_based_lease_rebalancing.enabled",
 	"set to enable rebalancing of range leases based on load and latency",
 	true,
-)
+).WithPublic()
 
 // leaseRebalancingAggressiveness enables users to tweak how aggressive their
 // cluster is at moving leases towards the localities where the most requests
@@ -83,11 +83,12 @@ var enableLoadBasedLeaseRebalancing = settings.RegisterPublicBoolSetting(
 //
 // Setting this to 0 effectively disables load-based lease rebalancing, and
 // settings less than 0 are disallowed.
-var leaseRebalancingAggressiveness = settings.RegisterNonNegativeFloatSetting(
+var leaseRebalancingAggressiveness = settings.RegisterFloatSetting(
 	"kv.allocator.lease_rebalancing_aggressiveness",
 	"set greater than 1.0 to rebalance leases toward load more aggressively, "+
 		"or between 0 and 1.0 to be more conservative about rebalancing leases",
 	1.0,
+	settings.NonNegativeFloat,
 )
 
 // AllocatorAction enumerates the various replication adjustments that may be
@@ -345,7 +346,7 @@ func (a *Allocator) ComputeAction(
 	// On the other hand if we get the race where a leaseholder starts adding a
 	// replica in the replicate queue and during this loses its lease, it should
 	// probably not retry.
-	if learners := desc.Replicas().Learners(); len(learners) > 0 {
+	if learners := desc.Replicas().LearnerDescriptors(); len(learners) > 0 {
 		// TODO(dan): Since this goes before anything else, the priority here should
 		// be influenced by whatever operations would happen right after the learner
 		// is removed. In the meantime, we don't want to block something important
@@ -355,7 +356,7 @@ func (a *Allocator) ComputeAction(
 		return AllocatorRemoveLearner, removeLearnerReplicaPriority
 	}
 	// computeAction expects to operate only on voters.
-	return a.computeAction(ctx, zone, desc.Replicas().Voters())
+	return a.computeAction(ctx, zone, desc.Replicas().VoterDescriptors())
 }
 
 func (a *Allocator) computeAction(
@@ -494,17 +495,17 @@ func (a *Allocator) AllocateTarget(
 
 func (a *Allocator) allocateTargetFromList(
 	ctx context.Context,
-	sl StoreList,
+	candidateStores StoreList,
 	zone *zonepb.ZoneConfig,
-	candidateReplicas []roachpb.ReplicaDescriptor,
+	existingReplicas []roachpb.ReplicaDescriptor,
 	options scorerOptions,
 ) (*roachpb.StoreDescriptor, string) {
 	analyzedConstraints := constraint.AnalyzeConstraints(
-		ctx, a.storePool.getStoreDescriptor, candidateReplicas, zone)
+		ctx, a.storePool.getStoreDescriptor, existingReplicas, zone)
 	candidates := allocateCandidates(
 		ctx,
-		sl, analyzedConstraints, candidateReplicas,
-		a.storePool.getLocalitiesByStore(candidateReplicas),
+		candidateStores, analyzedConstraints, existingReplicas,
+		a.storePool.getLocalitiesByStore(existingReplicas),
 		a.storePool.isNodeReadyForRoutineReplicaTransfer,
 		options,
 	)
@@ -559,17 +560,17 @@ func (a Allocator) RemoveTarget(
 	}
 
 	// Retrieve store descriptors for the provided candidates from the StorePool.
-	existingStoreIDs := make(roachpb.StoreIDSlice, len(candidates))
+	candidateStoreIDs := make(roachpb.StoreIDSlice, len(candidates))
 	for i, exist := range candidates {
-		existingStoreIDs[i] = exist.StoreID
+		candidateStoreIDs[i] = exist.StoreID
 	}
-	sl, _, _ := a.storePool.getStoreListFromIDs(existingStoreIDs, storeFilterNone)
+	candidateStoreList, _, _ := a.storePool.getStoreListFromIDs(candidateStoreIDs, storeFilterNone)
 
 	analyzedConstraints := constraint.AnalyzeConstraints(
 		ctx, a.storePool.getStoreDescriptor, existingReplicas, zone)
 	options := a.scorerOptions()
 	rankedCandidates := removeCandidates(
-		sl,
+		candidateStoreList,
 		analyzedConstraints,
 		a.storePool.getLocalitiesByStore(existingReplicas),
 		options,
@@ -769,6 +770,8 @@ func (a *Allocator) scorerOptions() scorerOptions {
 // TransferLeaseTarget returns a suitable replica to transfer the range lease
 // to from the provided list. It excludes the current lease holder replica
 // unless asked to do otherwise by the checkTransferLeaseSource parameter.
+//
+// Returns an empty descriptor if no target is found.
 //
 // TODO(aayush, andrei): If a draining leaseholder doesn't see any other voters
 // in its locality, but sees a learner, rather than allowing the lease to be

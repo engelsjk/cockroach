@@ -137,10 +137,6 @@ const (
 	// rather than string literals. For example, the bytes \x40 will be formatted
 	// as b'\x40' rather than '\x40'.
 	fmtFormatByteLiterals
-
-	// FmtSkipAsOfSystemTimeClauses prevents the formatter from printing AS OF
-	// SYSTEM TIME clauses.
-	FmtSkipAsOfSystemTimeClauses
 )
 
 // Composite/derived flag definitions follow.
@@ -385,6 +381,8 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 				// p.typ will be nil if the placeholder has not been type-checked yet.
 				typ = p.typ
 			} else if d.AmbiguousFormat() {
+				typ = d.ResolvedType()
+			} else if _, isArray := d.(*DArray); isArray && f.HasFlags(FmtPGCatalog) {
 				typ = d.ResolvedType()
 			}
 		}

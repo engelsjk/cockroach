@@ -232,10 +232,9 @@ func TestIsNullSelOp(t *testing.T) {
 			spec := &execinfrapb.ProcessorSpec{
 				Input: []execinfrapb.InputSyncSpec{{ColumnTypes: typs}},
 				Core: execinfrapb.ProcessorCoreUnion{
-					Noop: &execinfrapb.NoopCoreSpec{},
-				},
-				Post: execinfrapb.PostProcessSpec{
-					Filter: execinfrapb.Expression{Expr: fmt.Sprintf("@1 %s", c.selExpr)},
+					Filterer: &execinfrapb.FiltererSpec{
+						Filter: execinfrapb.Expression{Expr: fmt.Sprintf("@1 %s", c.selExpr)},
+					},
 				},
 				ResultTypes: typs,
 			}
@@ -244,7 +243,6 @@ func TestIsNullSelOp(t *testing.T) {
 				Inputs:              input,
 				StreamingMemAccount: testMemAcc,
 			}
-			args.TestingKnobs.UseStreamingMemAccountForBuffering = true
 			result, err := TestNewColOperator(ctx, flowCtx, args)
 			if err != nil {
 				return nil, err

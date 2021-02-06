@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
@@ -54,7 +53,7 @@ var maxTimestampAge = settings.RegisterDurationSetting(
 )
 
 func (dsp *DistSQLPlanner) createStatsPlan(
-	planCtx *PlanningCtx, desc *tabledesc.Immutable, reqStats []requestedStat, job *jobs.Job,
+	planCtx *PlanningCtx, desc catalog.TableDescriptor, reqStats []requestedStat, job *jobs.Job,
 ) (*PhysicalPlan, error) {
 	if len(reqStats) == 0 {
 		return nil, errors.New("no stats requested")
@@ -79,6 +78,10 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	err := scan.initDescDefaults(colCfg)
 	if err != nil {
 		return nil, err
+	}
+	var colIdxMap catalog.TableColMap
+	for i, c := range scan.cols {
+		colIdxMap.Set(c.ID, i)
 	}
 	sb := span.MakeBuilder(planCtx.EvalContext(), planCtx.ExtendedEvalCtx.Codec, desc, scan.index)
 	scan.spans, err = sb.UnconstrainedSpans()
@@ -112,7 +115,7 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 			StatName:            s.name,
 		}
 		for i, colID := range s.columns {
-			colIdx, ok := scan.colIdxMap.Get(colID)
+			colIdx, ok := colIdxMap.Get(colID)
 			if !ok {
 				panic("necessary column not scanned")
 			}
@@ -127,9 +130,9 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 			// TODO(mjibson): allow multiple inverted indexes on the same column (i.e.,
 			// with different configurations). See #50655.
 			col := s.columns[0]
-			for _, indexDesc := range desc.GetPublicNonPrimaryIndexes() {
-				if indexDesc.Type == descpb.IndexDescriptor_INVERTED && indexDesc.ColumnIDs[0] == col {
-					spec.Index = &indexDesc
+			for _, index := range desc.PublicNonPrimaryIndexes() {
+				if index.GetType() == descpb.IndexDescriptor_INVERTED && index.InvertedColumnID() == col {
+					spec.Index = index.IndexDesc()
 					break
 				}
 			}
@@ -183,7 +186,7 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	)
 
 	// Estimate the expected number of rows based on existing stats in the cache.
-	tableStats, err := planCtx.ExtendedEvalCtx.ExecCfg.TableStatsCache.GetTableStats(planCtx.ctx, desc.ID)
+	tableStats, err := planCtx.ExtendedEvalCtx.ExecCfg.TableStatsCache.GetTableStats(planCtx.ctx, desc.GetID())
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +213,7 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		InvertedSketches: invSketchSpecs,
 		SampleSize:       sampler.SampleSize,
 		SampledColumnIDs: sampledColumnIDs,
-		TableID:          desc.ID,
+		TableID:          desc.GetID(),
 		JobID:            jobID,
 		RowsExpected:     rowsExpected,
 	}
@@ -278,10 +281,9 @@ func (dsp *DistSQLPlanner) planAndRunCreateStats(
 		tree.DDL,
 		evalCtx.ExecCfg.RangeDescriptorCache,
 		txn,
-		func(ts hlc.Timestamp) {
-			evalCtx.ExecCfg.Clock.Update(ts)
-		},
+		evalCtx.ExecCfg.Clock,
 		evalCtx.Tracing,
+		evalCtx.ExecCfg.ContentionRegistry,
 	)
 	defer recv.Release()
 

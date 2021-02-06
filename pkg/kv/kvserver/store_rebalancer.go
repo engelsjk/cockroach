@@ -74,7 +74,7 @@ func makeStoreRebalancerMetrics() StoreRebalancerMetrics {
 // LoadBasedRebalancingMode controls whether range rebalancing takes
 // additional variables such as write load and disk usage into account.
 // If disabled, rebalancing is done purely based on replica count.
-var LoadBasedRebalancingMode = settings.RegisterPublicEnumSetting(
+var LoadBasedRebalancingMode = settings.RegisterEnumSetting(
 	"kv.allocator.load_based_rebalancing",
 	"whether to rebalance based on the distribution of QPS across stores",
 	"leases and replicas",
@@ -83,7 +83,7 @@ var LoadBasedRebalancingMode = settings.RegisterPublicEnumSetting(
 		int64(LBRebalancingLeasesOnly):        "leases",
 		int64(LBRebalancingLeasesAndReplicas): "leases and replicas",
 	},
-)
+).WithPublic()
 
 // qpsRebalanceThreshold is much like rangeRebalanceThreshold, but for
 // QPS rather than range count. This should be set higher than
@@ -91,10 +91,11 @@ var LoadBasedRebalancingMode = settings.RegisterPublicEnumSetting(
 // workloads change and clients come and go, so we need to be a little more
 // forgiving to avoid thrashing.
 var qpsRebalanceThreshold = func() *settings.FloatSetting {
-	s := settings.RegisterNonNegativeFloatSetting(
+	s := settings.RegisterFloatSetting(
 		"kv.allocator.qps_rebalance_threshold",
 		"minimum fraction away from the mean a store's QPS (such as queries per second) can be before it is considered overfull or underfull",
 		0.25,
+		settings.NonNegativeFloat,
 	)
 	s.SetVisibility(settings.Public)
 	return s
@@ -176,7 +177,7 @@ func (sr *StoreRebalancer) Start(ctx context.Context, stopper *stop.Stopper) {
 
 	// Start a goroutine that watches and proactively renews certain
 	// expiration-based leases.
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "store-rebalancer", func(ctx context.Context) {
 		timer := timeutil.NewTimer()
 		defer timer.Stop()
 		timer.Reset(jitteredInterval(storeRebalancerTimerDuration))
@@ -291,7 +292,7 @@ func (sr *StoreRebalancer) rebalanceStore(
 	replicasToMaybeRebalance = append(replicasToMaybeRebalance, hottestRanges...)
 
 	for localDesc.Capacity.QueriesPerSecond > qpsMaxThreshold {
-		replWithStats, targets := sr.chooseReplicaToRebalance(
+		replWithStats, voterTargets := sr.chooseReplicaToRebalance(
 			ctx,
 			&replicasToMaybeRebalance,
 			localDesc,
@@ -308,12 +309,13 @@ func (sr *StoreRebalancer) rebalanceStore(
 
 		descBeforeRebalance := replWithStats.repl.Desc()
 		log.VEventf(ctx, 1, "rebalancing r%d (%.2f qps) from %v to %v to better balance load",
-			replWithStats.repl.RangeID, replWithStats.qps, descBeforeRebalance.Replicas(), targets)
+			replWithStats.repl.RangeID, replWithStats.qps, descBeforeRebalance.Replicas(), voterTargets)
 		timeout := sr.rq.processTimeoutFunc(sr.st, replWithStats.repl)
 		if err := contextutil.RunWithTimeout(ctx, "relocate range", timeout, func(ctx context.Context) error {
-			return sr.rq.store.AdminRelocateRange(ctx, *descBeforeRebalance, targets)
+			// TODO(aayush): Fix when we can make decisions about rebalancing non-voting replicas.
+			return sr.rq.store.AdminRelocateRange(ctx, *descBeforeRebalance, voterTargets, []roachpb.ReplicationTarget{})
 		}); err != nil {
-			log.Errorf(ctx, "unable to relocate range to %v: %+v", targets, err)
+			log.Errorf(ctx, "unable to relocate range to %v: %+v", voterTargets, err)
 			continue
 		}
 		sr.metrics.RangeRebalanceCount.Inc(1)
@@ -325,7 +327,7 @@ func (sr *StoreRebalancer) rebalanceStore(
 		// TODO(a-robinson): This just updates the copies used locally by the
 		// storeRebalancer. We may also want to update the copies in the StorePool
 		// itself.
-		replicasBeforeRebalance := descBeforeRebalance.Replicas().All()
+		replicasBeforeRebalance := descBeforeRebalance.Replicas().Descriptors()
 		for i := range replicasBeforeRebalance {
 			if storeDesc := storeMap[replicasBeforeRebalance[i].StoreID]; storeDesc != nil {
 				storeDesc.Capacity.RangeCount--
@@ -333,8 +335,8 @@ func (sr *StoreRebalancer) rebalanceStore(
 		}
 		localDesc.Capacity.LeaseCount--
 		localDesc.Capacity.QueriesPerSecond -= replWithStats.qps
-		for i := range targets {
-			if storeDesc := storeMap[targets[i].StoreID]; storeDesc != nil {
+		for i := range voterTargets {
+			if storeDesc := storeMap[voterTargets[i].StoreID]; storeDesc != nil {
 				storeDesc.Capacity.RangeCount++
 				if i == 0 {
 					storeDesc.Capacity.LeaseCount++
@@ -361,7 +363,7 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 	maxQPS float64,
 ) (replicaWithStats, roachpb.ReplicaDescriptor, []replicaWithStats) {
 	var considerForRebalance []replicaWithStats
-	now := sr.rq.store.Clock().Now()
+	now := sr.rq.store.Clock().NowAsClockTimestamp()
 	for {
 		if len(*hottestRanges) == 0 {
 			return replicaWithStats{}, roachpb.ReplicaDescriptor{}, considerForRebalance
@@ -397,7 +399,7 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 		// Check all the other replicas in order of increasing qps. Learner replicas
 		// aren't allowed to become the leaseholder or raft leader, so only consider
 		// the `Voters` replicas.
-		candidates := desc.Replicas().DeepCopy().Voters()
+		candidates := desc.Replicas().DeepCopy().VoterDescriptors()
 		sort.Slice(candidates, func(i, j int) bool {
 			var iQPS, jQPS float64
 			if desc := storeMap[candidates[i].StoreID]; desc != nil {
@@ -469,7 +471,7 @@ func (sr *StoreRebalancer) chooseReplicaToRebalance(
 	minQPS float64,
 	maxQPS float64,
 ) (replicaWithStats, []roachpb.ReplicationTarget) {
-	now := sr.rq.store.Clock().Now()
+	now := sr.rq.store.Clock().NowAsClockTimestamp()
 	for {
 		if len(*hottestRanges) == 0 {
 			return replicaWithStats{}, nil
@@ -505,7 +507,7 @@ func (sr *StoreRebalancer) chooseReplicaToRebalance(
 		desiredReplicas := GetNeededReplicas(*zone.NumReplicas, clusterNodes)
 		targets := make([]roachpb.ReplicationTarget, 0, desiredReplicas)
 		targetReplicas := make([]roachpb.ReplicaDescriptor, 0, desiredReplicas)
-		currentReplicas := desc.Replicas().All()
+		currentReplicas := desc.Replicas().Descriptors()
 
 		// Check the range's existing diversity score, since we want to ensure we
 		// don't hurt locality diversity just to improve QPS.
@@ -627,7 +629,7 @@ func shouldNotMoveAway(
 	ctx context.Context,
 	replWithStats replicaWithStats,
 	localDesc *roachpb.StoreDescriptor,
-	now hlc.Timestamp,
+	now hlc.ClockTimestamp,
 	minQPS float64,
 ) bool {
 	if !replWithStats.repl.OwnsValidLease(ctx, now) {

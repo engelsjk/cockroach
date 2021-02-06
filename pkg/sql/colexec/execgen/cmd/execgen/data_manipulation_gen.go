@@ -35,11 +35,6 @@ var dataManipulationReplacementInfos = []dataManipulationReplacementInfo{
 		replaceWith:         "Set",
 	},
 	{
-		templatePlaceholder: "execgen.SLICE",
-		numArgs:             3,
-		replaceWith:         "Slice",
-	},
-	{
 		templatePlaceholder: "execgen.COPYSLICE",
 		numArgs:             5,
 		replaceWith:         "CopySlice",
@@ -58,6 +53,11 @@ var dataManipulationReplacementInfos = []dataManipulationReplacementInfo{
 		templatePlaceholder: "execgen.WINDOW",
 		numArgs:             3,
 		replaceWith:         "Window",
+	},
+	{
+		templatePlaceholder: "execgen.SETVARIABLESIZE",
+		numArgs:             2,
+		replaceWith:         "SetVariableSize",
 	},
 }
 

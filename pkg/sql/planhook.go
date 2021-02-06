@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -50,14 +51,6 @@ type planHookFn func(
 type PlanHookRowFn func(context.Context, []planNode, chan<- tree.Datums) error
 
 var planHooks []planHookFn
-
-// wrappedPlanHookFn is similar to planHookFn but returns an existing plan type.
-// Additionally, it takes a context.
-type wrappedPlanHookFn func(
-	context.Context, tree.Statement, PlanHookState,
-) (planNode, error)
-
-var wrappedPlanHooks []wrappedPlanHookFn
 
 func (p *planner) RunParams(ctx context.Context) runParams {
 	return runParams{ctx, p.ExtendedEvalContext(), p}
@@ -100,7 +93,7 @@ type PlanHookState interface {
 		ctx context.Context, tn *tree.TableName, required bool, requiredType tree.RequiredTableKind,
 	) (table *tabledesc.Mutable, err error)
 	ShowCreate(
-		ctx context.Context, dbPrefix string, allDescs []descpb.Descriptor, desc *tabledesc.Immutable, displayOptions ShowCreateDisplayOptions,
+		ctx context.Context, dbPrefix string, allDescs []descpb.Descriptor, desc catalog.TableDescriptor, displayOptions ShowCreateDisplayOptions,
 	) (string, error)
 	CreateSchemaNamespaceEntry(ctx context.Context, schemaNameKey roachpb.Key,
 		schemaID descpb.ID) error

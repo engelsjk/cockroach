@@ -4,18 +4,18 @@ query T
 EXPLAIN (VERBOSE) SELECT * FROM system.information_schema.schemata
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • virtual table
   columns: (catalog_name, schema_name, default_character_set_name, sql_path, crdb_is_user_defined)
-  estimated row count: 1000 (missing stats)
+  estimated row count: 1,000 (missing stats)
   table: schemata@primary
 
 query T
 EXPLAIN SELECT * FROM system.information_schema.tables WHERE table_name='foo'
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • filter
 │ filter: table_name = 'foo'

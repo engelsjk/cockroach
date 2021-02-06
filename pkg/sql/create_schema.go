@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
@@ -38,7 +39,8 @@ func (n *createSchemaNode) startExec(params runParams) error {
 
 func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema) error {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		p.EvalContext().Context,
+		p.ExecCfg(),
 		"CREATE SCHEMA",
 	); err != nil {
 		return err
@@ -56,7 +58,8 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 		dbName = n.Schema.Catalog()
 	}
 
-	db, err := p.ResolveMutableDatabaseDescriptor(params.ctx, dbName, true /* required */)
+	_, db, err := p.Descriptors().GetMutableDatabaseByName(params.ctx, p.txn, dbName,
+		tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return err
 	}
@@ -96,10 +99,10 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 	}
 
 	// Ensure that the cluster version is high enough to create the schema.
-	if !params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.VersionUserDefinedSchemas) {
+	if !params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.UserDefinedSchemas) {
 		return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 			`creating schemas requires all nodes to be upgraded to %s`,
-			clusterversion.VersionByKey(clusterversion.VersionUserDefinedSchemas))
+			clusterversion.ByKey(clusterversion.UserDefinedSchemas))
 	}
 
 	// Create the ID.
@@ -164,18 +167,18 @@ func (p *planner) createUserDefinedSchema(params runParams, n *tree.CreateSchema
 	); err != nil {
 		return err
 	}
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogCreateSchema,
-		int32(desc.GetID()),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			SchemaName string
-			Owner      string
-			User       string
-		}{schemaName, privs.Owner().Normalized(), params.p.User().Normalized()},
-	)
+
+	qualifiedSchemaName, err := p.getQualifiedSchemaName(params.ctx, desc)
+	if err != nil {
+		return err
+	}
+
+	return params.p.logEvent(params.ctx,
+		desc.GetID(),
+		&eventpb.CreateSchema{
+			SchemaName: qualifiedSchemaName.String(),
+			Owner:      privs.Owner().Normalized(),
+		})
 }
 
 func (*createSchemaNode) Next(runParams) (bool, error) { return false, nil }
@@ -185,7 +188,8 @@ func (n *createSchemaNode) Close(ctx context.Context)  {}
 // CreateSchema creates a schema.
 func (p *planner) CreateSchema(ctx context.Context, n *tree.CreateSchema) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"CREATE SCHEMA",
 	); err != nil {
 		return nil, err

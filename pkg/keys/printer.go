@@ -70,12 +70,14 @@ var (
 
 	// KeyDict drives the pretty-printing and pretty-scanning of the key space.
 	KeyDict = KeyComprehensionTable{
-		{Name: "/Local", start: localPrefix, end: LocalMax, Entries: []DictEntry{
-			{Name: "/Store", prefix: roachpb.Key(localStorePrefix),
+		{Name: "/Local", start: LocalPrefix, end: LocalMax, Entries: []DictEntry{
+			{Name: "/Store", prefix: roachpb.Key(LocalStorePrefix),
 				ppFunc: localStoreKeyPrint, PSFunc: localStoreKeyParse},
 			{Name: "/RangeID", prefix: roachpb.Key(LocalRangeIDPrefix),
 				ppFunc: localRangeIDKeyPrint, PSFunc: localRangeIDKeyParse},
 			{Name: "/Range", prefix: LocalRangePrefix, ppFunc: localRangeKeyPrint,
+				PSFunc: parseUnsupported},
+			{Name: "/Lock", prefix: LocalRangeLockTablePrefix, ppFunc: localRangeLockTablePrint,
 				PSFunc: parseUnsupported},
 		}},
 		{Name: "/Meta1", start: Meta1Prefix, end: Meta1KeyMax, Entries: []DictEntry{
@@ -169,6 +171,7 @@ var (
 		{name: "RangeLease", suffix: LocalRangeLeaseSuffix},
 		{name: "RangeStats", suffix: LocalRangeStatsLegacySuffix},
 		{name: "RangeLastGC", suffix: LocalRangeLastGCSuffix},
+		{name: "RangeVersion", suffix: LocalRangeVersionSuffix},
 	}
 
 	rangeSuffixDict = []struct {
@@ -215,11 +218,11 @@ func localStoreKeyPrint(_ []encoding.Direction, key roachpb.Key) string {
 		if bytes.HasPrefix(key, v.key) {
 			if v.key.Equal(localStoreNodeTombstoneSuffix) {
 				return v.name + "/" + nodeTombstoneKeyPrint(
-					append(roachpb.Key(nil), append(localStorePrefix, key...)...),
+					append(roachpb.Key(nil), append(LocalStorePrefix, key...)...),
 				)
 			} else if v.key.Equal(localStoreCachedSettingsSuffix) {
 				return v.name + "/" + cachedSettingsKeyPrint(
-					append(roachpb.Key(nil), append(localStorePrefix, key...)...),
+					append(roachpb.Key(nil), append(LocalStorePrefix, key...)...),
 				)
 			}
 			return v.name
@@ -523,6 +526,27 @@ func localRangeKeyPrint(valDirs []encoding.Direction, key roachpb.Key) string {
 	return buf.String()
 }
 
+// lockTablePrintLockedKey is initialized to prettyPrintInternal in init() to break an
+// initialization loop.
+var lockTablePrintLockedKey func(valDirs []encoding.Direction, key roachpb.Key, quoteRawKeys bool) string
+
+func localRangeLockTablePrint(valDirs []encoding.Direction, key roachpb.Key) string {
+	var buf bytes.Buffer
+	if !bytes.HasPrefix(key, LockTableSingleKeyInfix) {
+		fmt.Fprintf(&buf, "/\"%x\"", key)
+		return buf.String()
+	}
+	buf.WriteString("/Intent")
+	key = key[len(LockTableSingleKeyInfix):]
+	b, lockedKey, err := encoding.DecodeBytesAscending(key, nil)
+	if err != nil || len(b) != 0 {
+		fmt.Fprintf(&buf, "/\"%x\"", key)
+		return buf.String()
+	}
+	buf.WriteString(lockTablePrintLockedKey(valDirs, lockedKey, true))
+	return buf.String()
+}
+
 // ErrUglifyUnsupported is returned when UglyPrint doesn't know how to process a
 // key.
 type ErrUglifyUnsupported struct {
@@ -675,6 +699,7 @@ func PrettyPrint(valDirs []encoding.Direction, key roachpb.Key) string {
 func init() {
 	roachpb.PrettyPrintKey = PrettyPrint
 	roachpb.PrettyPrintRange = PrettyPrintRange
+	lockTablePrintLockedKey = prettyPrintInternal
 }
 
 // PrettyPrintRange pretty prints a compact representation of a key range. The

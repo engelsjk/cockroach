@@ -271,10 +271,19 @@ CREATE TABLE y (
   a INT AS (3)
 )
 
-statement error at or near "virtual": syntax error: unimplemented
+statement error unimplemented: virtual computed columns
 CREATE TABLE y (
   a INT AS (3) VIRTUAL
 )
+
+statement ok
+CREATE TABLE tmp (x INT)
+
+statement error unimplemented: virtual computed columns
+ALTER TABLE tmp ADD COLUMN y INT AS (x+1) VIRTUAL
+
+statement ok
+DROP TABLE tmp
 
 statement error expected computed column expression to have type int, but .* has type string
 CREATE TABLE y (
@@ -349,17 +358,17 @@ CREATE TABLE y (
   r INT AS (q) STORED
 )
 
-statement error computed column "r" cannot be a foreign key reference
+statement error computed column "r" cannot reference a foreign key
 CREATE TABLE y (
   r INT AS (1) STORED REFERENCES x (a)
 )
 
-statement error computed column "r" cannot be a foreign key reference
+statement error computed column "r" cannot reference a foreign key
 CREATE TABLE y (
   r INT AS (1) STORED REFERENCES x
 )
 
-statement error computed column "r" cannot be a foreign key reference
+statement error computed column "r" cannot reference a foreign key
 CREATE TABLE y (
   a INT,
   r INT AS (1) STORED REFERENCES x
@@ -384,14 +393,14 @@ CREATE TABLE xx (
   UNIQUE (a, b)
 )
 
-statement error computed column "y" cannot be a foreign key reference
+statement error computed column "y" cannot reference a foreign key
 CREATE TABLE yy (
   x INT,
   y INT AS (3) STORED,
   FOREIGN KEY (x, y) REFERENCES xx (a, b)
 )
 
-statement error computed column "y" cannot be a foreign key reference
+statement error computed column "y" cannot reference a foreign key
 CREATE TABLE yy (
   x INT,
   y INT AS (3) STORED,
@@ -407,7 +416,7 @@ CREATE TABLE y (
   INDEX (r)
 )
 
-statement error computed column "r" cannot be a foreign key reference
+statement error computed column "r" cannot reference a foreign key
 ALTER TABLE y ADD FOREIGN KEY (r) REFERENCES x (a)
 
 statement ok

@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -334,6 +336,11 @@ func (ex *connExecutor) execStmtInOpenState(
 		}
 	}()
 
+	makeErrEvent := func(err error) (fsm.Event, fsm.EventPayload, error) {
+		ev, payload := ex.makeErrEvent(err, ast)
+		return ev, payload, nil
+	}
+
 	p := &ex.planner
 	stmtTS := ex.server.cfg.Clock.PhysicalTime()
 	ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
@@ -342,16 +349,26 @@ func (ex *connExecutor) execStmtInOpenState(
 	p.noticeSender = res
 	ih := &p.instrumentation
 
-	if e, ok := ast.(*tree.ExplainAnalyze); ok &&
-		(e.Mode == tree.ExplainDebug || e.Mode == tree.ExplainPlan) {
-		if e.Mode == tree.ExplainDebug {
+	if e, ok := ast.(*tree.ExplainAnalyze); ok {
+		switch e.Mode {
+		case tree.ExplainDebug:
 			telemetry.Inc(sqltelemetry.ExplainAnalyzeDebugUseCounter)
 			ih.SetOutputMode(explainAnalyzeDebugOutput, explain.Flags{})
-		} else {
+
+		case tree.ExplainPlan:
 			telemetry.Inc(sqltelemetry.ExplainAnalyzeUseCounter)
 			flags := explain.MakeFlags(&e.ExplainOptions)
 			flags.MakeDeterministic = ex.server.cfg.TestingKnobs.DeterministicExplainAnalyze
 			ih.SetOutputMode(explainAnalyzePlanOutput, flags)
+
+		case tree.ExplainDistSQL:
+			telemetry.Inc(sqltelemetry.ExplainAnalyzeDistSQLUseCounter)
+			flags := explain.MakeFlags(&e.ExplainOptions)
+			flags.MakeDeterministic = ex.server.cfg.TestingKnobs.DeterministicExplainAnalyze
+			ih.SetOutputMode(explainAnalyzeDistSQLOutput, flags)
+
+		default:
+			return makeErrEvent(errors.AssertionFailedf("unsupported EXPLAIN ANALYZE mode %s", e.Mode))
 		}
 		// Strip off the explain node to execute the inner statement.
 		stmt.AST = e.Statement
@@ -368,20 +385,25 @@ func (ex *connExecutor) execStmtInOpenState(
 	var needFinish bool
 	ctx, needFinish = ih.Setup(
 		ctx, ex.server.cfg, ex.appStats, p, ex.stmtDiagnosticsRecorder,
-		stmt.AnonymizedStr, os.ImplicitTxn.Get(),
+		stmt.AnonymizedStr, os.ImplicitTxn.Get(), ex.extraTxnState.shouldCollectExecutionStats,
 	)
 	if needFinish {
 		sql := stmt.SQL
 		defer func() {
-			retErr = ih.Finish(ex.server.cfg, ex.appStats, ex.statsCollector, p, ast, sql, res, retErr)
+			retErr = ih.Finish(
+				ex.server.cfg,
+				ex.appStats,
+				&ex.extraTxnState.accumulatedStats,
+				ex.statsCollector,
+				p,
+				ast,
+				sql,
+				res,
+				retErr,
+			)
 		}()
 		// TODO(radu): consider removing this if/when #46164 is addressed.
 		p.extendedEvalCtx.Context = ctx
-	}
-
-	makeErrEvent := func(err error) (fsm.Event, fsm.EventPayload, error) {
-		ev, payload := ex.makeErrEvent(err, ast)
-		return ev, payload, nil
 	}
 
 	// We exempt `SET` statements from the statement timeout, particularly so as
@@ -530,37 +552,25 @@ func (ex *connExecutor) execStmtInOpenState(
 	// don't return any event unless an error happens.
 
 	if os.ImplicitTxn.Get() {
-		asOfTs, timestampType, err := p.isAsOf(ctx, ast)
+		asOfTs, err := p.isAsOf(ctx, ast)
 		if err != nil {
 			return makeErrEvent(err)
 		}
 		if asOfTs != nil {
-			switch timestampType {
-			case transactionTimestamp:
-				p.semaCtx.AsOfTimestamp = asOfTs
-				p.extendedEvalCtx.SetTxnTimestamp(asOfTs.GoTime())
-				ex.state.setHistoricalTimestamp(ctx, *asOfTs)
-			case backfillTimestamp:
-				p.semaCtx.AsOfTimestampForBackfill = asOfTs
-			}
+			p.semaCtx.AsOfTimestamp = asOfTs
+			p.extendedEvalCtx.SetTxnTimestamp(asOfTs.GoTime())
+			ex.state.setHistoricalTimestamp(ctx, *asOfTs)
 		}
 	} else {
 		// If we're in an explicit txn, we allow AOST but only if it matches with
 		// the transaction's timestamp. This is useful for running AOST statements
 		// using the InternalExecutor inside an external transaction; one might want
 		// to do that to force p.avoidCachedDescriptors to be set below.
-		ts, timestampType, err := p.isAsOf(ctx, ast)
+		ts, err := p.isAsOf(ctx, ast)
 		if err != nil {
 			return makeErrEvent(err)
 		}
 		if ts != nil {
-			if timestampType == backfillTimestamp {
-				// Can't handle this: we don't know how to do a CTAS with a historical
-				// read timestamp and a present write timestamp.
-				err = unimplemented.NewWithIssueDetailf(35712, "historical ctas in explicit txn",
-					"historical CREATE TABLE AS unsupported in explicit transaction")
-				return makeErrEvent(err)
-			}
 			if readTs := ex.state.getReadTimestamp(); *ts != readTs {
 				err = pgerror.Newf(pgcode.Syntax,
 					"inconsistent AS OF SYSTEM TIME timestamp; expected: %s", readTs)
@@ -632,10 +642,30 @@ func (ex *connExecutor) execStmtInOpenState(
 	p.cancelChecker = cancelchecker.NewCancelChecker(ctx)
 	p.autoCommit = os.ImplicitTxn.Get() && !ex.server.cfg.TestingKnobs.DisableAutoCommit
 
-	// Now actually execute the statement!
+	var stmtThresholdSpan *tracing.Span
+	alreadyRecording := ex.transitionCtx.sessionTracing.Enabled()
+	stmtTraceThreshold := traceStmtThreshold.Get(&ex.planner.execCfg.Settings.SV)
+	if !alreadyRecording && stmtTraceThreshold > 0 {
+		ctx, stmtThresholdSpan = createRootOrChildSpan(ctx, "trace-stmt-threshold", ex.transitionCtx.tracer)
+		stmtThresholdSpan.SetVerbose(true)
+	}
+
 	if err := ex.dispatchToExecutionEngine(ctx, p, res); err != nil {
+		stmtThresholdSpan.Finish()
 		return nil, nil, err
 	}
+
+	if stmtThresholdSpan != nil {
+		stmtThresholdSpan.Finish()
+		logTraceAboveThreshold(
+			ctx,
+			stmtThresholdSpan.GetRecording(),
+			fmt.Sprintf("SQL stmt %s", stmt.AST.String()),
+			stmtTraceThreshold,
+			timeutil.Since(ex.phaseTimes[sessionQueryReceived]),
+		)
+	}
+
 	if err := res.Err(); err != nil {
 		return makeErrEvent(err)
 	}
@@ -664,6 +694,7 @@ func (ex *connExecutor) execStmtInOpenState(
 		}
 		log.VEventf(ctx, 2, "push detected for non-refreshable txn but auto-retry not possible")
 	}
+
 	// No event was generated.
 	return nil, nil, nil
 }
@@ -712,6 +743,12 @@ func (ex *connExecutor) commitSQLTransaction(
 func (ex *connExecutor) commitSQLTransactionInternal(
 	ctx context.Context, ast tree.Statement,
 ) error {
+	if ex.extraTxnState.schemaChangerState.mode != sessiondata.UseNewSchemaChangerOff {
+		if err := ex.runPreCommitStages(ctx); err != nil {
+			return err
+		}
+	}
+
 	if err := validatePrimaryKeys(&ex.extraTxnState.descCollection); err != nil {
 		return err
 	}
@@ -742,7 +779,7 @@ func validatePrimaryKeys(tc *descs.Collection) error {
 		if !table.HasPrimaryKey() {
 			return unimplemented.NewWithIssuef(48026,
 				"primary key of table %s dropped without subsequent addition of new primary key",
-				table.Name,
+				table.GetName(),
 			)
 		}
 	}
@@ -773,38 +810,12 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	ex.sessionTracing.TracePlanStart(ctx, stmt.AST.StatementTag())
 	ex.statsCollector.phaseTimes[plannerStartLogicalPlan] = timeutil.Now()
 
-	var originalTxn *kv.Txn
-	if planner.semaCtx.AsOfTimestampForBackfill != nil {
-		// If we've been tasked with backfilling a schema change operation at a
-		// particular system time, it's important that we do planning for the
-		// operation at the timestamp that we're expecting to perform the backfill
-		// at, in case the schema of the objects that we read have changed in
-		// between the present transaction timestamp and the user-defined backfill
-		// timestamp.
-		//
-		// Set the planner's transaction to a new historical transaction pinned at
-		// that timestamp. We'll restore it after planning.
-		historicalTxn := kv.NewTxnWithSteppingEnabled(ctx, ex.transitionCtx.db, ex.transitionCtx.nodeIDOrZero)
-		historicalTxn.SetFixedTimestamp(ctx, *planner.semaCtx.AsOfTimestampForBackfill)
-		originalTxn = planner.txn
-		planner.txn = historicalTxn
-	}
 	// Prepare the plan. Note, the error is processed below. Everything
 	// between here and there needs to happen even if there's an error.
-	//
-	// As a note about planning in a historical context (happens if we enter the
-	// stanza above due to an AOST backfill query), we don't ever expect a retry
-	// error to come out of planning.
 	err := ex.makeExecPlan(ctx, planner)
 	// We'll be closing the plan manually below after execution; this
 	// defer is a catch-all in case some other return path is taken.
 	defer planner.curPlan.close(ctx)
-
-	if originalTxn != nil {
-		// Reset the planner's transaction to the current-timestamp, original
-		// transaction.
-		planner.txn = originalTxn
-	}
 
 	if planner.autoCommit {
 		planner.curPlan.flags.Set(planFlagImplicitTxn)
@@ -892,14 +903,15 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	default:
 		planner.curPlan.flags.Set(planFlagNotDistributed)
 	}
-
 	ex.sessionTracing.TraceExecStart(ctx, "distributed")
-	// Dispatch the query to the execution engine.
 	stats, err := ex.execWithDistSQLEngine(
 		ctx, planner, stmt.AST.StatementType(), res, distributePlan.WillDistribute(), progAtomic,
 	)
 	ex.sessionTracing.TraceExecEnd(ctx, res.Err(), res.RowsAffected())
 	ex.statsCollector.phaseTimes[plannerEndExecStmt] = timeutil.Now()
+
+	ex.extraTxnState.rowsRead += stats.rowsRead
+	ex.extraTxnState.bytesRead += stats.bytesRead
 
 	// Record the statement summary. This also closes the plan if the
 	// plan has not been closed earlier.
@@ -924,17 +936,19 @@ func (ex *connExecutor) makeExecPlan(ctx context.Context, planner *planner) erro
 
 	flags := planner.curPlan.flags
 
-	// We don't execute the statement if:
-	// - plan contains a full table or full index scan.
-	// - the session setting disallows full table/index scans.
-	// - the query is not an internal query.
-	if (flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan)) &&
-		planner.EvalContext().SessionData.DisallowFullTableScans && ex.executorType == executorTypeExec {
-		return errors.WithHint(
-			pgerror.Newf(pgcode.TooManyRows,
-				"query `%s` contains a full table/index scan which is explicitly disallowed",
-				planner.stmt.SQL),
-			"try overriding the `disallow_full_table_scans` cluster/session setting")
+	if flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan) {
+		if ex.executorType == executorTypeExec && planner.EvalContext().SessionData.DisallowFullTableScans {
+			// We don't execute the statement if:
+			// - plan contains a full table or full index scan.
+			// - the session setting disallows full table/index scans.
+			// - the query is not an internal query.
+			return errors.WithHint(
+				pgerror.Newf(pgcode.TooManyRows,
+					"query `%s` contains a full table/index scan which is explicitly disallowed",
+					planner.stmt.SQL),
+				"try overriding the `disallow_full_table_scans` cluster/session setting")
+		}
+		ex.metrics.EngineMetrics.FullTableOrIndexScanCount.Inc(1)
 	}
 
 	// TODO(knz): Remove this accounting if/when savepoint rollbacks
@@ -970,10 +984,9 @@ func (ex *connExecutor) execWithDistSQLEngine(
 		ctx, res, stmtType,
 		ex.server.cfg.RangeDescriptorCache,
 		planner.txn,
-		func(ts hlc.Timestamp) {
-			ex.server.cfg.Clock.Update(ts)
-		},
+		ex.server.cfg.Clock,
 		&ex.sessionTracing,
+		ex.server.cfg.ContentionRegistry,
 	)
 	recv.progressAtomic = progressAtomic
 	defer recv.Release()
@@ -983,10 +996,11 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	planCtx.stmtType = recv.stmtType
 	if ex.server.cfg.TestingKnobs.TestingSaveFlows != nil {
 		planCtx.saveFlows = ex.server.cfg.TestingKnobs.TestingSaveFlows(planner.stmt.SQL)
-	} else if planner.instrumentation.ShouldCollectBundle() {
+	} else if planner.instrumentation.ShouldSaveFlows() {
 		planCtx.saveFlows = planCtx.getDefaultSaveFlowsFunc(ctx, planner, planComponentTypeMainQuery)
 	}
 	planCtx.traceMetadata = planner.instrumentation.traceMetadata
+	planCtx.collectExecStats = planner.instrumentation.ShouldCollectExecStats()
 
 	var evalCtxFactory func() *extendedEvalContext
 	if len(planner.curPlan.subqueryPlans) != 0 ||
@@ -1037,12 +1051,16 @@ func (ex *connExecutor) execWithDistSQLEngine(
 
 // beginTransactionTimestampsAndReadMode computes the timestamps and
 // ReadWriteMode to be used for the associated transaction state based on the
-// values of the statement's Modes. Note that this method may reset the
-// connExecutor's planner in order to compute the timestamp for the AsOf clause
-// if it exists. The timestamps correspond to the timestamps passed to
-// makeEventTxnStartPayload; txnSQLTimestamp propagates to become the
-// TxnTimestamp while historicalTimestamp populated with a non-nil value only
-// if the BeginTransaction statement has a non-nil AsOf clause expression. A
+// values of the BeginTransaction statement's Modes, along with the session's
+// default transaction settings. If no BeginTransaction statement is provided
+// then the session's defaults are consulted alone.
+//
+// Note that this method may reset the connExecutor's planner in order to
+// compute the timestamp for the AsOf clause if it exists. The timestamps
+// correspond to the timestamps passed to makeEventTxnStartPayload;
+// txnSQLTimestamp propagates to become the TxnTimestamp while
+// historicalTimestamp populated with a non-nil value only if the
+// BeginTransaction statement has a non-nil AsOf clause expression. A
 // non-nil historicalTimestamp implies a ReadOnly rwMode.
 func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 	ctx context.Context, s *tree.BeginTransaction,
@@ -1053,14 +1071,19 @@ func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 	err error,
 ) {
 	now := ex.server.cfg.Clock.PhysicalTime()
-	if s.Modes.AsOf.Expr == nil {
-		rwMode = ex.readWriteModeWithSessionDefault(s.Modes.ReadWriteMode)
+	var modes tree.TransactionModes
+	if s != nil {
+		modes = s.Modes
+	}
+	asOf := ex.asOfClauseWithSessionDefault(modes.AsOf)
+	if asOf.Expr == nil {
+		rwMode = ex.readWriteModeWithSessionDefault(modes.ReadWriteMode)
 		return rwMode, now, nil, nil
 	}
 	ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
 	p := &ex.planner
 	ex.resetPlanner(ctx, p, nil /* txn */, now)
-	ts, err := p.EvalAsOfTimestamp(ctx, s.Modes.AsOf)
+	ts, err := p.EvalAsOfTimestamp(ctx, asOf)
 	if err != nil {
 		return 0, time.Time{}, nil, err
 	}
@@ -1069,7 +1092,7 @@ func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 	// AOST clause and is ReadWrite but performing a check decouples this code
 	// from that and hopefully adds clarity that the returning of ReadOnly with
 	// a historical timestamp is intended.
-	if s.Modes.ReadWriteMode == tree.ReadWrite {
+	if modes.ReadWriteMode == tree.ReadWrite {
 		return 0, time.Time{}, nil, tree.ErrAsOfSpecifiedWithReadWrite
 	}
 	return tree.ReadOnly, ts.GoTime(), &ts, nil
@@ -1110,15 +1133,21 @@ func (ex *connExecutor) execStmtInNoTxnState(
 		*tree.RollbackTransaction, *tree.SetTransaction, *tree.Savepoint:
 		return ex.makeErrEvent(errNoTransactionInProgress, ast)
 	default:
-		// NB: Implicit transactions are created without a historical timestamp even
-		// though the statement might contain an AOST clause. In these cases the
-		// clause is evaluated and applied execStmtInOpenState.
+		// NB: Implicit transactions are created with the session's default
+		// historical timestamp even though the statement itself might contain
+		// an AOST clause. In these cases the clause is evaluated and applied
+		// execStmtInOpenState.
+		noBeginStmt := (*tree.BeginTransaction)(nil)
+		mode, sqlTs, historicalTs, err := ex.beginTransactionTimestampsAndReadMode(ctx, noBeginStmt)
+		if err != nil {
+			return ex.makeErrEvent(err, s)
+		}
 		return eventTxnStart{ImplicitTxn: fsm.True},
 			makeEventTxnStartPayload(
 				ex.txnPriorityWithSessionDefault(tree.UnspecifiedUserPriority),
-				ex.readWriteModeWithSessionDefault(tree.UnspecifiedReadWriteMode),
-				ex.server.cfg.Clock.PhysicalTime(),
-				nil, /* historicalTimestamp */
+				mode,
+				sqlTs,
+				historicalTs,
 				ex.transitionCtx)
 	}
 }
@@ -1317,7 +1346,7 @@ func (ex *connExecutor) runSetTracing(
 
 func (ex *connExecutor) enableTracing(modes []string) error {
 	traceKV := false
-	recordingType := tracing.SnowballRecording
+	recordingType := tracing.RecordingVerbose
 	enableMode := true
 	showResults := false
 
@@ -1331,10 +1360,8 @@ func (ex *connExecutor) enableTracing(modes []string) error {
 			enableMode = false
 		case "kv":
 			traceKV = true
-		case "local":
-			recordingType = tracing.SingleNodeRecording
 		case "cluster":
-			recordingType = tracing.SnowballRecording
+			recordingType = tracing.RecordingVerbose
 		default:
 			return pgerror.Newf(pgcode.Syntax,
 				"set tracing: unknown mode %q", s)
@@ -1453,6 +1480,15 @@ func (ex *connExecutor) recordTransactionStart() (onTxnFinish func(txnEvent), on
 	ex.extraTxnState.transactionStatementsHash = util.MakeFNV64()
 	ex.extraTxnState.transactionStatementIDs = nil
 	ex.extraTxnState.numRows = 0
+	ex.extraTxnState.shouldCollectExecutionStats = false
+	ex.extraTxnState.accumulatedStats = execstats.QueryLevelStats{}
+	ex.extraTxnState.rowsRead = 0
+	ex.extraTxnState.bytesRead = 0
+	if execStatsSampleRate := collectTxnStatsSampleRate.Get(&ex.server.GetExecutorConfig().Settings.SV); execStatsSampleRate > 0 {
+		ex.extraTxnState.shouldCollectExecutionStats = execStatsSampleRate > ex.rng.Float64()
+	}
+
+	ex.metrics.EngineMetrics.SQLTxnsOpen.Inc(1)
 
 	onTxnFinish = func(ev txnEvent) {
 		ex.phaseTimes[sessionEndExecTransaction] = timeutil.Now()
@@ -1463,6 +1499,11 @@ func (ex *connExecutor) recordTransactionStart() (onTxnFinish func(txnEvent), on
 		ex.extraTxnState.transactionStatementIDs = nil
 		ex.extraTxnState.transactionStatementsHash = util.MakeFNV64()
 		ex.extraTxnState.numRows = 0
+		// accumulatedStats are cleared, but shouldCollectExecutionStats is
+		// unchanged.
+		ex.extraTxnState.accumulatedStats = execstats.QueryLevelStats{}
+		ex.extraTxnState.rowsRead = 0
+		ex.extraTxnState.bytesRead = 0
 	}
 	return onTxnFinish, onTxnRestart
 }
@@ -1470,6 +1511,7 @@ func (ex *connExecutor) recordTransactionStart() (onTxnFinish func(txnEvent), on
 func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool, txnStart time.Time) {
 	txnEnd := timeutil.Now()
 	txnTime := txnEnd.Sub(txnStart)
+	ex.metrics.EngineMetrics.SQLTxnsOpen.Dec(1)
 	ex.metrics.EngineMetrics.SQLTxnLatency.RecordValue(txnTime.Nanoseconds())
 
 	txnServiceLat := ex.phaseTimes.getTransactionServiceLatency()
@@ -1487,5 +1529,44 @@ func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool, txnStart t
 		txnRetryLat,
 		commitLat,
 		ex.extraTxnState.numRows,
+		ex.extraTxnState.shouldCollectExecutionStats,
+		ex.extraTxnState.accumulatedStats,
+		ex.extraTxnState.rowsRead,
+		ex.extraTxnState.bytesRead,
 	)
+}
+
+// createRootOrChildSpan is used to create spans for txns and stmts. It inspects
+// parentCtx for an existing span and creates a root span if none is found, or a
+// child span if one is found. A context derived from parentCtx which
+// additionally contains the new span is also returned.
+func createRootOrChildSpan(
+	parentCtx context.Context, opName string, tr *tracing.Tracer, os ...tracing.SpanOption,
+) (context.Context, *tracing.Span) {
+	// WithForceRealSpan is used to support the use of session tracing, which
+	// may start recording on this span.
+	os = append(os, tracing.WithForceRealSpan())
+	return tracing.EnsureChildSpan(parentCtx, tr, opName, os...)
+}
+
+// logTraceAboveThreshold logs a span's recording if the duration is above a
+// given threshold. It is used when txn or stmt threshold tracing is enabled.
+// This function assumes that sp is non-nil and threshold tracing was enabled.
+func logTraceAboveThreshold(
+	ctx context.Context, r tracing.Recording, opName string, threshold, elapsed time.Duration,
+) {
+	if elapsed < threshold {
+		return
+	}
+	if r == nil {
+		log.Warning(ctx, "missing trace when threshold tracing was enabled")
+		return
+	}
+	dump := r.String()
+	if len(dump) == 0 {
+		return
+	}
+	// Note that log lines larger than 65k are truncated in the debug zip (see
+	// #50166).
+	log.Infof(ctx, "%s took %s, exceeding threshold of %s:\n%s", opName, elapsed, threshold, dump)
 }

@@ -187,14 +187,7 @@ func (c *cliTest) stopServer() {
 	if c.TestServer != nil {
 		log.Infof(context.Background(), "stopping server at %s / %s",
 			c.ServingRPCAddr(), c.ServingSQLAddr())
-		select {
-		case <-c.Stopper().ShouldStop():
-			// If ShouldStop() doesn't block, that means someone has already
-			// called Stop(). We just need to wait.
-			<-c.Stopper().IsStopped()
-		default:
-			c.Stopper().Stop(context.Background())
-		}
+		c.Stopper().Stop(context.Background())
 	}
 }
 
@@ -530,8 +523,12 @@ func Example_sql() {
 	c.RunWithArgs([]string{`sql`, `--set=errexit=0`, `-e`, `select nonexistent`, `-e`, `select 123 as "123"`})
 	c.RunWithArgs([]string{`sql`, `--set`, `echo=true`, `-e`, `select 123 as "123"`})
 	c.RunWithArgs([]string{`sql`, `--set`, `unknownoption`, `-e`, `select 123 as "123"`})
-	// Check that partial results + error get reported together.
-	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(@1-3) from generate_series(1,4)`})
+	// Check that partial results + error get reported together. The query will
+	// run via the vectorized execution engine which operates on the batches of
+	// growing capacity starting at 1 (the batch sizes will be 1, 2, 4, ...),
+	// and with the query below the division by zero error will occur after the
+	// first batch consisting of 1 row has been returned to the client.
+	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(@1-2) from generate_series(1,3)`})
 
 	// Output:
 	// sql -e show application_name
@@ -589,9 +586,8 @@ func Example_sql() {
 	// sql --set unknownoption -e select 123 as "123"
 	// invalid syntax: \set unknownoption. Try \? for help.
 	// ERROR: invalid syntax
-	// sql -e select 1/(@1-3) from generate_series(1,4)
+	// sql -e select 1/(@1-2) from generate_series(1,3)
 	// ?column?
-	// -0.5
 	// -1
 	// (error encountered after some results were delivered)
 	// ERROR: division by zero
@@ -1371,7 +1367,7 @@ func Example_misc_table() {
 	//            info
 	// --------------------------
 	//   distribution: full
-	//   vectorized: false
+	//   vectorized: true
 	//
 	//   • render
 	//   │
@@ -1432,13 +1428,18 @@ Available Commands:
   help              Help about any command
 
 Flags:
-  -h, --help                             help for cockroach
-      --logtostderr Severity[=DEFAULT]   logs at or above this threshold go to stderr (default NONE)
-      --no-color                         disable standard error log colorization
+  -h, --help                 help for cockroach
+      --log <string>         
+                                     Logging configuration. See the documentation for details.
+                                    
+      --version              version for cockroach
 
 Use "cockroach [command] --help" for more information about a command.
 `
-	helpExpected := fmt.Sprintf("CockroachDB command-line interface and server.\n\n%s", expUsage)
+	helpExpected := fmt.Sprintf("CockroachDB command-line interface and server.\n\n%s",
+		// Due to a bug in spf13/cobra, 'cockroach help' does not include the --version
+		// flag. Strangely, 'cockroach --help' does, as well as usage error messages.
+		strings.ReplaceAll(expUsage, "      --version              version for cockroach\n", ""))
 	badFlagExpected := fmt.Sprintf("%s\nError: unknown flag: --foo\n", expUsage)
 
 	testCases := []struct {

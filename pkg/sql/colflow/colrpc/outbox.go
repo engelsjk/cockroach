@@ -17,7 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
@@ -46,8 +45,6 @@ type Outbox struct {
 	colexec.OneInputNode
 
 	typs []*types.T
-	// batch is the last batch received from the input.
-	batch coldata.Batch
 
 	converter  *colserde.ArrowBatchConverter
 	serializer *colserde.RecordBatchSerializer
@@ -237,18 +234,19 @@ func (o *Outbox) sendBatches(
 				return
 			}
 
-			o.batch = o.Input().Next(o.runnerCtx)
-			if o.batch.Length() == 0 {
+			batch := o.Input().Next(o.runnerCtx)
+			n := batch.Length()
+			if n == 0 {
 				terminatedGracefully = true
 				return
 			}
 
 			o.scratch.buf.Reset()
-			d, err := o.converter.BatchToArrow(o.batch)
+			d, err := o.converter.BatchToArrow(batch)
 			if err != nil {
 				colexecerror.InternalError(errors.Wrap(err, "Outbox BatchToArrow data serialization error"))
 			}
-			if _, _, err := o.serializer.Serialize(o.scratch.buf, d, o.batch.Length()); err != nil {
+			if _, _, err := o.serializer.Serialize(o.scratch.buf, d, n); err != nil {
 				colexecerror.InternalError(errors.Wrap(err, "Outbox Serialize data error"))
 			}
 			o.scratch.msg.Data.RawBytes = o.scratch.buf.Bytes()
@@ -274,6 +272,15 @@ func (o *Outbox) sendMetadata(ctx context.Context, stream flowStreamClient, errT
 		msg.Data.Metadata = append(
 			msg.Data.Metadata, execinfrapb.LocalMetaToRemoteProducerMeta(ctx, execinfrapb.ProducerMetadata{Err: errToSend}),
 		)
+	}
+	if trace := execinfra.GetTraceData(ctx); trace != nil {
+		msg.Data.Metadata = append(msg.Data.Metadata, execinfrapb.RemoteProducerMetadata{
+			Value: &execinfrapb.RemoteProducerMetadata_TraceData_{
+				TraceData: &execinfrapb.RemoteProducerMetadata_TraceData{
+					CollectedSpans: trace,
+				},
+			},
+		})
 	}
 	for _, src := range o.metadataSources {
 		for _, meta := range src.DrainMeta(ctx) {

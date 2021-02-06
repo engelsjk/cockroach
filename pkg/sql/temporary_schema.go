@@ -50,11 +50,11 @@ import (
 
 // TempObjectCleanupInterval is a ClusterSetting controlling how often
 // temporary objects get cleaned up.
-var TempObjectCleanupInterval = settings.RegisterPublicDurationSetting(
+var TempObjectCleanupInterval = settings.RegisterDurationSetting(
 	"sql.temp_object_cleaner.cleanup_interval",
 	"how often to clean up orphaned temporary objects",
 	30*time.Minute,
-)
+).WithPublic()
 
 var (
 	temporaryObjectCleanerActiveCleanersMetric = metric.Metadata{
@@ -159,25 +159,6 @@ func temporarySchemaSessionID(scName string) (bool, ClusterWideID, error) {
 	return true, ClusterWideID{uint128.Uint128{Hi: hi, Lo: lo}}, nil
 }
 
-// getTemporaryObjectNames returns all the temporary objects under the
-// temporary schema of the given dbID.
-func getTemporaryObjectNames(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, dbID descpb.ID, tempSchemaName string,
-) (tree.TableNames, error) {
-	dbDesc, err := catalogkv.MustGetDatabaseDescByID(ctx, txn, codec, dbID)
-	if err != nil {
-		return nil, err
-	}
-	return descs.GetObjectNames(
-		ctx,
-		txn,
-		codec,
-		dbDesc,
-		tempSchemaName,
-		tree.DatabaseListFlags{CommonLookupFlags: tree.CommonLookupFlags{Required: false}},
-	)
-}
-
 // cleanupSessionTempObjects removes all temporary objects (tables, sequences,
 // views, temporary schema) created by the session.
 func cleanupSessionTempObjects(
@@ -233,7 +214,17 @@ func cleanupSchemaObjects(
 	dbID descpb.ID,
 	schemaName string,
 ) error {
-	tbNames, err := getTemporaryObjectNames(ctx, txn, codec, dbID, schemaName)
+	dbDesc, err := catalogkv.MustGetDatabaseDescByID(ctx, txn, codec, dbID)
+	if err != nil {
+		return err
+	}
+	tbNames, err := descsCol.GetObjectNames(
+		ctx,
+		txn,
+		dbDesc,
+		schemaName,
+		tree.DatabaseListFlags{CommonLookupFlags: tree.CommonLookupFlags{Required: false}},
+	)
 	if err != nil {
 		return err
 	}
@@ -253,22 +244,22 @@ func cleanupSchemaObjects(
 	for _, tbName := range tbNames {
 		flags := tree.ObjectLookupFlagsWithRequired()
 		flags.AvoidCached = true
-		desc, err := descsCol.GetTableVersion(ctx, txn, &tbName, flags)
+		_, desc, err := descsCol.GetImmutableTableByName(ctx, txn, &tbName, flags)
 		if err != nil {
 			return err
 		}
 
-		tblDescsByID[desc.ID] = desc
-		tblNamesByID[desc.ID] = tbName
+		tblDescsByID[desc.GetID()] = desc
+		tblNamesByID[desc.GetID()] = tbName
 
-		databaseIDToTempSchemaID[uint32(desc.ParentID)] = uint32(desc.GetParentSchemaID())
+		databaseIDToTempSchemaID[uint32(desc.GetParentID())] = uint32(desc.GetParentSchemaID())
 
-		if desc.SequenceOpts != nil {
-			sequences = append(sequences, desc.ID)
-		} else if desc.ViewQuery != "" {
-			views = append(views, desc.ID)
+		if desc.GetSequenceOpts() != nil {
+			sequences = append(sequences, desc.GetID())
+		} else if desc.GetViewQuery() != "" {
+			views = append(views, desc.GetID())
 		} else {
-			tables = append(tables, desc.ID)
+			tables = append(tables, desc.GetID())
 		}
 	}
 
@@ -329,12 +320,12 @@ func cleanupSchemaObjects(
 					for _, colID := range d.ColumnIDs {
 						dependentColIDs.Add(int(colID))
 					}
-					for _, col := range dTableDesc.Columns {
-						if dependentColIDs.Contains(int(col.ID)) {
+					for _, col := range dTableDesc.PublicColumns() {
+						if dependentColIDs.Contains(int(col.GetID())) {
 							tbName := tree.MakeTableNameWithSchema(
 								tree.Name(db.GetName()),
 								tree.Name(schema),
-								tree.Name(dTableDesc.Name),
+								tree.Name(dTableDesc.GetName()),
 							)
 							_, err = ie.ExecEx(
 								ctx,
@@ -344,7 +335,7 @@ func cleanupSchemaObjects(
 								fmt.Sprintf(
 									"ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
 									tbName.FQString(),
-									tree.NameString(col.Name),
+									tree.NameString(col.GetName()),
 								),
 							)
 							if err != nil {
@@ -389,7 +380,7 @@ func cleanupSchemaObjects(
 }
 
 // isMeta1LeaseholderFunc helps us avoid an import into pkg/storage.
-type isMeta1LeaseholderFunc func(context.Context, hlc.Timestamp) (bool, error)
+type isMeta1LeaseholderFunc func(context.Context, hlc.ClockTimestamp) (bool, error)
 
 // TemporaryObjectCleaner is a background thread job that periodically
 // cleans up orphaned temporary objects by sessions which did not close
@@ -486,7 +477,7 @@ func (c *TemporaryObjectCleaner) doTemporaryObjectCleanup(
 
 	// We only want to perform the cleanup if we are holding the meta1 lease.
 	// This ensures only one server can perform the job at a time.
-	isLeaseholder, err := c.isMeta1LeaseholderFunc(ctx, c.db.Clock().Now())
+	isLeaseholder, err := c.isMeta1LeaseholderFunc(ctx, c.db.Clock().NowAsClockTimestamp())
 	if err != nil {
 		return err
 	}
@@ -594,7 +585,7 @@ func (c *TemporaryObjectCleaner) doTemporaryObjectCleanup(
 
 // Start initializes the background thread which periodically cleans up leftover temporary objects.
 func (c *TemporaryObjectCleaner) Start(ctx context.Context, stopper *stop.Stopper) {
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "object-cleaner", func(ctx context.Context) {
 		nextTick := timeutil.Now()
 		for {
 			nextTickCh := time.After(nextTick.Sub(timeutil.Now()))

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -74,7 +75,7 @@ func TestConsistencyQueueRequiresLive(t *testing.T) {
 	}
 
 	if shouldQ, priority := kvserver.ConsistencyQueueShouldQueue(
-		context.Background(), clock.Now(), desc, getQueueLastProcessed, isNodeLive,
+		context.Background(), clock.NowAsClockTimestamp(), desc, getQueueLastProcessed, isNodeLive,
 		false, interval); !shouldQ {
 		t.Fatalf("expected shouldQ true; got %t, %f", shouldQ, priority)
 	}
@@ -82,7 +83,7 @@ func TestConsistencyQueueRequiresLive(t *testing.T) {
 	live = false
 
 	if shouldQ, priority := kvserver.ConsistencyQueueShouldQueue(
-		context.Background(), clock.Now(), desc, getQueueLastProcessed, isNodeLive,
+		context.Background(), clock.NowAsClockTimestamp(), desc, getQueueLastProcessed, isNodeLive,
 		false, interval); shouldQ {
 		t.Fatalf("expected shouldQ false; got %t, %f", shouldQ, priority)
 	}
@@ -442,7 +443,9 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 		iter := cpEng.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: []byte("\xff")})
 		defer iter.Close()
 
-		ms, err := storage.ComputeStatsForRange(iter, roachpb.KeyMin, roachpb.KeyMax, 0 /* nowNanos */)
+		// The range is specified using only global keys, since the implementation
+		// may use an intentInterleavingIter.
+		ms, err := storage.ComputeStatsForRange(iter, keys.LocalMax, roachpb.KeyMax, 0 /* nowNanos */)
 		assert.NoError(t, err)
 
 		assert.NotZero(t, ms.KeyBytes)
@@ -619,7 +622,7 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 	// RecomputeStats does not see any skew in its MVCC stats when they are
 	// modified concurrently. Note that these writes don't interfere with the
 	// field we modified (SysCount).
-	tc.Stopper().RunWorker(ctx, func(ctx context.Context) {
+	_ = tc.Stopper().RunAsyncTask(ctx, "recompute-loop", func(ctx context.Context) {
 		// This channel terminates the loop early if the test takes more than five
 		// seconds. This is useful for stress race runs in CI where the tight loop
 		// can starve the actual work to be done.

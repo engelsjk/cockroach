@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -159,10 +160,11 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 	defer func() {
 		if err == nil {
 			if dropped := atomic.LoadInt32(&countDropped); dropped > 0 {
-				entry := log.MakeEntry(
-					ctx, severity.WARNING, 0 /* depth */, false, /* redactable */
+				entry := log.MakeLegacyEntry(
+					ctx, severity.WARNING, channel.DEV,
+					0 /* depth */, true, /* redactable */
 					"%d messages were dropped", log.Safe(dropped))
-				err = log.FormatEntry(entry, w) // modify return value
+				err = log.FormatLegacyEntry(entry, w) // modify return value
 			}
 		}
 	}()
@@ -174,8 +176,9 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 	entries := make(chan logpb.Entry, logSpyChanCap)
 
 	{
-		entry := log.MakeEntry(
-			ctx, severity.INFO, 0 /* depth */, false, /* redactable */
+		entry := log.MakeLegacyEntry(
+			ctx, severity.INFO, channel.DEV,
+			0 /* depth */, true, /* redactable */
 			"intercepting logs with options %+v", opts)
 		entries <- entry
 	}
@@ -215,7 +218,7 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 			return
 
 		case entry := <-entries:
-			if err := log.FormatEntry(entry, w); err != nil {
+			if err := log.FormatLegacyEntry(entry, w); err != nil {
 				return errors.Wrapf(err, "while writing entry %v", entry)
 			}
 			count++

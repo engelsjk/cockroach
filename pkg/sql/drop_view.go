@@ -20,8 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -36,7 +36,8 @@ type dropViewNode struct {
 //          mysql requires the DROP privilege on the view.
 func (p *planner) DropView(ctx context.Context, n *tree.DropView) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"DROP VIEW",
 	); err != nil {
 		return nil, err
@@ -89,7 +90,7 @@ func (p *planner) DropView(ctx context.Context, n *tree.DropView) (planNode, err
 func (n *dropViewNode) ReadingOwnWrites() {}
 
 func (n *dropViewNode) startExec(params runParams) error {
-	telemetry.Inc(sqltelemetry.SchemaChangeDropCounter("view"))
+	telemetry.Inc(n.n.TelemetryCounter())
 
 	ctx := params.ctx
 	for _, toDel := range n.td {
@@ -107,19 +108,11 @@ func (n *dropViewNode) startExec(params runParams) error {
 		// Log a Drop View event for this table. This is an auditable log event
 		// and is recorded in the same transaction as the table descriptor
 		// update.
-		if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			ctx,
-			params.p.txn,
-			EventLogDropView,
-			int32(droppedDesc.ID),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			struct {
-				ViewName            string
-				Statement           string
-				User                string
-				CascadeDroppedViews []string
-			}{toDel.tn.FQString(), n.n.String(), params.p.User().Normalized(), cascadeDroppedViews},
-		); err != nil {
+		if err := params.p.logEvent(ctx,
+			droppedDesc.ID,
+			&eventpb.DropView{
+				ViewName:            toDel.tn.FQString(),
+				CascadeDroppedViews: cascadeDroppedViews}); err != nil {
 			return err
 		}
 	}
@@ -198,7 +191,8 @@ func (p *planner) dropViewImpl(
 	var cascadeDroppedViews []string
 
 	// Remove back-references from the tables/views this view depends on.
-	for _, depID := range viewDesc.DependsOn {
+	dependedOn := append([]descpb.ID(nil), viewDesc.DependsOn...)
+	for _, depID := range dependedOn {
 		dependencyDesc, err := p.Descriptors().GetMutableTableVersionByID(ctx, depID, p.txn)
 		if err != nil {
 			return cascadeDroppedViews,
@@ -221,19 +215,26 @@ func (p *planner) dropViewImpl(
 	viewDesc.DependsOn = nil
 
 	if behavior == tree.DropCascade {
-		for _, ref := range viewDesc.DependedOnBy {
+		dependedOnBy := append([]descpb.TableDescriptor_Reference(nil), viewDesc.DependedOnBy...)
+		for _, ref := range dependedOnBy {
 			dependentDesc, err := p.getViewDescForCascade(
 				ctx, viewDesc.TypeName(), viewDesc.Name, viewDesc.ParentID, ref.ID, behavior,
 			)
 			if err != nil {
 				return cascadeDroppedViews, err
 			}
+
+			qualifiedView, err := p.getQualifiedTableName(ctx, dependentDesc)
+			if err != nil {
+				return cascadeDroppedViews, err
+			}
+
 			cascadedViews, err := p.dropViewImpl(ctx, dependentDesc, queueJob, "dropping dependent view", behavior)
 			if err != nil {
 				return cascadeDroppedViews, err
 			}
 			cascadeDroppedViews = append(cascadeDroppedViews, cascadedViews...)
-			cascadeDroppedViews = append(cascadeDroppedViews, dependentDesc.Name)
+			cascadeDroppedViews = append(cascadeDroppedViews, qualifiedView.FQString())
 		}
 	}
 

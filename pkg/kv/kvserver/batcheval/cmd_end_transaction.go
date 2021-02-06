@@ -31,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -42,10 +41,7 @@ func init() {
 // declareKeysWriteTransaction is the shared portion of
 // declareKeys{End,Heartbeat}Transaction.
 func declareKeysWriteTransaction(
-	_ *roachpb.RangeDescriptor,
-	header roachpb.Header,
-	req roachpb.Request,
-	latchSpans *spanset.SpanSet,
+	_ ImmutableRangeState, header roachpb.Header, req roachpb.Request, latchSpans *spanset.SpanSet,
 ) {
 	if header.Txn != nil {
 		header.Txn.AssertInitialized(context.TODO())
@@ -56,13 +52,13 @@ func declareKeysWriteTransaction(
 }
 
 func declareKeysEndTxn(
-	desc *roachpb.RangeDescriptor,
+	rs ImmutableRangeState,
 	header roachpb.Header,
 	req roachpb.Request,
 	latchSpans, _ *spanset.SpanSet,
 ) {
 	et := req.(*roachpb.EndTxnRequest)
-	declareKeysWriteTransaction(desc, header, req, latchSpans)
+	declareKeysWriteTransaction(rs, header, req, latchSpans)
 	var minTxnTS hlc.Timestamp
 	if header.Txn != nil {
 		header.Txn.AssertInitialized(context.TODO())
@@ -77,7 +73,7 @@ func declareKeysEndTxn(
 			abortSpanAccess = spanset.SpanReadWrite
 		}
 		latchSpans.AddNonMVCC(abortSpanAccess, roachpb.Span{
-			Key: keys.AbortSpanKey(header.RangeID, header.Txn.ID),
+			Key: keys.AbortSpanKey(rs.GetRangeID(), header.Txn.ID),
 		})
 	}
 
@@ -87,7 +83,9 @@ func declareKeysEndTxn(
 		// All requests that intend on resolving local locks need to depend on
 		// the range descriptor because they need to determine which locks are
 		// within the local range.
-		latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(desc.StartKey)})
+		latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{
+			Key: keys.RangeDescriptorKey(rs.GetStartKey()),
+		})
 
 		// The spans may extend beyond this Range, but it's ok for the
 		// purpose of acquiring latches. The parts in our Range will
@@ -121,7 +119,7 @@ func declareKeysEndTxn(
 					EndKey: keys.MakeRangeKeyPrefix(st.RightDesc.EndKey).PrefixEnd(),
 				})
 
-				leftRangeIDPrefix := keys.MakeRangeIDReplicatedPrefix(header.RangeID)
+				leftRangeIDPrefix := keys.MakeRangeIDReplicatedPrefix(rs.GetRangeID())
 				latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{
 					Key:    leftRangeIDPrefix,
 					EndKey: leftRangeIDPrefix.PrefixEnd(),
@@ -146,8 +144,8 @@ func declareKeysEndTxn(
 				})
 
 				latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{
-					Key:    abortspan.MinKey(header.RangeID),
-					EndKey: abortspan.MaxKey(header.RangeID),
+					Key:    abortspan.MinKey(rs.GetRangeID()),
+					EndKey: abortspan.MaxKey(rs.GetRangeID()),
 				})
 			}
 			if mt := et.InternalCommitTrigger.MergeTrigger; mt != nil {
@@ -418,6 +416,56 @@ func IsEndTxnTriggeringRetryError(
 
 const lockResolutionBatchSize = 500
 
+// iterManager provides a storage.IterAndBuf appropriate for working with a
+// span of keys that are either all local or all global keys, identified by
+// the start key of the span, that is passed to getIterAndBuf. This is to deal
+// with the constraint that a single MVCCIterator using
+// MVCCKeyAndIntentsIterKind can either iterate over local keys or global
+// keys, but not both. We don't wish to create a new iterator for each span,
+// so iterManager lazily creates a new one when needed.
+type iterManager struct {
+	reader              storage.Reader
+	globalKeyUpperBound roachpb.Key
+	iterAndBuf          storage.IterAndBuf
+
+	iter        storage.MVCCIterator
+	isLocalIter bool
+}
+
+func (im *iterManager) getIterAndBuf(key roachpb.Key) storage.IterAndBuf {
+	isLocal := keys.IsLocal(key)
+	if im.iter != nil {
+		if im.isLocalIter == isLocal {
+			return im.iterAndBuf
+		}
+		im.iterAndBuf.SwitchIter(nil /* iter */)
+		im.iter.Close()
+		im.iter = nil
+	}
+	if isLocal {
+		im.iter = im.reader.NewMVCCIterator(
+			storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+				UpperBound: keys.LocalMax,
+			})
+		im.isLocalIter = true
+		im.iterAndBuf.SwitchIter(im.iter)
+	} else {
+		im.iter = im.reader.NewMVCCIterator(
+			storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+				UpperBound: im.globalKeyUpperBound,
+			})
+		im.isLocalIter = false
+		im.iterAndBuf.SwitchIter(im.iter)
+	}
+	return im.iterAndBuf
+}
+
+func (im *iterManager) Close() {
+	im.iterAndBuf.Cleanup()
+	im.iterAndBuf = storage.IterAndBuf{}
+	im.iter = nil
+}
+
 // resolveLocalLocks synchronously resolves any locks that are local to this
 // range in the same batch and returns those lock spans. The remainder are
 // collected and returned so that they can be handed off to asynchronous
@@ -441,11 +489,12 @@ func resolveLocalLocks(
 		desc = &mergeTrigger.LeftDesc
 	}
 
-	iter := readWriter.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
-		UpperBound: desc.EndKey.AsRawKey(),
-	})
-	iterAndBuf := storage.GetBufUsingIter(iter)
-	defer iterAndBuf.Cleanup()
+	iterManager := &iterManager{
+		reader:              readWriter,
+		globalKeyUpperBound: desc.EndKey.AsRawKey(),
+		iterAndBuf:          storage.GetBufUsingIter(nil),
+	}
+	defer iterManager.Close()
 
 	var resolveAllowance int64 = lockResolutionBatchSize
 	if args.InternalCommitTrigger != nil {
@@ -468,7 +517,8 @@ func resolveLocalLocks(
 					return nil
 				}
 				resolveMS := ms
-				ok, err := storage.MVCCResolveWriteIntentUsingIter(ctx, readWriter, iterAndBuf, resolveMS, update)
+				ok, err := storage.MVCCResolveWriteIntentUsingIter(
+					ctx, readWriter, iterManager.getIterAndBuf(span.Key), resolveMS, update)
 				if err != nil {
 					return err
 				}
@@ -485,7 +535,8 @@ func resolveLocalLocks(
 			externalLocks = append(externalLocks, outSpans...)
 			if inSpan != nil {
 				update.Span = *inSpan
-				num, resumeSpan, err := storage.MVCCResolveWriteIntentRangeUsingIter(ctx, readWriter, iterAndBuf, ms, update, resolveAllowance)
+				num, resumeSpan, err := storage.MVCCResolveWriteIntentRangeUsingIter(
+					ctx, readWriter, iterManager.getIterAndBuf(update.Span.Key), ms, update, resolveAllowance)
 				if err != nil {
 					return err
 				}
@@ -810,9 +861,6 @@ func splitTrigger(
 	split *roachpb.SplitTrigger,
 	ts hlc.Timestamp,
 ) (enginepb.MVCCStats, result.Result, error) {
-	// TODO(andrei): should this span be a child of the ctx's (if any)?
-	sp := rec.ClusterSettings().Tracer.StartSpan("split", tracing.WithCtxLogTags(ctx))
-	defer sp.Finish()
 	desc := rec.Desc()
 	if !bytes.Equal(desc.StartKey, split.LeftDesc.StartKey) ||
 		!bytes.Equal(desc.EndKey, split.RightDesc.EndKey) {
@@ -885,7 +933,7 @@ func splitTriggerHelper(
 		return enginepb.MVCCStats{}, result.Result{}, err
 	}
 
-	if !rec.ClusterSettings().Version.IsActive(ctx, clusterversion.VersionAbortSpanBytes) {
+	if !rec.ClusterSettings().Version.IsActive(ctx, clusterversion.AbortSpanBytes) {
 		// Since the stats here is used to seed the initial state for the RHS
 		// replicas, we need to be careful about zero-ing out the abort span
 		// bytes if the cluster version introducing it is not yet active. Not
@@ -905,7 +953,7 @@ func splitTriggerHelper(
 	// initial state. Additionally, since bothDeltaMS is tracking writes to
 	// both sides, we need to update it as well.
 	{
-		// Various pieces of code rely on a replica's lease never being unitialized,
+		// Various pieces of code rely on a replica's lease never being uninitialized,
 		// but it's more than that - it ensures that we properly initialize the
 		// timestamp cache, which is only populated on the lease holder, from that
 		// of the original Range.  We found out about a regression here the hard way
@@ -922,8 +970,9 @@ func splitTriggerHelper(
 		// - node two can illegally propose a write to 'd' at a lower timestamp.
 		//
 		// TODO(tschottdorf): why would this use r.store.Engine() and not the
-		// batch?
-		leftLease, err := MakeStateLoader(rec).LoadLease(ctx, rec.Engine())
+		// batch? We do the same thing for other usages of the state loader.
+		sl := MakeStateLoader(rec)
+		leftLease, err := sl.LoadLease(ctx, rec.Engine())
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load lease")
 		}
@@ -940,8 +989,7 @@ func splitTriggerHelper(
 		}
 		rightLease := leftLease
 		rightLease.Replica = replica
-
-		gcThreshold, err := MakeStateLoader(rec).LoadGCThreshold(ctx, rec.Engine())
+		gcThreshold, err := sl.LoadGCThreshold(ctx, rec.Engine())
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load GCThreshold")
 		}
@@ -970,6 +1018,11 @@ func splitTriggerHelper(
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load legacy truncated state")
 		} else if found {
 			truncStateType = stateloader.TruncatedStateLegacyReplicated
+		}
+
+		replicaVersion, err := sl.LoadVersion(ctx, rec.Engine())
+		if err != nil {
+			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load GCThreshold")
 		}
 
 		// Writing the initial state is subtle since this also seeds the Raft
@@ -1004,7 +1057,7 @@ func splitTriggerHelper(
 
 		*h.AbsPostSplitRight(), err = stateloader.WriteInitialReplicaState(
 			ctx, batch, *h.AbsPostSplitRight(), split.RightDesc, rightLease,
-			*gcThreshold, truncStateType,
+			*gcThreshold, truncStateType, replicaVersion,
 		)
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to write initial Replica state")

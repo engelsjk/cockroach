@@ -3,7 +3,6 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "memo",
     srcs = [
-        "check_expr.go",
         "check_expr_skip.go",
         "constraint_builder.go",
         "cost.go",
@@ -11,6 +10,7 @@ go_library(
         "expr_format.go",
         "expr_name_gen.go",
         "extract.go",
+        "filters_expr_mutate_checker_skip.go",
         "group.go",
         "interner.go",
         "logical_props_builder.go",
@@ -26,10 +26,11 @@ go_library(
         "//pkg/geo/geoindex",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/inverted",
         "//pkg/sql/opt",
         "//pkg/sql/opt/cat",
         "//pkg/sql/opt/constraint",
-        "//pkg/sql/opt/invertedexpr",
+        "//pkg/sql/opt/invertedexpr",  # keep
         "//pkg/sql/opt/props",
         "//pkg/sql/opt/props/physical",
         "//pkg/sql/rowenc",
@@ -40,7 +41,7 @@ go_library(
         "//pkg/util/json",
         "//pkg/util/log",
         "//pkg/util/treeprinter",
-        "//vendor/github.com/cockroachdb/errors",
+        "@com_github_cockroachdb_errors//:errors",
     ],
 )
 
@@ -60,9 +61,9 @@ go_test(
     embed = [":memo"],
     deps = [
         "//pkg/settings/cluster",
+        "//pkg/sql/inverted",
         "//pkg/sql/opt",
         "//pkg/sql/opt/constraint",
-        "//pkg/sql/opt/invertedexpr",
         "//pkg/sql/opt/norm",
         "//pkg/sql/opt/optbuilder",
         "//pkg/sql/opt/props",
@@ -80,9 +81,9 @@ go_test(
         "//pkg/util/leaktest",
         "//pkg/util/timeofday",
         "//pkg/util/timeutil/pgdate",
-        "//vendor/github.com/cockroachdb/datadriven",
-        "//vendor/github.com/cockroachdb/errors",
-        "//vendor/golang.org/x/tools/container/intsets",
+        "@com_github_cockroachdb_datadriven//:datadriven",
+        "@com_github_cockroachdb_errors//:errors",
+        "@org_golang_x_tools//container/intsets",
     ],
 )
 

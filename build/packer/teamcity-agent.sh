@@ -34,9 +34,11 @@ apt-get install --yes \
   docker-ce \
   docker-compose \
   gnome-keyring \
+  gnupg2 \
   git \
   golang-go \
   openjdk-11-jre-headless \
+  pass \
   unzip
 # Installing gnome-keyring prevents the error described in
 # https://github.com/moby/moby/issues/34048
@@ -51,6 +53,11 @@ usermod -a -G docker agent
 # N.B.: This must be done as the agent user.
 su - agent <<'EOF'
 set -euxo pipefail
+
+# Set the default branch name for git. (Out of an abundance of caution because
+# I don't know how well TC handles having a different default branch name, stick
+# with "master".)
+git config --global init.defaultBranch master
 
 echo 'export GOPATH="$HOME"/work/.go' >> .profile && source .profile
 

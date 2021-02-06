@@ -10,15 +10,39 @@
 
 package log
 
-import "github.com/cockroachdb/cockroach/pkg/util/log/logpb"
-
 type logFormatter interface {
-	// formatEntry formats a logpb.Entry into a newly allocated *buffer.
+	formatterName() string
+	// doc is used to generate the formatter documentation.
+	doc() string
+	// formatEntry formats a logEntry into a newly allocated *buffer.
 	// The caller is responsible for calling putBuffer() afterwards.
-	formatEntry(entry logpb.Entry, stacks []byte) *buffer
+	formatEntry(entry logEntry) *buffer
 }
 
-var _ logFormatter = formatCrdbV1{}
-var _ logFormatter = formatCrdbV1WithCounter{}
-var _ logFormatter = formatCrdbV1TTY{}
-var _ logFormatter = formatCrdbV1TTYWithCounter{}
+var formatters = func() map[string]logFormatter {
+	m := make(map[string]logFormatter)
+	r := func(f logFormatter) {
+		m[f.formatterName()] = f
+	}
+	r(formatCrdbV1{})
+	r(formatCrdbV1WithCounter{})
+	r(formatCrdbV1TTY{})
+	r(formatCrdbV1TTYWithCounter{})
+	r(formatCrdbV2{})
+	r(formatCrdbV2TTY{})
+	r(formatFluentJSONCompact{})
+	r(formatFluentJSONFull{})
+	r(formatJSONCompact{})
+	r(formatJSONFull{})
+	return m
+}()
+
+// GetFormatterDocs returns the embedded documentation for all the
+// supported formats.
+func GetFormatterDocs() map[string]string {
+	m := make(map[string]string)
+	for fmtName, f := range formatters {
+		m[fmtName] = f.doc()
+	}
+	return m
+}

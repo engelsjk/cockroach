@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -28,8 +27,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/dustin/go-humanize"
-	"github.com/gogo/protobuf/types"
 )
+
+// DiagramFlags contains diagram settings.
+type DiagramFlags struct {
+	// ShowInputTypes adds input type information.
+	ShowInputTypes bool
+
+	// MakeDeterministic resets all stats that can vary from run to run (like
+	// execution time), suitable for tests. See CompositeStats.MakeDeterministic.
+	MakeDeterministic bool
+}
 
 type diagramCellType interface {
 	// summary produces a title and an arbitrary number of lines that describe a
@@ -67,6 +75,13 @@ func colListStr(cols []uint32) string {
 // summary implements the diagramCellType interface.
 func (*NoopCoreSpec) summary() (string, []string) {
 	return "No-op", []string{}
+}
+
+// summary implements the diagramCellType interface.
+func (f *FiltererSpec) summary() (string, []string) {
+	return "Filterer", []string{
+		fmt.Sprintf("Filter: %s", f.Filter),
+	}
 }
 
 // summary implements the diagramCellType interface.
@@ -133,8 +148,8 @@ func (tr *TableReaderSpec) summary() (string, []string) {
 	if len(tr.Spans) > 0 {
 		tbl := tabledesc.NewImmutable(tr.Table)
 		// only show the first span
-		idx, _, _ := tbl.FindIndexByIndexIdx(int(tr.IndexIdx))
-		valDirs := catalogkeys.IndexKeyValDirs(idx)
+		idx := tbl.ActiveIndexes()[int(tr.IndexIdx)]
+		valDirs := catalogkeys.IndexKeyValDirs(idx.IndexDesc())
 
 		var spanStr strings.Builder
 		spanStr.WriteString("Spans: ")
@@ -423,9 +438,6 @@ func (post *PostProcessSpec) summary() []string {
 // (namely InterleavedReaderJoiner) that have multiple PostProcessors.
 func (post *PostProcessSpec) summaryWithPrefix(prefix string) []string {
 	var res []string
-	if !post.Filter.Empty() {
-		res = append(res, fmt.Sprintf("%sFilter: %s", prefix, post.Filter))
-	}
 	if post.Projection {
 		outputColumns := "None"
 		if len(post.OutputColumns) > 0 {
@@ -563,6 +575,7 @@ type diagramData struct {
 	Processors []diagramProcessor `json:"processors"`
 	Edges      []diagramEdge      `json:"edges"`
 
+	flags  DiagramFlags
 	flowID FlowID
 }
 
@@ -579,23 +592,29 @@ func (d diagramData) ToURL() (string, url.URL, error) {
 
 // AddSpans implements the FlowDiagram interface.
 func (d *diagramData) AddSpans(spans []tracingpb.RecordedSpan) {
-	processorStats, streamStats := extractStatsFromSpans(d.flowID, spans)
+	statsMap := ExtractStatsFromSpans(spans, d.flags.MakeDeterministic)
 	for i := range d.Processors {
-		if statDetails, ok := processorStats[int(d.Processors[i].processorID)]; ok {
-			d.Processors[i].Core.Details = append(d.Processors[i].Core.Details, statDetails...)
+		p := &d.Processors[i]
+		component := ProcessorComponentID(d.flowID, p.processorID)
+		if compStats := statsMap[component]; compStats != nil {
+			p.Core.Details = append(p.Core.Details, compStats.StatsForQueryPlan()...)
 		}
 	}
 	for i := range d.Edges {
-		d.Edges[i].Stats = streamStats[int(d.Edges[i].streamID)]
+		component := StreamComponentID(d.flowID, d.Edges[i].streamID)
+		if compStats := statsMap[component]; compStats != nil {
+			d.Edges[i].Stats = compStats.StatsForQueryPlan()
+		}
 	}
 }
 
 func generateDiagramData(
-	sql string, flows []FlowSpec, nodeNames []string, showInputTypes bool,
+	sql string, flows []FlowSpec, nodeNames []string, flags DiagramFlags,
 ) (FlowDiagram, error) {
 	d := &diagramData{
 		SQL:       sql,
 		NodeNames: nodeNames,
+		flags:     flags,
 	}
 	if len(flows) > 0 {
 		d.flowID = flows[0].FlowID
@@ -625,7 +644,7 @@ func generateDiagramData(
 			if len(p.Input) > 1 || (len(p.Input) == 1 && len(p.Input[0].Streams) > 1) {
 				proc.Inputs = make([]diagramCell, len(p.Input))
 				for i, s := range p.Input {
-					proc.Inputs[i].Title, proc.Inputs[i].Details = s.summary(showInputTypes)
+					proc.Inputs[i].Title, proc.Inputs[i].Details = s.summary(flags.ShowInputTypes)
 				}
 			} else {
 				proc.Inputs = []diagramCell{}
@@ -723,7 +742,7 @@ func generateDiagramData(
 // one FlowSpec per node. The function assumes that StreamIDs are unique across
 // all flows.
 func GeneratePlanDiagram(
-	sql string, flows map[roachpb.NodeID]*FlowSpec, showInputTypes bool,
+	sql string, flows map[roachpb.NodeID]*FlowSpec, flags DiagramFlags,
 ) (FlowDiagram, error) {
 	// We sort the flows by node because we want the diagram data to be
 	// deterministic.
@@ -741,16 +760,16 @@ func GeneratePlanDiagram(
 		nodeNames[i] = n.String()
 	}
 
-	return generateDiagramData(sql, flowSlice, nodeNames, showInputTypes)
+	return generateDiagramData(sql, flowSlice, nodeNames, flags)
 }
 
 // GeneratePlanDiagramURL generates the json data for a flow diagram and a
 // URL which encodes the diagram. There should be one FlowSpec per node. The
 // function assumes that StreamIDs are unique across all flows.
 func GeneratePlanDiagramURL(
-	sql string, flows map[roachpb.NodeID]*FlowSpec, showInputTypes bool,
+	sql string, flows map[roachpb.NodeID]*FlowSpec, flags DiagramFlags,
 ) (string, url.URL, error) {
-	d, err := GeneratePlanDiagram(sql, flows, showInputTypes)
+	d, err := GeneratePlanDiagram(sql, flows, flags)
 	if err != nil {
 		return "", url.URL{}, err
 	}
@@ -779,49 +798,4 @@ func encodeJSONToURL(json bytes.Buffer) (string, url.URL, error) {
 		Fragment: compressed.String(),
 	}
 	return jsonStr, url, nil
-}
-
-// extractStatsFromSpans extracts stats from spans tagged with a processor id
-// and returns a map from that processor id to a slice of stat descriptions
-// that can be added to a plan.
-func extractStatsFromSpans(
-	flowID FlowID, spans []tracingpb.RecordedSpan,
-) (processorStats, streamStats map[int][]string) {
-	processorStats = make(map[int][]string)
-	streamStats = make(map[int][]string)
-	for _, span := range spans {
-		// The trace can contain spans from multiple flows; make sure we select the
-		// right ones.
-		if fid, ok := span.Tags[FlowIDTagKey]; !ok || fid != flowID.String() {
-			continue
-		}
-
-		var id string
-		var stats map[int][]string
-
-		// Get the processor or stream id for this span. If neither exists, this
-		// span doesn't belong to a processor or stream.
-		if pid, ok := span.Tags[ProcessorIDTagKey]; ok {
-			id = pid
-			stats = processorStats
-		} else if sid, ok := span.Tags[StreamIDTagKey]; ok {
-			id = sid
-			stats = streamStats
-		} else {
-			continue
-		}
-
-		var da types.DynamicAny
-		if err := types.UnmarshalAny(span.Stats, &da); err != nil {
-			continue
-		}
-		if dss, ok := da.Message.(DistSQLSpanStats); ok {
-			i, err := strconv.Atoi(id)
-			if err != nil {
-				continue
-			}
-			stats[i] = append(stats[i], dss.StatsForQueryPlan()...)
-		}
-	}
-	return processorStats, streamStats
 }

@@ -195,6 +195,26 @@ func TestChangefeedEnvelope(t *testing.T) {
 	t.Run(`enterprise`, enterpriseTest(testFn))
 }
 
+func TestChangefeedFullTableName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'a')`)
+
+		t.Run(`envelope=row`, func(t *testing.T) {
+			foo := feed(t, f, `CREATE CHANGEFEED FOR foo WITH full_table_name`)
+			defer closeFeed(t, foo)
+			assertPayloads(t, foo, []string{`d.public.foo: [1]->{"after": {"a": 1, "b": "a"}}`})
+		})
+	}
+	//TODO(zinger): Plumb this option through to all encoders so it works in sinkless mode
+	//t.Run(`sinkless`, sinklessTest(testFn))
+	t.Run(`enterprise`, enterpriseTest(testFn))
+}
+
 func TestChangefeedMultiTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -374,6 +394,7 @@ func TestChangefeedResolvedFrequency(t *testing.T) {
 // operation.
 func TestChangefeedInitialScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderRaceWithIssue(t, 57754, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
@@ -1403,7 +1424,7 @@ func TestChangefeedUpdatePrimaryKey(t *testing.T) {
 	t.Run(`enterprise`, enterpriseTest(testFn))
 }
 
-func TestChangefeedTruncateRenameDrop(t *testing.T) {
+func TestChangefeedTruncateOrDrop(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -1449,28 +1470,16 @@ func TestChangefeedTruncateRenameDrop(t *testing.T) {
 		}
 		assertFailuresCounter(t, metrics, 2)
 
-		sqlDB.Exec(t, `CREATE TABLE rename (a INT PRIMARY KEY)`)
-		sqlDB.Exec(t, `INSERT INTO rename VALUES (1)`)
-		rename := feed(t, f, `CREATE CHANGEFEED FOR rename`)
-		defer closeFeed(t, rename)
-		assertPayloads(t, rename, []string{`rename: [1]->{"after": {"a": 1}}`})
-		sqlDB.Exec(t, `ALTER TABLE rename RENAME TO renamed`)
-		sqlDB.Exec(t, `INSERT INTO renamed VALUES (2)`)
-		if _, err := rename.Next(); !testutils.IsError(err, `"rename" was renamed to "renamed"`) {
-			t.Errorf(`expected ""rename" was renamed to "renamed"" error got: %+v`, err)
-		}
-		assertFailuresCounter(t, metrics, 3)
-
 		sqlDB.Exec(t, `CREATE TABLE drop (a INT PRIMARY KEY)`)
 		sqlDB.Exec(t, `INSERT INTO drop VALUES (1)`)
 		drop := feed(t, f, `CREATE CHANGEFEED FOR drop`)
 		defer closeFeed(t, drop)
 		assertPayloads(t, drop, []string{`drop: [1]->{"after": {"a": 1}}`})
 		sqlDB.Exec(t, `DROP TABLE drop`)
-		if _, err := drop.Next(); !testutils.IsError(err, `"drop" was dropped or truncated`) {
-			t.Errorf(`expected ""drop" was dropped or truncated" error got: %+v`, err)
+		if _, err := drop.Next(); !testutils.IsError(err, `"drop" was dropped`) {
+			t.Errorf(`expected ""drop" was dropped" error got: %+v`, err)
 		}
-		assertFailuresCounter(t, metrics, 4)
+		assertFailuresCounter(t, metrics, 3)
 	}
 
 	t.Run(`sinkless`, sinklessTest(testFn))
@@ -1970,6 +1979,7 @@ func TestChangefeedErrors(t *testing.T) {
 	)
 
 	// Check that confluent_schema_registry is only accepted if format is avro.
+	// TODO: This should be testing it as a WITH option and check avro_schema_prefix too
 	sqlDB.ExpectErr(
 		t, `unknown sink query parameter: confluent_schema_registry`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `experimental-sql://d/?confluent_schema_registry=foo`,
@@ -3028,4 +3038,45 @@ func TestChangefeedHandlesDrainingNodes(t *testing.T) {
 		`foo: [9]->{"after": {"k": 9, "v": 1}}`,
 		`foo: [10]->{"after": {"k": 10, "v": 0}}`,
 	})
+}
+
+// Primary key changes are not currently supported by changefeeds. There used
+// to be no detection but rather they would fail with an inscrutible error or
+// not all, just swallowing writes.
+func TestChangefeedPrimaryKeyChange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING NOT NULL)`)
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (0, 'initial')`)
+		sqlDB.Exec(t, `UPSERT INTO foo VALUES (0, 'updated')`)
+
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
+		defer closeFeed(t, foo)
+
+		// 'initial' is skipped because only the latest value ('updated') is
+		// emitted by the initial scan.
+		assertPayloads(t, foo, []string{
+			`foo: [0]->{"after": {"a": 0, "b": "updated"}}`,
+		})
+
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'a'), (2, 'b')`)
+		assertPayloads(t, foo, []string{
+			`foo: [1]->{"after": {"a": 1, "b": "a"}}`,
+			`foo: [2]->{"after": {"a": 2, "b": "b"}}`,
+		})
+
+		// ALTER PRIMARY KEY is totally busted as of writing this.
+		// The change will occur and all future drops will be hidden
+		// until the data gets GC'd. Assert that we don't see these updates.
+		sqlDB.Exec(t, `ALTER TABLE foo ALTER PRIMARY KEY USING COLUMNS (b)`)
+		_, err := foo.Next()
+		require.Regexp(t, "\"foo\" primary key changed", err)
+	}
+
+	t.Run(`sinkless`, sinklessTest(testFn))
+	t.Run(`enterprise`, enterpriseTest(testFn))
+	t.Run(`cloudstorage`, cloudStorageTest(testFn))
 }

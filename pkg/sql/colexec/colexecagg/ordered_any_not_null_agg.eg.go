@@ -18,9 +18,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
+)
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ tree.AggType
+	_ apd.Context
+	_ duration.Duration
 )
 
 func newAnyNotNullOrderedAggAlloc(
@@ -88,8 +97,6 @@ func newAnyNotNullOrderedAggAlloc(
 // first non-null value in the input column.
 type anyNotNullBoolOrderedAgg struct {
 	orderedAggregateFuncBase
-	allocator                   *colmem.Allocator
-	vec                         coldata.Vec
 	col                         coldata.Bools
 	curAgg                      bool
 	foundNonNullForCurrentGroup bool
@@ -99,7 +106,6 @@ var _ AggregateFunc = &anyNotNullBoolOrderedAgg{}
 
 func (a *anyNotNullBoolOrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec
 	a.col = vec.Bool()
 }
 
@@ -107,22 +113,22 @@ func (a *anyNotNullBoolOrderedAgg) Compute(
 	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
 ) {
 
+	var oldCurAggSize uintptr
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Bool(), vec.Nulls()
-
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// Capture col to force bounds check to work. See
-			// https://github.com/golang/go/issues/39756
-			col := col
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
 			_ = col.Get(inputLen - 1)
-			groups := a.groups
-			if sel == nil {
-				_ = groups[inputLen-1]
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -133,49 +139,25 @@ func (a *anyNotNullBoolOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			} else {
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						if groups[i] {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -186,47 +168,87 @@ func (a *anyNotNullBoolOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for _, i := range sel {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			}
-		},
+		} else {
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			}
+		}
+	},
 	)
+	var newCurAggSize uintptr
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	}
 }
 
 func (a *anyNotNullBoolOrderedAgg) Flush(outputIdx int) {
@@ -241,6 +263,11 @@ func (a *anyNotNullBoolOrderedAgg) Flush(outputIdx int) {
 	} else {
 		a.col[outputIdx] = a.curAgg
 	}
+}
+
+func (a *anyNotNullBoolOrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.foundNonNullForCurrentGroup = false
 }
 
 type anyNotNullBoolOrderedAggAlloc struct {
@@ -268,8 +295,6 @@ func (a *anyNotNullBoolOrderedAggAlloc) newAggFunc() AggregateFunc {
 // first non-null value in the input column.
 type anyNotNullBytesOrderedAgg struct {
 	orderedAggregateFuncBase
-	allocator                   *colmem.Allocator
-	vec                         coldata.Vec
 	col                         *coldata.Bytes
 	curAgg                      []byte
 	foundNonNullForCurrentGroup bool
@@ -279,7 +304,6 @@ var _ AggregateFunc = &anyNotNullBytesOrderedAgg{}
 
 func (a *anyNotNullBytesOrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec
 	a.col = vec.Bytes()
 }
 
@@ -290,20 +314,19 @@ func (a *anyNotNullBytesOrderedAgg) Compute(
 	oldCurAggSize := len(a.curAgg)
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Bytes(), vec.Nulls()
-
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// Capture col to force bounds check to work. See
-			// https://github.com/golang/go/issues/39756
-			col := col
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
 			_ = col.Get(inputLen - 1)
-			groups := a.groups
-			if sel == nil {
-				_ = groups[inputLen-1]
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -314,49 +337,25 @@ func (a *anyNotNullBytesOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = append(a.curAgg[:0], val...)
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col.Set(a.curIdx, a.curAgg)
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = append(a.curAgg[:0], val...)
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = append(a.curAgg[:0], val...)
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			} else {
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						if groups[i] {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -367,49 +366,87 @@ func (a *anyNotNullBytesOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = append(a.curAgg[:0], val...)
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for _, i := range sel {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col.Set(a.curIdx, a.curAgg)
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = append(a.curAgg[:0], val...)
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = append(a.curAgg[:0], val...)
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			}
-		},
+		} else {
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col.Set(a.curIdx, a.curAgg)
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = append(a.curAgg[:0], val...)
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col.Set(a.curIdx, a.curAgg)
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = append(a.curAgg[:0], val...)
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			}
+		}
+	},
 	)
 	newCurAggSize := len(a.curAgg)
-	a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	}
 }
 
 func (a *anyNotNullBytesOrderedAgg) Flush(outputIdx int) {
@@ -427,6 +464,11 @@ func (a *anyNotNullBytesOrderedAgg) Flush(outputIdx int) {
 	// Release the reference to curAgg eagerly.
 	a.allocator.AdjustMemoryUsage(-int64(len(a.curAgg)))
 	a.curAgg = nil
+}
+
+func (a *anyNotNullBytesOrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.foundNonNullForCurrentGroup = false
 }
 
 type anyNotNullBytesOrderedAggAlloc struct {
@@ -454,8 +496,6 @@ func (a *anyNotNullBytesOrderedAggAlloc) newAggFunc() AggregateFunc {
 // first non-null value in the input column.
 type anyNotNullDecimalOrderedAgg struct {
 	orderedAggregateFuncBase
-	allocator                   *colmem.Allocator
-	vec                         coldata.Vec
 	col                         coldata.Decimals
 	curAgg                      apd.Decimal
 	foundNonNullForCurrentGroup bool
@@ -465,7 +505,6 @@ var _ AggregateFunc = &anyNotNullDecimalOrderedAgg{}
 
 func (a *anyNotNullDecimalOrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec
 	a.col = vec.Decimal()
 }
 
@@ -473,22 +512,22 @@ func (a *anyNotNullDecimalOrderedAgg) Compute(
 	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
 ) {
 
+	oldCurAggSize := tree.SizeOfDecimal(&a.curAgg)
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Decimal(), vec.Nulls()
-
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// Capture col to force bounds check to work. See
-			// https://github.com/golang/go/issues/39756
-			col := col
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
 			_ = col.Get(inputLen - 1)
-			groups := a.groups
-			if sel == nil {
-				_ = groups[inputLen-1]
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -499,49 +538,25 @@ func (a *anyNotNullDecimalOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg.Set(&val)
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx].Set(&a.curAgg)
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg.Set(&val)
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg.Set(&val)
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			} else {
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						if groups[i] {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -552,47 +567,87 @@ func (a *anyNotNullDecimalOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg.Set(&val)
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for _, i := range sel {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx].Set(&a.curAgg)
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg.Set(&val)
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg.Set(&val)
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			}
-		},
+		} else {
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx].Set(&a.curAgg)
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg.Set(&val)
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx].Set(&a.curAgg)
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg.Set(&val)
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			}
+		}
+	},
 	)
+	newCurAggSize := tree.SizeOfDecimal(&a.curAgg)
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	}
 }
 
 func (a *anyNotNullDecimalOrderedAgg) Flush(outputIdx int) {
@@ -607,6 +662,11 @@ func (a *anyNotNullDecimalOrderedAgg) Flush(outputIdx int) {
 	} else {
 		a.col[outputIdx].Set(&a.curAgg)
 	}
+}
+
+func (a *anyNotNullDecimalOrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.foundNonNullForCurrentGroup = false
 }
 
 type anyNotNullDecimalOrderedAggAlloc struct {
@@ -634,8 +694,6 @@ func (a *anyNotNullDecimalOrderedAggAlloc) newAggFunc() AggregateFunc {
 // first non-null value in the input column.
 type anyNotNullInt16OrderedAgg struct {
 	orderedAggregateFuncBase
-	allocator                   *colmem.Allocator
-	vec                         coldata.Vec
 	col                         coldata.Int16s
 	curAgg                      int16
 	foundNonNullForCurrentGroup bool
@@ -645,7 +703,6 @@ var _ AggregateFunc = &anyNotNullInt16OrderedAgg{}
 
 func (a *anyNotNullInt16OrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec
 	a.col = vec.Int16()
 }
 
@@ -653,22 +710,22 @@ func (a *anyNotNullInt16OrderedAgg) Compute(
 	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
 ) {
 
+	var oldCurAggSize uintptr
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Int16(), vec.Nulls()
-
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// Capture col to force bounds check to work. See
-			// https://github.com/golang/go/issues/39756
-			col := col
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
 			_ = col.Get(inputLen - 1)
-			groups := a.groups
-			if sel == nil {
-				_ = groups[inputLen-1]
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -679,49 +736,25 @@ func (a *anyNotNullInt16OrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			} else {
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						if groups[i] {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -732,47 +765,87 @@ func (a *anyNotNullInt16OrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for _, i := range sel {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			}
-		},
+		} else {
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			}
+		}
+	},
 	)
+	var newCurAggSize uintptr
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	}
 }
 
 func (a *anyNotNullInt16OrderedAgg) Flush(outputIdx int) {
@@ -787,6 +860,11 @@ func (a *anyNotNullInt16OrderedAgg) Flush(outputIdx int) {
 	} else {
 		a.col[outputIdx] = a.curAgg
 	}
+}
+
+func (a *anyNotNullInt16OrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.foundNonNullForCurrentGroup = false
 }
 
 type anyNotNullInt16OrderedAggAlloc struct {
@@ -814,8 +892,6 @@ func (a *anyNotNullInt16OrderedAggAlloc) newAggFunc() AggregateFunc {
 // first non-null value in the input column.
 type anyNotNullInt32OrderedAgg struct {
 	orderedAggregateFuncBase
-	allocator                   *colmem.Allocator
-	vec                         coldata.Vec
 	col                         coldata.Int32s
 	curAgg                      int32
 	foundNonNullForCurrentGroup bool
@@ -825,7 +901,6 @@ var _ AggregateFunc = &anyNotNullInt32OrderedAgg{}
 
 func (a *anyNotNullInt32OrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec
 	a.col = vec.Int32()
 }
 
@@ -833,22 +908,22 @@ func (a *anyNotNullInt32OrderedAgg) Compute(
 	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
 ) {
 
+	var oldCurAggSize uintptr
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Int32(), vec.Nulls()
-
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// Capture col to force bounds check to work. See
-			// https://github.com/golang/go/issues/39756
-			col := col
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
 			_ = col.Get(inputLen - 1)
-			groups := a.groups
-			if sel == nil {
-				_ = groups[inputLen-1]
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -859,49 +934,25 @@ func (a *anyNotNullInt32OrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			} else {
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						if groups[i] {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -912,47 +963,87 @@ func (a *anyNotNullInt32OrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for _, i := range sel {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			}
-		},
+		} else {
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			}
+		}
+	},
 	)
+	var newCurAggSize uintptr
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	}
 }
 
 func (a *anyNotNullInt32OrderedAgg) Flush(outputIdx int) {
@@ -967,6 +1058,11 @@ func (a *anyNotNullInt32OrderedAgg) Flush(outputIdx int) {
 	} else {
 		a.col[outputIdx] = a.curAgg
 	}
+}
+
+func (a *anyNotNullInt32OrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.foundNonNullForCurrentGroup = false
 }
 
 type anyNotNullInt32OrderedAggAlloc struct {
@@ -994,8 +1090,6 @@ func (a *anyNotNullInt32OrderedAggAlloc) newAggFunc() AggregateFunc {
 // first non-null value in the input column.
 type anyNotNullInt64OrderedAgg struct {
 	orderedAggregateFuncBase
-	allocator                   *colmem.Allocator
-	vec                         coldata.Vec
 	col                         coldata.Int64s
 	curAgg                      int64
 	foundNonNullForCurrentGroup bool
@@ -1005,7 +1099,6 @@ var _ AggregateFunc = &anyNotNullInt64OrderedAgg{}
 
 func (a *anyNotNullInt64OrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec
 	a.col = vec.Int64()
 }
 
@@ -1013,22 +1106,22 @@ func (a *anyNotNullInt64OrderedAgg) Compute(
 	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
 ) {
 
+	var oldCurAggSize uintptr
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Int64(), vec.Nulls()
-
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// Capture col to force bounds check to work. See
-			// https://github.com/golang/go/issues/39756
-			col := col
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
 			_ = col.Get(inputLen - 1)
-			groups := a.groups
-			if sel == nil {
-				_ = groups[inputLen-1]
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -1039,49 +1132,25 @@ func (a *anyNotNullInt64OrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			} else {
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						if groups[i] {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -1092,47 +1161,87 @@ func (a *anyNotNullInt64OrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for _, i := range sel {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			}
-		},
+		} else {
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			}
+		}
+	},
 	)
+	var newCurAggSize uintptr
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	}
 }
 
 func (a *anyNotNullInt64OrderedAgg) Flush(outputIdx int) {
@@ -1147,6 +1256,11 @@ func (a *anyNotNullInt64OrderedAgg) Flush(outputIdx int) {
 	} else {
 		a.col[outputIdx] = a.curAgg
 	}
+}
+
+func (a *anyNotNullInt64OrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.foundNonNullForCurrentGroup = false
 }
 
 type anyNotNullInt64OrderedAggAlloc struct {
@@ -1174,8 +1288,6 @@ func (a *anyNotNullInt64OrderedAggAlloc) newAggFunc() AggregateFunc {
 // first non-null value in the input column.
 type anyNotNullFloat64OrderedAgg struct {
 	orderedAggregateFuncBase
-	allocator                   *colmem.Allocator
-	vec                         coldata.Vec
 	col                         coldata.Float64s
 	curAgg                      float64
 	foundNonNullForCurrentGroup bool
@@ -1185,7 +1297,6 @@ var _ AggregateFunc = &anyNotNullFloat64OrderedAgg{}
 
 func (a *anyNotNullFloat64OrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec
 	a.col = vec.Float64()
 }
 
@@ -1193,22 +1304,22 @@ func (a *anyNotNullFloat64OrderedAgg) Compute(
 	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
 ) {
 
+	var oldCurAggSize uintptr
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Float64(), vec.Nulls()
-
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// Capture col to force bounds check to work. See
-			// https://github.com/golang/go/issues/39756
-			col := col
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
 			_ = col.Get(inputLen - 1)
-			groups := a.groups
-			if sel == nil {
-				_ = groups[inputLen-1]
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -1219,49 +1330,25 @@ func (a *anyNotNullFloat64OrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			} else {
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						if groups[i] {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -1272,47 +1359,87 @@ func (a *anyNotNullFloat64OrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for _, i := range sel {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			}
-		},
+		} else {
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			}
+		}
+	},
 	)
+	var newCurAggSize uintptr
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	}
 }
 
 func (a *anyNotNullFloat64OrderedAgg) Flush(outputIdx int) {
@@ -1327,6 +1454,11 @@ func (a *anyNotNullFloat64OrderedAgg) Flush(outputIdx int) {
 	} else {
 		a.col[outputIdx] = a.curAgg
 	}
+}
+
+func (a *anyNotNullFloat64OrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.foundNonNullForCurrentGroup = false
 }
 
 type anyNotNullFloat64OrderedAggAlloc struct {
@@ -1354,8 +1486,6 @@ func (a *anyNotNullFloat64OrderedAggAlloc) newAggFunc() AggregateFunc {
 // first non-null value in the input column.
 type anyNotNullTimestampOrderedAgg struct {
 	orderedAggregateFuncBase
-	allocator                   *colmem.Allocator
-	vec                         coldata.Vec
 	col                         coldata.Times
 	curAgg                      time.Time
 	foundNonNullForCurrentGroup bool
@@ -1365,7 +1495,6 @@ var _ AggregateFunc = &anyNotNullTimestampOrderedAgg{}
 
 func (a *anyNotNullTimestampOrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec
 	a.col = vec.Timestamp()
 }
 
@@ -1373,22 +1502,22 @@ func (a *anyNotNullTimestampOrderedAgg) Compute(
 	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
 ) {
 
+	var oldCurAggSize uintptr
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Timestamp(), vec.Nulls()
-
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// Capture col to force bounds check to work. See
-			// https://github.com/golang/go/issues/39756
-			col := col
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
 			_ = col.Get(inputLen - 1)
-			groups := a.groups
-			if sel == nil {
-				_ = groups[inputLen-1]
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -1399,49 +1528,25 @@ func (a *anyNotNullTimestampOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			} else {
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						if groups[i] {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -1452,47 +1557,87 @@ func (a *anyNotNullTimestampOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for _, i := range sel {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			}
-		},
+		} else {
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			}
+		}
+	},
 	)
+	var newCurAggSize uintptr
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	}
 }
 
 func (a *anyNotNullTimestampOrderedAgg) Flush(outputIdx int) {
@@ -1507,6 +1652,11 @@ func (a *anyNotNullTimestampOrderedAgg) Flush(outputIdx int) {
 	} else {
 		a.col[outputIdx] = a.curAgg
 	}
+}
+
+func (a *anyNotNullTimestampOrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.foundNonNullForCurrentGroup = false
 }
 
 type anyNotNullTimestampOrderedAggAlloc struct {
@@ -1534,8 +1684,6 @@ func (a *anyNotNullTimestampOrderedAggAlloc) newAggFunc() AggregateFunc {
 // first non-null value in the input column.
 type anyNotNullIntervalOrderedAgg struct {
 	orderedAggregateFuncBase
-	allocator                   *colmem.Allocator
-	vec                         coldata.Vec
 	col                         coldata.Durations
 	curAgg                      duration.Duration
 	foundNonNullForCurrentGroup bool
@@ -1545,7 +1693,6 @@ var _ AggregateFunc = &anyNotNullIntervalOrderedAgg{}
 
 func (a *anyNotNullIntervalOrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec
 	a.col = vec.Interval()
 }
 
@@ -1553,22 +1700,22 @@ func (a *anyNotNullIntervalOrderedAgg) Compute(
 	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
 ) {
 
+	var oldCurAggSize uintptr
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Interval(), vec.Nulls()
-
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// Capture col to force bounds check to work. See
-			// https://github.com/golang/go/issues/39756
-			col := col
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
 			_ = col.Get(inputLen - 1)
-			groups := a.groups
-			if sel == nil {
-				_ = groups[inputLen-1]
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -1579,49 +1726,25 @@ func (a *anyNotNullIntervalOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			} else {
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						if groups[i] {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -1632,47 +1755,87 @@ func (a *anyNotNullIntervalOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for _, i := range sel {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col[a.curIdx] = a.curAgg
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			}
-		},
+		} else {
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			}
+		}
+	},
 	)
+	var newCurAggSize uintptr
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	}
 }
 
 func (a *anyNotNullIntervalOrderedAgg) Flush(outputIdx int) {
@@ -1687,6 +1850,11 @@ func (a *anyNotNullIntervalOrderedAgg) Flush(outputIdx int) {
 	} else {
 		a.col[outputIdx] = a.curAgg
 	}
+}
+
+func (a *anyNotNullIntervalOrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.foundNonNullForCurrentGroup = false
 }
 
 type anyNotNullIntervalOrderedAggAlloc struct {
@@ -1714,8 +1882,6 @@ func (a *anyNotNullIntervalOrderedAggAlloc) newAggFunc() AggregateFunc {
 // first non-null value in the input column.
 type anyNotNullDatumOrderedAgg struct {
 	orderedAggregateFuncBase
-	allocator                   *colmem.Allocator
-	vec                         coldata.Vec
 	col                         coldata.DatumVec
 	curAgg                      interface{}
 	foundNonNullForCurrentGroup bool
@@ -1725,7 +1891,6 @@ var _ AggregateFunc = &anyNotNullDatumOrderedAgg{}
 
 func (a *anyNotNullDatumOrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec
 	a.col = vec.Datum()
 }
 
@@ -1739,20 +1904,19 @@ func (a *anyNotNullDatumOrderedAgg) Compute(
 	}
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Datum(), vec.Nulls()
-
-	a.allocator.PerformOperation(
-		[]coldata.Vec{a.vec},
-		func() {
-			// Capture col to force bounds check to work. See
-			// https://github.com/golang/go/issues/39756
-			col := col
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
 			_ = col.Get(inputLen - 1)
-			groups := a.groups
-			if sel == nil {
-				_ = groups[inputLen-1]
-				if nulls.MaybeHasNulls() {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -1763,49 +1927,25 @@ func (a *anyNotNullDatumOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for i := 0; i < inputLen; i++ {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col.Set(a.curIdx, a.curAgg)
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			} else {
-				sel = sel[:inputLen]
-				if nulls.MaybeHasNulls() {
-					for _, i := range sel {
-						if groups[i] {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
 							// If this is a new group, check if any non-nulls have been found for the
 							// current group.
 							if !a.foundNonNullForCurrentGroup {
@@ -1816,52 +1956,91 @@ func (a *anyNotNullDatumOrderedAgg) Compute(
 							a.curIdx++
 							a.foundNonNullForCurrentGroup = false
 						}
-
-						var isNull bool
-						isNull = nulls.NullAt(i)
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+						a.isFirstGroup = false
 					}
-				} else {
-					for _, i := range sel {
-						if groups[i] {
-							// If this is a new group, check if any non-nulls have been found for the
-							// current group.
-							if !a.foundNonNullForCurrentGroup {
-								a.nulls.SetNull(a.curIdx)
-							} else {
-								a.col.Set(a.curIdx, a.curAgg)
-							}
-							a.curIdx++
-							a.foundNonNullForCurrentGroup = false
-						}
 
-						var isNull bool
-						isNull = false
-						if !a.foundNonNullForCurrentGroup && !isNull {
-							// If we haven't seen any non-nulls for the current group yet, and the
-							// current value is non-null, then we can pick the current value to be
-							// the output.
-							val := col.Get(i)
-							a.curAgg = val
-							a.foundNonNullForCurrentGroup = true
-						}
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
 					}
 				}
 			}
-		},
+		} else {
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col.Set(a.curIdx, a.curAgg)
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							// If this is a new group, check if any non-nulls have been found for the
+							// current group.
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col.Set(a.curIdx, a.curAgg)
+							}
+							a.curIdx++
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !a.foundNonNullForCurrentGroup && !isNull {
+						// If we haven't seen any non-nulls for the current group yet, and the
+						// current value is non-null, then we can pick the current value to be
+						// the output.
+						val := col.Get(i)
+						a.curAgg = val
+						a.foundNonNullForCurrentGroup = true
+					}
+				}
+			}
+		}
+	},
 	)
+
 	var newCurAggSize uintptr
 	if a.curAgg != nil {
 		newCurAggSize = a.curAgg.(*coldataext.Datum).Size()
 	}
-	a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+	}
 }
 
 func (a *anyNotNullDatumOrderedAgg) Flush(outputIdx int) {
@@ -1881,6 +2060,11 @@ func (a *anyNotNullDatumOrderedAgg) Flush(outputIdx int) {
 		a.allocator.AdjustMemoryUsage(-int64(d.Size()))
 	}
 	a.curAgg = nil
+}
+
+func (a *anyNotNullDatumOrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.foundNonNullForCurrentGroup = false
 }
 
 type anyNotNullDatumOrderedAggAlloc struct {

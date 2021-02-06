@@ -184,7 +184,7 @@ func splitPostApply(
 		}
 	}
 
-	now := r.store.Clock().Now()
+	now := r.store.Clock().NowAsClockTimestamp()
 
 	// While performing the split, zone config changes or a newly created table
 	// might require the range to be split again. Enqueue both the left and right
@@ -199,7 +199,7 @@ func splitPostApply(
 	if rightReplOrNil != nil {
 		r.store.splitQueue.MaybeAddAsync(ctx, rightReplOrNil, now)
 		r.store.replicateQueue.MaybeAddAsync(ctx, rightReplOrNil, now)
-		if len(split.RightDesc.Replicas().All()) == 1 {
+		if len(split.RightDesc.Replicas().Descriptors()) == 1 {
 			// TODO(peter): In single-node clusters, we enqueue the right-hand side of
 			// the split (the new range) for Raft processing so that the corresponding
 			// Raft group is created. This shouldn't be necessary for correctness, but
@@ -272,7 +272,9 @@ func prepareRightReplicaForSplit(
 	// Invoke the leasePostApply method to ensure we properly initialize
 	// the replica according to whether it holds the lease. This enables
 	// the txnWaitQueue.
-	rightRepl.leasePostApply(ctx, rightLease, false /* permitJump */)
+	rightRepl.mu.Lock()
+	defer rightRepl.mu.Unlock()
+	rightRepl.leasePostApplyLocked(ctx, rightLease, false /* permitJump */)
 	return rightRepl
 }
 

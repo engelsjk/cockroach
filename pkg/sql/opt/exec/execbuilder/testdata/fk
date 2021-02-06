@@ -16,7 +16,7 @@ query T
 EXPLAIN INSERT INTO child VALUES (1,1), (2,2)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -29,7 +29,7 @@ vectorized: false
 │       └── • values
 │             size: 2 columns, 2 rows
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -49,7 +49,7 @@ query T
 EXPLAIN INSERT INTO child SELECT x,y FROM xy
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -64,7 +64,7 @@ vectorized: false
 │             table: xy@primary
 │             spans: FULL SCAN
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -89,7 +89,7 @@ query T
 EXPLAIN INSERT INTO child_nullable VALUES (100, 1), (200, NULL)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -102,7 +102,7 @@ vectorized: false
 │       └── • values
 │             size: 2 columns, 2 rows
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -133,7 +133,7 @@ query T
 EXPLAIN INSERT INTO multi_col_child VALUES (2, NULL, 20, 20), (3, 20, NULL, 20)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -146,7 +146,7 @@ vectorized: false
 │       └── • values
 │             size: 4 columns, 2 rows
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -181,7 +181,7 @@ query T
 EXPLAIN INSERT INTO multi_ref_child VALUES (1, NULL, NULL, NULL), (2, 3, 4, 5)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -194,7 +194,7 @@ vectorized: false
 │       └── • values
 │             size: 4 columns, 2 rows
 │
-├── • fk-check
+├── • constraint-check
 │   │
 │   └── • error if rows
 │       │
@@ -209,7 +209,7 @@ vectorized: false
 │               └── • scan buffer
 │                     label: buffer 1
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -229,7 +229,7 @@ query T
 EXPLAIN INSERT INTO multi_ref_child VALUES (1, NULL, NULL, NULL)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert
 │ into: multi_ref_child(k, a, b, c)
@@ -244,7 +244,7 @@ query T
 EXPLAIN DELETE FROM parent WHERE p = 3
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -259,7 +259,7 @@ vectorized: false
 │             table: parent@primary
 │             spans: [/3 - /3]
 │
-├── • fk-check
+├── • constraint-check
 │   │
 │   └── • error if rows
 │       │
@@ -270,7 +270,7 @@ vectorized: false
 │           └── • scan buffer
 │                 label: buffer 1
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -288,7 +288,7 @@ query T
 EXPLAIN DELETE FROM parent WHERE p = 3
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -303,7 +303,7 @@ vectorized: false
 │             table: parent@primary
 │             spans: [/3 - /3]
 │
-├── • fk-check
+├── • constraint-check
 │   │
 │   └── • error if rows
 │       │
@@ -314,7 +314,7 @@ vectorized: false
 │           └── • scan buffer
 │                 label: buffer 1
 │
-├── • fk-check
+├── • constraint-check
 │   │
 │   └── • error if rows
 │       │
@@ -325,7 +325,7 @@ vectorized: false
 │           └── • scan buffer
 │                 label: buffer 1
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -352,7 +352,7 @@ query T
 EXPLAIN DELETE FROM doubleparent WHERE p1 = 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -367,7 +367,7 @@ vectorized: false
 │             table: doubleparent@primary
 │             spans: [/10 - /10]
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -384,7 +384,7 @@ query T
 EXPLAIN UPDATE child SET p = 4
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -403,7 +403,7 @@ vectorized: false
 │                 spans: FULL SCAN
 │                 locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -423,7 +423,7 @@ query T
 EXPLAIN UPDATE child SET p = 4 WHERE c = 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -442,7 +442,7 @@ vectorized: false
 │                 spans: [/10 - /10]
 │                 locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -458,7 +458,7 @@ query T
 EXPLAIN UPDATE parent SET p = p+1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -477,7 +477,7 @@ vectorized: false
 │                 spans: FULL SCAN
 │                 locking strength: for update
 │
-├── • fk-check
+├── • constraint-check
 │   │
 │   └── • error if rows
 │       │
@@ -503,7 +503,7 @@ vectorized: false
 │                     table: child@child_p_idx
 │                     spans: FULL SCAN
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -533,7 +533,7 @@ query T
 EXPLAIN UPDATE parent SET p = p+1 WHERE other = 10
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -552,7 +552,7 @@ vectorized: false
 │                 spans: [/10 - /10]
 │                 locking strength: for update
 │
-├── • fk-check
+├── • constraint-check
 │   │
 │   └── • error if rows
 │       │
@@ -568,7 +568,7 @@ vectorized: false
 │               └── • scan buffer
 │                     label: buffer 1
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -591,7 +591,7 @@ query T
 EXPLAIN UPDATE child SET c = 4
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -610,7 +610,7 @@ vectorized: false
 │                 spans: FULL SCAN
 │                 locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -640,7 +640,7 @@ query T
 EXPLAIN UPDATE child SET p = 4
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -659,7 +659,7 @@ vectorized: false
 │                 spans: FULL SCAN
 │                 locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -679,7 +679,7 @@ query T
 EXPLAIN UPDATE child SET p = p
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -696,7 +696,7 @@ vectorized: false
 │             spans: FULL SCAN
 │             locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -716,7 +716,7 @@ query T
 EXPLAIN UPDATE child SET p = p+1, c = c+1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -735,7 +735,7 @@ vectorized: false
 │                 spans: FULL SCAN
 │                 locking strength: for update
 │
-├── • fk-check
+├── • constraint-check
 │   │
 │   └── • error if rows
 │       │
@@ -751,7 +751,7 @@ vectorized: false
 │                 table: parent@primary
 │                 spans: FULL SCAN
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -784,7 +784,7 @@ query T
 EXPLAIN UPDATE child SET p = 4
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -803,7 +803,7 @@ vectorized: false
 │                 spans: FULL SCAN
 │                 locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -826,7 +826,7 @@ query T
 EXPLAIN UPDATE self SET y = 3
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -845,7 +845,7 @@ vectorized: false
 │                 spans: FULL SCAN
 │                 locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -865,7 +865,7 @@ query T
 EXPLAIN UPDATE self SET x = 3
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -884,7 +884,7 @@ vectorized: false
 │                 spans: FULL SCAN
 │                 locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -918,7 +918,7 @@ query T
 EXPLAIN (VERBOSE) INSERT INTO child VALUES (1,1), (2,2)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert fast path
   columns: ()
@@ -999,7 +999,7 @@ query T
 EXPLAIN INSERT INTO nonunique_idx_child VALUES (0, 1, 10)
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert fast path
   into: nonunique_idx_child(k, ref1, ref2)
@@ -1044,7 +1044,7 @@ query T
 EXPLAIN (VERBOSE) DELETE FROM cascadeparent WHERE p > 1
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │ columns: ()
@@ -1062,7 +1062,7 @@ query T
 EXPLAIN (VERBOSE) DELETE FROM cascadeparent WHERE p > 1 AND data > 0
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │ columns: ()
@@ -1192,7 +1192,7 @@ query T
 EXPLAIN INSERT INTO c VALUES (1,1), (2,2), (3,3);
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -1205,7 +1205,7 @@ vectorized: false
 │       └── • values
 │             size: 2 columns, 3 rows
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -1225,7 +1225,7 @@ query T
 EXPLAIN UPDATE c SET p=p+c WHERE c > 0
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -1244,7 +1244,7 @@ vectorized: false
 │                 spans: [/1 - ]
 │                 locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -1267,7 +1267,7 @@ query T
 EXPLAIN UPDATE p SET p=p+1 WHERE p > 0
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -1286,7 +1286,7 @@ vectorized: false
 │                 spans: [/1 - ]
 │                 locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -1311,7 +1311,7 @@ query T
 EXPLAIN DELETE FROM p WHERE p > 0
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -1326,7 +1326,7 @@ vectorized: false
 │             table: p@primary
 │             spans: [/1 - ]
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -1350,7 +1350,7 @@ query T
 EXPLAIN INSERT INTO c VALUES (1,1), (2,2), (3,3);
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • insert fast path
   into: c(c, p)
@@ -1362,7 +1362,7 @@ query T
 EXPLAIN UPDATE c SET p=p+c WHERE c > 0
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -1381,7 +1381,7 @@ vectorized: false
 │                 spans: [/1 - ]
 │                 locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -1400,7 +1400,7 @@ query T
 EXPLAIN UPDATE p SET p=p+1 WHERE p > 0
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -1419,7 +1419,7 @@ vectorized: false
 │                 spans: [/1 - ]
 │                 locking strength: for update
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -1439,7 +1439,7 @@ query T
 EXPLAIN DELETE FROM p WHERE p > 0
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -1454,7 +1454,7 @@ vectorized: false
 │             table: p@primary
 │             spans: [/1 - ]
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -1489,7 +1489,7 @@ query T
 EXPLAIN INSERT INTO large_child SELECT i, i % 10 + 1 FROM generate_series(1, 10000) AS i
 ----
 distribution: local
-vectorized: false
+vectorized: true
 ·
 • root
 │
@@ -1505,7 +1505,7 @@ vectorized: false
 │               │
 │               └── • emptyrow
 │
-└── • fk-check
+└── • constraint-check
     │
     └── • error if rows
         │
@@ -1520,3 +1520,91 @@ vectorized: false
                   estimated row count: 10
                   table: small_parent@primary
                   spans: FULL SCAN
+
+# Test that partial indexes with IS NOT NULL predicates are used for performing
+# FK checks.
+subtest partial_index
+
+statement ok
+CREATE TABLE partial_parent (
+  id INT PRIMARY KEY
+)
+
+statement ok
+CREATE TABLE partial_child (
+  id INT PRIMARY KEY,
+  parent_id INT,
+  CONSTRAINT fk FOREIGN KEY (parent_id) REFERENCES partial_parent(id),
+  INDEX partial_idx (parent_id) WHERE parent_id IS NOT NULL
+)
+
+query T
+EXPLAIN DELETE FROM partial_parent WHERE id = 1
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • delete
+│   │ from: partial_parent
+│   │
+│   └── • buffer
+│       │ label: buffer 1
+│       │
+│       └── • scan
+│             missing stats
+│             table: partial_parent@primary
+│             spans: [/1 - /1]
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • lookup join (semi)
+            │ table: partial_child@partial_idx (partial index)
+            │ equality: (id) = (parent_id)
+            │
+            └── • scan buffer
+                  label: buffer 1
+
+query T
+EXPLAIN UPDATE partial_parent SET id = 2 WHERE id = 1
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • update
+│   │ table: partial_parent
+│   │ set: id
+│   │
+│   └── • buffer
+│       │ label: buffer 1
+│       │
+│       └── • render
+│           │
+│           └── • scan
+│                 missing stats
+│                 table: partial_parent@primary
+│                 spans: [/1 - /1]
+│                 locking strength: for update
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • lookup join (semi)
+            │ table: partial_child@partial_idx (partial index)
+            │ equality: (id) = (parent_id)
+            │
+            └── • except
+                │
+                ├── • scan buffer
+                │     label: buffer 1
+                │
+                └── • scan buffer
+                      label: buffer 1
+
+subtest end

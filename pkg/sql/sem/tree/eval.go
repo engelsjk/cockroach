@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -2570,11 +2571,11 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 
 const experimentalBox2DClusterSettingName = "sql.spatial.experimental_box2d_comparison_operators.enabled"
 
-var experimentalBox2DClusterSetting = settings.RegisterPublicBoolSetting(
+var experimentalBox2DClusterSetting = settings.RegisterBoolSetting(
 	experimentalBox2DClusterSettingName,
 	"enables the use of certain experimental box2d comparison operators",
 	false,
-)
+).WithPublic()
 
 func checkExperimentalBox2DComparisonOperatorEnabled(ctx *EvalContext) error {
 	if !experimentalBox2DClusterSetting.Get(&ctx.Settings.SV) {
@@ -3026,27 +3027,60 @@ type EvalDatabase interface {
 type EvalPlanner interface {
 	EvalDatabase
 	TypeReferenceResolver
-	// ParseType parses a column type.
-	ParseType(sql string) (*types.T, error)
+
+	// GetTypeFromValidSQLSyntax parses a column type when the input
+	// string uses the parseable SQL representation of a type name, e.g.
+	// `INT(13)`, `mytype`, `"mytype"`, `pg_catalog.int4` or `"public".mytype`.
+	GetTypeFromValidSQLSyntax(sql string) (*types.T, error)
 
 	// EvalSubquery returns the Datum for the given subquery node.
 	EvalSubquery(expr *Subquery) (Datum, error)
 
-	// UnsafeUpsertDescriptor is a used to repair descriptors in dire
+	// UnsafeUpsertDescriptor is used to repair descriptors in dire
 	// circumstances. See the comment on the planner implementation.
-	UnsafeUpsertDescriptor(ctx context.Context, descID int64, encodedDescriptor []byte) error
+	UnsafeUpsertDescriptor(
+		ctx context.Context, descID int64, encodedDescriptor []byte, force bool,
+	) error
 
-	// UnsafeDeleteDescriptor is a used to repair descriptors in dire
+	// UnsafeDeleteDescriptor is used to repair descriptors in dire
 	// circumstances. See the comment on the planner implementation.
-	UnsafeDeleteDescriptor(ctx context.Context, descID int64) error
+	UnsafeDeleteDescriptor(ctx context.Context, descID int64, force bool) error
 
-	// UnsafeUpsertNamespaceEntry is a used to repair namespace entries in dire
+	// UnsafeUpsertNamespaceEntry is used to repair namespace entries in dire
 	// circumstances. See the comment on the planner implementation.
-	UnsafeUpsertNamespaceEntry(ctx context.Context, parentID, parentSchemaID int64, name string, descID int64, force bool) error
+	UnsafeUpsertNamespaceEntry(
+		ctx context.Context,
+		parentID, parentSchemaID int64,
+		name string,
+		descID int64,
+		force bool,
+	) error
 
-	// UnsafeDeleteNamespaceEntry is a used to repair namespace entries in dire
+	// UnsafeDeleteNamespaceEntry is used to repair namespace entries in dire
 	// circumstances. See the comment on the planner implementation.
-	UnsafeDeleteNamespaceEntry(ctx context.Context, parentID, parentSchemaID int64, name string, descID int64) error
+	UnsafeDeleteNamespaceEntry(
+		ctx context.Context,
+		parentID, parentSchemaID int64,
+		name string,
+		descID int64,
+		force bool,
+	) error
+
+	// CompactEngineSpan is used to compact an engine key span at the given
+	// (nodeID, storeID). If we add more overloads to the compact_span builtin,
+	// this parameter list should be changed to a struct union to accommodate
+	// those overloads.
+	CompactEngineSpan(
+		ctx context.Context, nodeID int32, storeID int32, startKey []byte, endKey []byte,
+	) error
+
+	// MemberOfWithAdminOption is used to collect a list of roles (direct and
+	// indirect) that the member is part of. See the comment on the planner
+	// implementation in authorization.go
+	MemberOfWithAdminOption(
+		ctx context.Context,
+		member security.SQLUsername,
+	) (map[security.SQLUsername]bool, error)
 }
 
 // EvalSessionAccessor is a limited interface to access session variables.
@@ -3148,6 +3182,23 @@ type SequenceOperators interface {
 	// `newVal` is returned. Otherwise, the next call to nextval will return
 	// `newVal + seqOpts.Increment`.
 	SetSequenceValue(ctx context.Context, seqName *TableName, newVal int64, isCalled bool) error
+
+	// IncrementSequenceByID increments the given sequence and returns the result.
+	// It returns an error if the given ID is not a sequence.
+	// Takes in a sequence ID rather than a name, unlike IncrementSequence.
+	IncrementSequenceByID(ctx context.Context, seqID int64) (int64, error)
+
+	// GetLatestValueInSessionForSequenceByID returns the value most recently obtained by
+	// nextval() for the given sequence in this session.
+	// Takes in a sequence ID rather than a name, unlike GetLatestValueInSessionForSequence.
+	GetLatestValueInSessionForSequenceByID(ctx context.Context, seqID int64) (int64, error)
+
+	// SetSequenceValueByID sets the sequence's value.
+	// If isCalled is false, the sequence is set such that the next time nextval() is called,
+	// `newVal` is returned. Otherwise, the next call to nextval will return
+	// `newVal + seqOpts.Increment`.
+	// Takes in a sequence ID rather than a name, unlike SetSequenceValue.
+	SetSequenceValueByID(ctx context.Context, seqID int64, newVal int64, isCalled bool) error
 }
 
 // TenantOperator is capable of interacting with tenant state, allowing SQL
@@ -3189,6 +3240,9 @@ type EvalContextTestingKnobs struct {
 	// cost of each expression in the query tree for the purpose of creating
 	// alternate query plans in the optimizer.
 	OptimizerCostPerturbation float64
+	// If set, mutations.MaxBatchSize and row.getKVBatchSize will be overridden
+	// to use the non-test value.
+	ForceProductionBatchSizes bool
 
 	CallbackGenerators map[string]*CallbackValueGenerator
 }
@@ -3913,6 +3967,24 @@ func (expr *FuncExpr) evalArgs(ctx *EvalContext) (bool, Datums, error) {
 	return false, args, nil
 }
 
+// MaybeWrapError updates non-nil error depending on the FuncExpr to provide
+// more context.
+func (expr *FuncExpr) MaybeWrapError(err error) error {
+	// If we are facing an explicit error, propagate it unchanged.
+	fName := expr.Func.String()
+	if fName == `crdb_internal.force_error` {
+		return err
+	}
+	// Otherwise, wrap it with context.
+	newErr := errors.Wrapf(err, "%s()", errors.Safe(fName))
+	// Count function errors as it flows out of the system. We need to handle
+	// them this way because if we are facing a retry error, in particular those
+	// generated by crdb_internal.force_retry(), Wrap() will propagate it as a
+	// non-pgerror error (so that the executor can see it with the right type).
+	newErr = errors.WithTelemetry(newErr, fName+"()")
+	return newErr
+}
+
 // Eval implements the TypedExpr interface.
 func (expr *FuncExpr) Eval(ctx *EvalContext) (Datum, error) {
 	nullResult, args, err := expr.evalArgs(ctx)
@@ -3925,21 +3997,7 @@ func (expr *FuncExpr) Eval(ctx *EvalContext) (Datum, error) {
 
 	res, err := expr.fn.Fn(ctx, args)
 	if err != nil {
-		// If we are facing an explicit error, propagate it unchanged.
-		fName := expr.Func.String()
-		if fName == `crdb_internal.force_error` {
-			return nil, err
-		}
-		// Otherwise, wrap it with context.
-		newErr := errors.Wrapf(err, "%s()", errors.Safe(fName))
-		// Count function errors as it flows out of the system.  We need
-		// to have this inside a if because if we are facing a retry
-		// error, in particular those generated by
-		// crdb_internal.force_retry(), Wrap() will propagate it as a
-		// non-pgerror error (so that the executor can see it with the
-		// right type).
-		newErr = errors.WithTelemetry(newErr, fName+"()")
-		return nil, newErr
+		return nil, expr.MaybeWrapError(err)
 	}
 	if ctx.TestingKnobs.AssertFuncExprReturnTypes {
 		if err := ensureExpectedType(expr.fn.FixedReturnType(), res); err != nil {

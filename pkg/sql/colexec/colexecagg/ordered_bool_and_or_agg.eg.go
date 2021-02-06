@@ -31,115 +31,144 @@ func newBoolAndOrderedAggAlloc(
 
 type boolAndOrderedAgg struct {
 	orderedAggregateFuncBase
-	sawNonNull bool
-	vec        []bool
-	curAgg     bool
+	col    []bool
+	curAgg bool
+	// foundNonNullForCurrentGroup tracks if we have seen any non-null values
+	// for the group that is currently being aggregated.
+	foundNonNullForCurrentGroup bool
 }
 
 var _ AggregateFunc = &boolAndOrderedAgg{}
 
 func (a *boolAndOrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec.Bool()
+	a.col = vec.Bool()
 }
 
 func (a *boolAndOrderedAgg) Compute(
 	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
 ) {
+	var oldCurAggSize uintptr
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Bool(), vec.Nulls()
-	groups := a.groups
-	if sel == nil {
-		_ = groups[inputLen-1]
-		col = col[:inputLen]
-		if nulls.MaybeHasNulls() {
-			for i := range col {
-				if groups[i] {
-					if !a.sawNonNull {
-						a.nulls.SetNull(a.curIdx)
-					} else {
-						a.vec[a.curIdx] = a.curAgg
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
+			_ = col.Get(inputLen - 1)
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.curAgg = true
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
 					}
-					a.curIdx++
-					a.curAgg = true
-					a.sawNonNull = false
-				}
 
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-					a.curAgg = a.curAgg && col[i]
-					a.sawNonNull = true
-				}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !isNull {
+						//gcassert:bce
+						a.curAgg = a.curAgg && col[i]
+						a.foundNonNullForCurrentGroup = true
+					}
 
+				}
+			} else {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.curAgg = true
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !isNull {
+						//gcassert:bce
+						a.curAgg = a.curAgg && col[i]
+						a.foundNonNullForCurrentGroup = true
+					}
+
+				}
 			}
 		} else {
-			for i := range col {
-				if groups[i] {
-					if !a.sawNonNull {
-						a.nulls.SetNull(a.curIdx)
-					} else {
-						a.vec[a.curIdx] = a.curAgg
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.curAgg = true
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
 					}
-					a.curIdx++
-					a.curAgg = true
-					a.sawNonNull = false
-				}
 
-				var isNull bool
-				isNull = false
-				if !isNull {
-					a.curAgg = a.curAgg && col[i]
-					a.sawNonNull = true
-				}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !isNull {
+						a.curAgg = a.curAgg && col[i]
+						a.foundNonNullForCurrentGroup = true
+					}
 
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.curAgg = true
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !isNull {
+						a.curAgg = a.curAgg && col[i]
+						a.foundNonNullForCurrentGroup = true
+					}
+
+				}
 			}
 		}
-	} else {
-		sel = sel[:inputLen]
-		if nulls.MaybeHasNulls() {
-			for _, i := range sel {
-				if groups[i] {
-					if !a.sawNonNull {
-						a.nulls.SetNull(a.curIdx)
-					} else {
-						a.vec[a.curIdx] = a.curAgg
-					}
-					a.curIdx++
-					a.curAgg = true
-					a.sawNonNull = false
-				}
-
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-					a.curAgg = a.curAgg && col[i]
-					a.sawNonNull = true
-				}
-
-			}
-		} else {
-			for _, i := range sel {
-				if groups[i] {
-					if !a.sawNonNull {
-						a.nulls.SetNull(a.curIdx)
-					} else {
-						a.vec[a.curIdx] = a.curAgg
-					}
-					a.curIdx++
-					a.curAgg = true
-					a.sawNonNull = false
-				}
-
-				var isNull bool
-				isNull = false
-				if !isNull {
-					a.curAgg = a.curAgg && col[i]
-					a.sawNonNull = true
-				}
-
-			}
-		}
+	},
+	)
+	var newCurAggSize uintptr
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
 	}
 }
 
@@ -148,11 +177,17 @@ func (a *boolAndOrderedAgg) Flush(outputIdx int) {
 	_ = outputIdx
 	outputIdx = a.curIdx
 	a.curIdx++
-	if !a.sawNonNull {
+	if !a.foundNonNullForCurrentGroup {
 		a.nulls.SetNull(outputIdx)
 	} else {
-		a.vec[outputIdx] = a.curAgg
+		a.col[outputIdx] = a.curAgg
 	}
+}
+
+func (a *boolAndOrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.curAgg = true
+	a.foundNonNullForCurrentGroup = false
 }
 
 type boolAndOrderedAggAlloc struct {
@@ -171,8 +206,9 @@ func (a *boolAndOrderedAggAlloc) newAggFunc() AggregateFunc {
 		a.aggFuncs = make([]boolAndOrderedAgg, a.allocSize)
 	}
 	f := &a.aggFuncs[0]
+	f.allocator = a.allocator
+	f.Reset()
 	a.aggFuncs = a.aggFuncs[1:]
-	f.curAgg = true
 	return f
 }
 
@@ -187,115 +223,144 @@ func newBoolOrOrderedAggAlloc(
 
 type boolOrOrderedAgg struct {
 	orderedAggregateFuncBase
-	sawNonNull bool
-	vec        []bool
-	curAgg     bool
+	col    []bool
+	curAgg bool
+	// foundNonNullForCurrentGroup tracks if we have seen any non-null values
+	// for the group that is currently being aggregated.
+	foundNonNullForCurrentGroup bool
 }
 
 var _ AggregateFunc = &boolOrOrderedAgg{}
 
 func (a *boolOrOrderedAgg) SetOutput(vec coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	a.vec = vec.Bool()
+	a.col = vec.Bool()
 }
 
 func (a *boolOrOrderedAgg) Compute(
 	vecs []coldata.Vec, inputIdxs []uint32, inputLen int, sel []int,
 ) {
+	var oldCurAggSize uintptr
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Bool(), vec.Nulls()
-	groups := a.groups
-	if sel == nil {
-		_ = groups[inputLen-1]
-		col = col[:inputLen]
-		if nulls.MaybeHasNulls() {
-			for i := range col {
-				if groups[i] {
-					if !a.sawNonNull {
-						a.nulls.SetNull(a.curIdx)
-					} else {
-						a.vec[a.curIdx] = a.curAgg
+	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+		// Capture groups and col to force bounds check to work. See
+		// https://github.com/golang/go/issues/39756
+		groups := a.groups
+		col := col
+		if sel == nil {
+			_ = groups[inputLen-1]
+			_ = col.Get(inputLen - 1)
+			if nulls.MaybeHasNulls() {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.curAgg = false
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
 					}
-					a.curIdx++
-					a.curAgg = false
-					a.sawNonNull = false
-				}
 
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-					a.curAgg = a.curAgg || col[i]
-					a.sawNonNull = true
-				}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !isNull {
+						//gcassert:bce
+						a.curAgg = a.curAgg || col[i]
+						a.foundNonNullForCurrentGroup = true
+					}
 
+				}
+			} else {
+				for i := 0; i < inputLen; i++ {
+					//gcassert:bce
+					if groups[i] {
+						if !a.isFirstGroup {
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.curAgg = false
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !isNull {
+						//gcassert:bce
+						a.curAgg = a.curAgg || col[i]
+						a.foundNonNullForCurrentGroup = true
+					}
+
+				}
 			}
 		} else {
-			for i := range col {
-				if groups[i] {
-					if !a.sawNonNull {
-						a.nulls.SetNull(a.curIdx)
-					} else {
-						a.vec[a.curIdx] = a.curAgg
+			sel = sel[:inputLen]
+			if nulls.MaybeHasNulls() {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.curAgg = false
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
 					}
-					a.curIdx++
-					a.curAgg = false
-					a.sawNonNull = false
-				}
 
-				var isNull bool
-				isNull = false
-				if !isNull {
-					a.curAgg = a.curAgg || col[i]
-					a.sawNonNull = true
-				}
+					var isNull bool
+					isNull = nulls.NullAt(i)
+					if !isNull {
+						a.curAgg = a.curAgg || col[i]
+						a.foundNonNullForCurrentGroup = true
+					}
 
+				}
+			} else {
+				for _, i := range sel {
+					if groups[i] {
+						if !a.isFirstGroup {
+							if !a.foundNonNullForCurrentGroup {
+								a.nulls.SetNull(a.curIdx)
+							} else {
+								a.col[a.curIdx] = a.curAgg
+							}
+							a.curIdx++
+							a.curAgg = false
+							a.foundNonNullForCurrentGroup = false
+						}
+						a.isFirstGroup = false
+					}
+
+					var isNull bool
+					isNull = false
+					if !isNull {
+						a.curAgg = a.curAgg || col[i]
+						a.foundNonNullForCurrentGroup = true
+					}
+
+				}
 			}
 		}
-	} else {
-		sel = sel[:inputLen]
-		if nulls.MaybeHasNulls() {
-			for _, i := range sel {
-				if groups[i] {
-					if !a.sawNonNull {
-						a.nulls.SetNull(a.curIdx)
-					} else {
-						a.vec[a.curIdx] = a.curAgg
-					}
-					a.curIdx++
-					a.curAgg = false
-					a.sawNonNull = false
-				}
-
-				var isNull bool
-				isNull = nulls.NullAt(i)
-				if !isNull {
-					a.curAgg = a.curAgg || col[i]
-					a.sawNonNull = true
-				}
-
-			}
-		} else {
-			for _, i := range sel {
-				if groups[i] {
-					if !a.sawNonNull {
-						a.nulls.SetNull(a.curIdx)
-					} else {
-						a.vec[a.curIdx] = a.curAgg
-					}
-					a.curIdx++
-					a.curAgg = false
-					a.sawNonNull = false
-				}
-
-				var isNull bool
-				isNull = false
-				if !isNull {
-					a.curAgg = a.curAgg || col[i]
-					a.sawNonNull = true
-				}
-
-			}
-		}
+	},
+	)
+	var newCurAggSize uintptr
+	if newCurAggSize != oldCurAggSize {
+		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
 	}
 }
 
@@ -304,11 +369,17 @@ func (a *boolOrOrderedAgg) Flush(outputIdx int) {
 	_ = outputIdx
 	outputIdx = a.curIdx
 	a.curIdx++
-	if !a.sawNonNull {
+	if !a.foundNonNullForCurrentGroup {
 		a.nulls.SetNull(outputIdx)
 	} else {
-		a.vec[outputIdx] = a.curAgg
+		a.col[outputIdx] = a.curAgg
 	}
+}
+
+func (a *boolOrOrderedAgg) Reset() {
+	a.orderedAggregateFuncBase.Reset()
+	a.curAgg = false
+	a.foundNonNullForCurrentGroup = false
 }
 
 type boolOrOrderedAggAlloc struct {
@@ -327,7 +398,8 @@ func (a *boolOrOrderedAggAlloc) newAggFunc() AggregateFunc {
 		a.aggFuncs = make([]boolOrOrderedAgg, a.allocSize)
 	}
 	f := &a.aggFuncs[0]
+	f.allocator = a.allocator
+	f.Reset()
 	a.aggFuncs = a.aggFuncs[1:]
-	f.curAgg = false
 	return f
 }

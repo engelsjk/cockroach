@@ -148,7 +148,8 @@ message MergeTrigger {
   // before it stopped responding to requests altogether (in anticipation of
   // being subsumed). It is suitable for use as the timestamp cache's low water
   // mark for the keys previously owned by the subsumed range.
-  util.hlc.Timestamp freeze_start = 5 [(gogoproto.nullable) = false];
+  util.hlc.Timestamp freeze_start = 5 [(gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
 }
 
 // ReplicaChangeType is a parameter of ChangeReplicasTrigger.
@@ -285,7 +286,8 @@ message ObservedTimestamp {
   option (gogoproto.populate) = true;
 
   int32 node_id = 1 [(gogoproto.customname) = "NodeID", (gogoproto.casttype) = "NodeID"];
-  util.hlc.Timestamp timestamp = 2 [(gogoproto.nullable) = false];
+  util.hlc.Timestamp timestamp = 2 [(gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
 }
 
 // A Transaction is a unit of work performed on the database.
@@ -310,6 +312,10 @@ message Transaction {
   // The last time that the transaction's record was sent a heartbeat by its
   // coordinator to indicate client activity. Concurrent transactions will
   // avoid aborting a transaction if it observes recent-enough activity.
+  //
+  // NOTE: this could use a ClockTimestamp type, but doing so results in a
+  // large diff that doesn't seem worth it, given that we never feed this
+  // timestamp back into a clock.
   util.hlc.Timestamp last_heartbeat = 5 [(gogoproto.nullable) = false];
   // This flag is set if the transaction's timestamp was "leaked" beyond the
   // transaction (e.g. via cluster_logical_timestamp()). If true, this prevents
@@ -435,7 +441,7 @@ message TransactionRecord {
   option (gogoproto.populate) = true;
 
   // See comments on Transaction proto.
-  storage.enginepb.TxnMeta meta     = 1  [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  storage.enginepb.TxnMeta meta            = 1  [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   TransactionStatus status                 = 4;
   util.hlc.Timestamp last_heartbeat        = 5  [(gogoproto.nullable) = false];
   repeated Span lock_spans                 = 11 [(gogoproto.nullable) = false];
@@ -506,7 +512,8 @@ message Lease {
   // The start is a timestamp at which the lease begins. This value
   // must be greater than the last lease expiration or the lease request
   // is considered invalid.
-  util.hlc.Timestamp start = 1 [(gogoproto.nullable) = false];
+  util.hlc.Timestamp start = 1 [(gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
 
   // The expiration is a timestamp at which the lease expires. This means that a
   // new lease can be granted for a later timestamp. This field is only set for
@@ -525,7 +532,8 @@ message Lease {
   // to help with the rollout (such that a lease applied by some nodes before
   // the rollout and some nodes after the rollout is serialized the same).
   // TODO(andrei): Make this non-nullable after the rollout.
-  util.hlc.Timestamp proposed_ts  = 5 [(gogoproto.customname) = "ProposedTS"];
+  util.hlc.Timestamp proposed_ts  = 5 [(gogoproto.customname) = "ProposedTS",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
 
   // The epoch of the lease holder's node liveness entry. If this value is
   // non-zero, the expiration field is ignored.
@@ -622,11 +630,43 @@ message LeafTxnFinalState {
   reserved 8;
 }
 
-// RangeInfo describes a range which executed a request. It contains
-// the range descriptor and lease information at the time of execution.
+// RangeClosedTimestampPolicy represents the policy used by the leaseholder of a
+// range to establish and publish closed timestamps. The policy dictates how far
+// in the past (lag) or in the future (lead) MVCC history is closed off.
+enum RangeClosedTimestampPolicy {
+  option (gogoproto.goproto_enum_prefix) = false;
+
+  // LAG_BY_CLUSTER_SETTING indicates that the range's closed timestamp is
+  // configured to lag behind present time by the value configured for the
+  // `kv.closed_timestamp.target_duration` cluster setting.
+  LAG_BY_CLUSTER_SETTING = 0;
+  // LEAD_FOR_GLOBAL_READS indicates that the range's closed timestamp is
+  // configured to lead present time such that all followers of the range are
+  // able to serve consistent, present time reads. Because the policy describes
+  // a goal and not the lead time itself, the lead time is allowed vary as a
+  // function of maximum clock uncertainty and closed timestamp propagation time
+  // (which itself is a function of leaseholder -> follower network latency and
+  // closed timestamp update periodicity).
+  LEAD_FOR_GLOBAL_READS = 1;
+}
+
+// ClientRangeInfo represents the kvclient's knowledge about the state of the
+// range (i.e. of the range descriptor, lease, and closed timestamp policy). The
+// kvserver checks whether the client's info is up to date and, if it isn't, it
+// will return a RangeInfo with up-to-date information.
+message ClientRangeInfo {
+  int64 descriptor_generation = 1 [(gogoproto.casttype) = "RangeGeneration"];
+  int64 lease_sequence = 2 [(gogoproto.casttype) = "LeaseSequence"];
+  RangeClosedTimestampPolicy closed_timestamp_policy = 3;
+}
+
+// RangeInfo describes a range which executed a request. It contains the range
+// descriptor, lease information, and closed timestamp policy at the time of
+// execution.
 message RangeInfo {
   option (gogoproto.goproto_stringer) = false;
 
   RangeDescriptor desc = 1 [(gogoproto.nullable) = false];
   Lease lease = 2 [(gogoproto.nullable) = false];
+  RangeClosedTimestampPolicy closed_timestamp_policy = 3;
 }

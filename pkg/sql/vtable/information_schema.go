@@ -35,6 +35,7 @@ CREATE TABLE information_schema.columns (
 	TABLE_SCHEMA             STRING NOT NULL,
 	TABLE_NAME               STRING NOT NULL,
 	COLUMN_NAME              STRING NOT NULL,
+  COLUMN_COMMENT           STRING,
 	ORDINAL_POSITION         INT NOT NULL,
 	COLUMN_DEFAULT           STRING,
 	IS_NULLABLE              STRING NOT NULL,
@@ -168,4 +169,38 @@ CREATE TABLE information_schema.tables (
 	TABLE_TYPE         STRING NOT NULL,
 	IS_INSERTABLE_INTO STRING NOT NULL,
 	VERSION            INT
+)`
+
+// InformationSchemaCollationCharacterSetApplicability describes the schema of
+// the information_schema.collation_character_set_applicability table.
+// Postgres: https://www.postgresql.org/docs/current/infoschema-collation-character-set-applicab.html
+// MySQL:    https://dev.mysql.com/doc/refman/8.0/en/information-schema-collation-character-set-applicability-table.html
+const InformationSchemaCollationCharacterSetApplicability = `
+CREATE TABLE information_schema.collation_character_set_applicability (
+	COLLATION_CATALOG     STRING NOT NULL,
+	COLLATION_SCHEMA      STRING NOT NULL,
+	COLLATION_NAME        STRING NOT NULL,
+	CHARACTER_SET_CATALOG STRING,
+	CHARACTER_SET_SCHEMA  STRING,
+	CHARACTER_SET_NAME    STRING NOT NULL
+)`
+
+// InformationSchemaCollations describes the schema of the
+// information_schema.collations table.
+// Postgres: https://www.postgresql.org/docs/current/infoschema-collations.html
+// MySQL:    https://dev.mysql.com/doc/refman/8.0/en/information-schema-collations-table.html
+const InformationSchemaCollations = `
+CREATE TABLE information_schema.collations (
+	COLLATION_CATALOG STRING NOT NULL,
+	COLLATION_SCHEMA  STRING NOT NULL,
+	COLLATION_NAME    STRING NOT NULL,
+	PAD_ATTRIBUTE     STRING NOT NULL
+)`
+
+// InformationSchemaSessionVariables describes the schema of the
+// information_schema.session_variables table.
+const InformationSchemaSessionVariables = `
+CREATE TABLE information_schema.session_variables (
+	VARIABLE STRING NOT NULL,
+	VALUE STRING NOT NULL
 )`

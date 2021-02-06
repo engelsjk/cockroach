@@ -10,39 +10,72 @@
 
 package tree
 
-// RegionalAffinityLevel is a defined regional affinity.
-type RegionalAffinityLevel int
+import "fmt"
+
+// LocalityLevel is a defined locality.
+type LocalityLevel int
 
 const (
-	// RegionalAffinityLevelGlobal distributes a table across
+	// LocalityLevelGlobal distributes a table across
 	// a global cluster.
-	RegionalAffinityLevelGlobal RegionalAffinityLevel = iota
-	// RegionalAffinityLevelTable implies a table is homed
+	LocalityLevelGlobal LocalityLevel = iota
+	// LocalityLevelTable implies a table is homed
 	// in a fixed region.
-	RegionalAffinityLevelTable
-	// RegionalAffinityLevelRowLevel implies a table's rows are
+	LocalityLevelTable
+	// LocalityLevelRow implies a table's rows are
 	// homed depending on values within the row.
-	RegionalAffinityLevelRowLevel
+	LocalityLevelRow
 )
 
-// RegionalAffinity defines the locality for a given table.
-type RegionalAffinity struct {
-	RegionalAffinityLevel RegionalAffinityLevel
-	// TableRegion is set if is RegionalAffinityTable.
+const (
+	// RegionEnum is the name of the per-database region enum required for
+	// multi-region.
+	RegionEnum string = "crdb_internal_region"
+	// RegionalByRowRegionDefaultCol is the default name of the REGIONAL BY ROW
+	// column name if the AS field is not populated.
+	RegionalByRowRegionDefaultCol string = "crdb_region"
+	// RegionalByRowRegionDefaultColName is the same, typed as Name.
+	RegionalByRowRegionDefaultColName Name = Name(RegionalByRowRegionDefaultCol)
+	// RegionalByRowRegionNotSpecifiedName is the string denoting the REGIONAL BY ROW
+	// has no AS <col> specified.
+	// TODO(#59455): clean this up to use something nicer.
+	RegionalByRowRegionNotSpecifiedName = ""
+	// PrimaryRegionLocalityName is the string denoting the primary region in the
+	// locality config.
+	// TODO(#59455): clean this up to use something nicer.
+	PrimaryRegionLocalityName Name = ""
+)
+
+// Locality defines the locality for a given table.
+type Locality struct {
+	LocalityLevel LocalityLevel
+	// TableRegion is set if is LocalityLevelTable and a non-primary region is set.
 	TableRegion Name
+	// RegionalByRowColumn is set if col_name on REGIONAL BY ROW ON <col_name> is
+	// set.
+	RegionalByRowColumn Name
 }
 
 // Format implements the NodeFormatter interface.
-func (node *RegionalAffinity) Format(ctx *FmtCtx) {
-	switch node.RegionalAffinityLevel {
-	case RegionalAffinityLevelGlobal:
-		ctx.WriteString("REGIONAL AFFINITY NONE")
-	case RegionalAffinityLevelTable:
-		ctx.WriteString("REGIONAL AFFINITY ")
-		node.TableRegion.Format(ctx)
-	case RegionalAffinityLevelRowLevel:
-		ctx.WriteString("REGIONAL AFFINITY ROW LEVEL")
+func (node *Locality) Format(ctx *FmtCtx) {
+	ctx.WriteString("LOCALITY ")
+	switch node.LocalityLevel {
+	case LocalityLevelGlobal:
+		ctx.WriteString("GLOBAL")
+	case LocalityLevelTable:
+		ctx.WriteString("REGIONAL BY TABLE IN ")
+		if node.TableRegion != "" {
+			node.TableRegion.Format(ctx)
+		} else {
+			ctx.WriteString("PRIMARY REGION")
+		}
+	case LocalityLevelRow:
+		ctx.WriteString("REGIONAL BY ROW")
+		if node.RegionalByRowColumn != "" {
+			ctx.WriteString(" AS ")
+			node.RegionalByRowColumn.Format(ctx)
+		}
 	default:
-		ctx.WriteString("REGIONAL AFFINITY ???")
+		panic(fmt.Sprintf("unknown regional affinity: %#v", node.LocalityLevel))
 	}
 }

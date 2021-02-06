@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type createSequenceNode struct {
@@ -35,7 +36,8 @@ type createSequenceNode struct {
 
 func (p *planner) CreateSequence(ctx context.Context, n *tree.CreateSequence) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"CREATE SEQUENCE",
 	); err != nil {
 		return nil, err
@@ -156,18 +158,11 @@ func doCreateSequence(
 
 	// Log Create Sequence event. This is an auditable log event and is
 	// recorded in the same transaction as the table descriptor update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogCreateSequence,
-		int32(desc.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			SequenceName string
-			Statement    string
-			User         string
-		}{name.FQString(), context, params.p.User().Normalized()},
-	)
+	return params.p.logEvent(params.ctx,
+		desc.ID,
+		&eventpb.CreateSequence{
+			SequenceName: name.FQString(),
+		})
 }
 
 func (*createSequenceNode) Next(runParams) (bool, error) { return false, nil }
@@ -205,13 +200,13 @@ func NewSequenceTableDesc(
 			Type: types.Int,
 		},
 	}
-	desc.PrimaryIndex = descpb.IndexDescriptor{
+	desc.SetPrimaryIndex(descpb.IndexDescriptor{
 		ID:               keys.SequenceIndexID,
 		Name:             tabledesc.PrimaryKeyIndexName,
 		ColumnIDs:        []descpb.ColumnID{tabledesc.SequenceColumnID},
 		ColumnNames:      []string{tabledesc.SequenceColumnName},
 		ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
-	}
+	})
 	desc.Families = []descpb.ColumnFamilyDescriptor{
 		{
 			ID:              keys.SequenceColumnFamilyID,

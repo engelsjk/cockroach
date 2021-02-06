@@ -531,18 +531,31 @@ func evalPrivilegeCheck(
 	if withGrantOpt {
 		privChecks = append(privChecks, privilege.GRANT)
 	}
+
+	allRoleMemberships, err := ctx.Planner.MemberOfWithAdminOption(ctx.Context, user)
+	if err != nil {
+		return nil, err
+	}
+
+	// Slice containing all roles user is a direct and indirect member of.
+	allRoles := []string{security.PublicRole, user.Normalized()}
+	for role := range allRoleMemberships {
+		allRoles = append(allRoles, role.Normalized())
+	}
+
 	for _, p := range privChecks {
 		query := fmt.Sprintf(`
 			SELECT bool_or(privilege_type IN ('%s', '%s')) IS TRUE
-			FROM information_schema.%s WHERE grantee IN ($1, $2) AND %s`,
+			FROM information_schema.%s WHERE grantee = ANY ($1) AND %s`,
 			privilege.ALL, p, infoTable, pred)
-		// TODO(mberhault): "public" is a constant defined in sql/sqlbase, but importing that
-		// would cause a dependency cycle sqlbase -> sem/transform -> sem/builtins -> sqlbase
 		r, err := ctx.InternalExecutor.QueryRow(
-			ctx.Ctx(), "eval-privilege-check", ctx.Txn, query, "public", user.Normalized(),
+			ctx.Ctx(), "eval-privilege-check", ctx.Txn, query, allRoles,
 		)
 		if err != nil {
 			return nil, err
+		}
+		if r == nil {
+			return nil, errors.AssertionFailedf("failed to evaluate privilege check")
 		}
 		switch r[0] {
 		case tree.DBoolFalse:
@@ -1498,7 +1511,7 @@ SELECT description
 						return tree.DNull, nil
 					}
 					return evalPrivilegeCheck(ctx, "schema_privileges",
-						user, pred, privilege.SELECT, withGrantOpt)
+						user, pred, privilege.USAGE, withGrantOpt)
 				},
 			})
 		},

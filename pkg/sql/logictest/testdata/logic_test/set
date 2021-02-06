@@ -25,10 +25,10 @@ statement ok
 CREATE TABLE bar (k INT PRIMARY KEY)
 
 # Verify that the table is indeed in "foo".
-query TTTTI
+query TTTTIT
 SHOW TABLES FROM foo
 ----
-public  bar  table  root  0
+public  bar  table  root  0  NULL
 
 # Verify set to empty string.
 statement ok
@@ -44,10 +44,10 @@ statement error no database or schema specified
 SHOW TABLES
 
 # Verify SHOW TABLES FROM works when there is no current database.
-query TTTTI
+query TTTTIT
 SHOW TABLES FROM foo
 ----
-public  bar  table  root  0
+public  bar  table  root  0  NULL
 
 # SET statement succeeds, CREATE TABLE fails.
 statement error pgcode 42P07 relation \"bar\" already exists
@@ -60,10 +60,10 @@ database
 foo
 
 # SET succeeds
-query TTTTI
+query TTTTIT
 SHOW TABLES from foo
 ----
-public  bar  table  root  0
+public  bar  table  root  0  NULL
 
 statement error invalid variable name: ""
 SET ROW (1, TRUE, NULL)
@@ -142,6 +142,12 @@ statement error parameter "server_encoding" cannot be changed
 SET server_encoding = 'other'
 
 statement ok
+SET escape_string_warning = 'ON'
+
+statement ok
+SET escape_string_warning = 'off'
+
+statement ok
 SET datestyle = 'ISO'
 
 statement error invalid value for parameter "DateStyle": "other"
@@ -211,13 +217,13 @@ query T colnames
 SHOW server_version
 ----
 server_version
-9.5.0
+13.0.0
 
 query T colnames
 SHOW server_version_num
 ----
 server_version_num
-90500
+130000
 
 # Test read-only variables
 statement error parameter "max_index_keys" cannot be changed

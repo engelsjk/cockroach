@@ -21,13 +21,13 @@ const nonTemplatePanic = "do not call from non-template code"
 var (
 	_ = COPYVAL
 	_ = SET
-	_ = SLICE
 	_ = COPYSLICE
 	_ = APPENDSLICE
 	_ = APPENDVAL
 	_ = LEN
 	_ = ZERO
 	_ = WINDOW
+	_ = SETVARIABLESIZE
 )
 
 // COPYVAL is a template function that can be used to set a scalar to the value
@@ -41,12 +41,6 @@ func COPYVAL(dest, src interface{}) {
 // SET is a template function.
 func SET(target, i, new interface{}) {
 	colexecerror.InternalError(errors.AssertionFailedf(nonTemplatePanic))
-}
-
-// SLICE is a template function.
-func SLICE(target, start, end interface{}) interface{} {
-	colexecerror.InternalError(errors.AssertionFailedf(nonTemplatePanic))
-	return nil
 }
 
 // COPYSLICE is a template function.
@@ -77,6 +71,12 @@ func ZERO(target interface{}) {
 
 // WINDOW is a template function.
 func WINDOW(target, start, end interface{}) interface{} {
+	colexecerror.InternalError(errors.AssertionFailedf(nonTemplatePanic))
+	return nil
+}
+
+// SETVARIABLESIZE is a template function.
+func SETVARIABLESIZE(target, value interface{}) interface{} {
 	colexecerror.InternalError(errors.AssertionFailedf(nonTemplatePanic))
 	return nil
 }

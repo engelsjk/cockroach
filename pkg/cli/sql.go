@@ -44,6 +44,9 @@ import (
 )
 
 const (
+	// Refer to README.md to understand the general design guidelines for
+	// help texts.
+
 	welcomeMessage = `#
 # Welcome to the CockroachDB SQL shell.
 # All statements must be terminated by a semicolon.
@@ -562,7 +565,7 @@ func (c *cliState) handleDemoAddNode(cmd []string, nextState, errState cliStateE
 	}
 
 	if demoCtx.simulateLatency {
-		fmt.Printf("add command is not supported in --global configurations")
+		fmt.Printf("add command is not supported in --global configurations\n")
 		return nextState
 	}
 
@@ -1790,4 +1793,10 @@ func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 		return helpText, err
 	}
 	return "", nil
+}
+
+func printlnUnlessEmbedded(args ...interface{}) {
+	if !sqlCtx.embeddedMode {
+		fmt.Println(args...)
+	}
 }

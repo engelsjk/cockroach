@@ -45,10 +45,16 @@ func DequalifyAndValidateExpr(
 	tn *tree.TableName,
 ) (string, catalog.TableColSet, error) {
 	var colIDs catalog.TableColSet
+	nonDropColumns := desc.NonDropColumns()
+	nonDropColumnDescs := make([]descpb.ColumnDescriptor, len(nonDropColumns))
+	for i, col := range nonDropColumns {
+		nonDropColumnDescs[i] = *col.ColumnDesc()
+	}
+
 	sourceInfo := colinfo.NewSourceInfoForSingleTable(
 		*tn, colinfo.ResultColumnsFromColDescs(
 			desc.GetID(),
-			desc.AllNonDropColumns(),
+			nonDropColumnDescs,
 		),
 	)
 	expr, err := dequalifyColumnRefs(ctx, sourceInfo, expr)
@@ -101,12 +107,12 @@ func ExtractColumnIDs(
 			return true, expr, nil
 		}
 
-		col, _, err := desc.FindColumnByName(c.ColumnName)
+		col, err := desc.FindColumnWithName(c.ColumnName)
 		if err != nil {
 			return false, nil, err
 		}
 
-		colIDs.Add(col.ID)
+		colIDs.Add(col.GetID())
 		return false, expr, nil
 	})
 
@@ -138,7 +144,7 @@ func HasValidColumnReferences(desc catalog.TableDescriptor, rootExpr tree.Expr) 
 			return true, expr, nil
 		}
 
-		_, _, err = desc.FindColumnByName(c.ColumnName)
+		_, err = desc.FindColumnWithName(c.ColumnName)
 		if err != nil {
 			return false, expr, returnFalsePseudoError
 		}
@@ -164,7 +170,7 @@ func FormatExprForDisplay(
 	semaCtx *tree.SemaContext,
 	fmtFlags tree.FmtFlags,
 ) (string, error) {
-	expr, err := deserializeExprForFormatting(ctx, desc, exprStr, semaCtx)
+	expr, err := deserializeExprForFormatting(ctx, desc, exprStr, semaCtx, fmtFlags)
 	if err != nil {
 		return "", err
 	}
@@ -172,7 +178,11 @@ func FormatExprForDisplay(
 }
 
 func deserializeExprForFormatting(
-	ctx context.Context, desc catalog.TableDescriptor, exprStr string, semaCtx *tree.SemaContext,
+	ctx context.Context,
+	desc catalog.TableDescriptor,
+	exprStr string,
+	semaCtx *tree.SemaContext,
+	fmtFlags tree.FmtFlags,
 ) (tree.Expr, error) {
 	expr, err := parser.ParseExpr(exprStr)
 	if err != nil {
@@ -181,15 +191,34 @@ func deserializeExprForFormatting(
 
 	// Replace the column variables with dummyColumns so that they can be
 	// type-checked.
-	expr, _, err = replaceColumnVars(desc, expr)
+	replacedExpr, _, err := replaceColumnVars(desc, expr)
 	if err != nil {
 		return nil, err
 	}
 
 	// Type-check the expression to resolve user defined types.
-	typedExpr, err := expr.TypeCheck(ctx, semaCtx, types.Any)
+	typedExpr, err := replacedExpr.TypeCheck(ctx, semaCtx, types.Any)
 	if err != nil {
 		return nil, err
+	}
+
+	// In pg_catalog, we need to make sure we always display constants instead of
+	// expressions, when possible (e.g., turn Array expr into a DArrray). This is
+	// best-effort, so if there is any error, it is safe to fallback to the
+	// typedExpr.
+	if fmtFlags == tree.FmtPGCatalog {
+		sanitizedExpr, err := SanitizeVarFreeExpr(ctx, expr, typedExpr.ResolvedType(), "FORMAT", semaCtx,
+			tree.VolatilityImmutable)
+		// If the expr has no variables and has VolatilityImmutable, we can evaluate
+		// it and turn it into a constant.
+		if err == nil {
+			// An empty EvalContext is fine here since the expression has
+			// VolatilityImmutable.
+			d, err := sanitizedExpr.Eval(&tree.EvalContext{})
+			if err == nil {
+				return d, nil
+			}
+		}
 	}
 
 	return typedExpr, nil

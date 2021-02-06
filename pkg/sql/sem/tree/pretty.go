@@ -12,6 +12,7 @@ package tree
 
 import (
 	"bytes"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -1230,15 +1231,18 @@ func (node *CreateTable) doc(p *PrettyCfg) pretty.Doc {
 		)
 	}
 
-	clauses := make([]pretty.Doc, 0, 2)
+	clauses := make([]pretty.Doc, 0, 4)
 	if node.As() {
 		clauses = append(clauses, p.Doc(node.AsSource))
 	}
 	if node.Interleave != nil {
 		clauses = append(clauses, p.Doc(node.Interleave))
 	}
-	if node.PartitionBy != nil {
-		clauses = append(clauses, p.Doc(node.PartitionBy))
+	if node.PartitionByTable != nil {
+		clauses = append(clauses, p.Doc(node.PartitionByTable))
+	}
+	if node.Locality != nil {
+		clauses = append(clauses, p.Doc(node.Locality))
 	}
 	if len(clauses) == 0 {
 		return title
@@ -1400,6 +1404,24 @@ func (node *NullIfExpr) doc(p *PrettyCfg) pretty.Doc {
 		), ")", "")
 }
 
+func (node *PartitionByTable) doc(p *PrettyCfg) pretty.Doc {
+	// Final layout:
+	//
+	// PARTITION [ALL] BY NOTHING
+	//
+	// PARTITION [ALL] BY LIST (...)
+	//    ( ..values.. )
+	//
+	// PARTITION [ALL] BY RANGE (...)
+	//    ( ..values.. )
+	var kw string
+	kw = `PARTITION `
+	if node.All {
+		kw += `ALL `
+	}
+	return node.PartitionBy.docInner(p, kw+`BY `)
+}
+
 func (node *PartitionBy) doc(p *PrettyCfg) pretty.Doc {
 	// Final layout:
 	//
@@ -1408,15 +1430,19 @@ func (node *PartitionBy) doc(p *PrettyCfg) pretty.Doc {
 	// PARTITION BY LIST (...)
 	//    ( ..values.. )
 	//
-	if node == nil {
-		return pretty.Keyword("PARTITION BY NOTHING")
-	}
+	// PARTITION BY RANGE (...)
+	//    ( ..values.. )
+	return node.docInner(p, `PARTITION BY `)
+}
 
-	var kw string
+func (node *PartitionBy) docInner(p *PrettyCfg, kw string) pretty.Doc {
+	if node == nil {
+		return pretty.Keyword(kw + `NOTHING`)
+	}
 	if len(node.List) > 0 {
-		kw = `PARTITION BY LIST`
+		kw += `LIST`
 	} else if len(node.Range) > 0 {
-		kw = `PARTITION BY RANGE`
+		kw += `RANGE`
 	}
 	title := pretty.ConcatSpace(pretty.Keyword(kw),
 		p.bracket("(", p.Doc(&node.Fields), ")"))
@@ -1431,6 +1457,42 @@ func (node *PartitionBy) doc(p *PrettyCfg) pretty.Doc {
 	return p.nestUnder(title,
 		p.bracket("(", p.commaSeparated(inner...), ")"),
 	)
+}
+
+func (node *Locality) doc(p *PrettyCfg) pretty.Doc {
+	// Final layout:
+	//
+	// LOCALITY [GLOBAL | REGIONAL BY [TABLE [IN [PRIMARY REGION|region]]|ROW]]
+	localityKW := pretty.Keyword("LOCALITY")
+	switch node.LocalityLevel {
+	case LocalityLevelGlobal:
+		return pretty.ConcatSpace(localityKW, pretty.Keyword("GLOBAL"))
+	case LocalityLevelRow:
+		ret := pretty.ConcatSpace(localityKW, pretty.Keyword("REGIONAL BY ROW"))
+		if node.RegionalByRowColumn != "" {
+			return pretty.ConcatSpace(
+				ret,
+				pretty.ConcatSpace(
+					pretty.Keyword("AS"),
+					p.Doc(&node.RegionalByRowColumn),
+				),
+			)
+		}
+		return ret
+	case LocalityLevelTable:
+		byTable := pretty.ConcatSpace(localityKW, pretty.Keyword("REGIONAL BY TABLE IN"))
+		if node.TableRegion == "" {
+			return pretty.ConcatSpace(
+				byTable,
+				pretty.Keyword("PRIMARY REGION"),
+			)
+		}
+		return pretty.ConcatSpace(
+			byTable,
+			p.Doc(&node.TableRegion),
+		)
+	}
+	panic(fmt.Sprintf("unknown locality: %v", *node))
 }
 
 func (node *ListPartition) doc(p *PrettyCfg) pretty.Doc {
@@ -1557,8 +1619,8 @@ func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 	if node.Interleave != nil {
 		clauses = append(clauses, p.Doc(node.Interleave))
 	}
-	if node.PartitionBy != nil {
-		clauses = append(clauses, p.Doc(node.PartitionBy))
+	if node.PartitionByIndex != nil {
+		clauses = append(clauses, p.Doc(node.PartitionByIndex))
 	}
 	if node.StorageParams != nil {
 		clauses = append(clauses, p.bracketKeyword(
@@ -1630,8 +1692,8 @@ func (node *IndexTableDef) doc(p *PrettyCfg) pretty.Doc {
 	if node.Interleave != nil {
 		clauses = append(clauses, p.Doc(node.Interleave))
 	}
-	if node.PartitionBy != nil {
-		clauses = append(clauses, p.Doc(node.PartitionBy))
+	if node.PartitionByIndex != nil {
+		clauses = append(clauses, p.Doc(node.PartitionByIndex))
 	}
 	if node.StorageParams != nil {
 		clauses = append(
@@ -1693,8 +1755,8 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	if node.Interleave != nil {
 		clauses = append(clauses, p.Doc(node.Interleave))
 	}
-	if node.PartitionBy != nil {
-		clauses = append(clauses, p.Doc(node.PartitionBy))
+	if node.PartitionByIndex != nil {
+		clauses = append(clauses, p.Doc(node.PartitionByIndex))
 	}
 	if node.Predicate != nil {
 		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
@@ -1789,8 +1851,19 @@ func (node *ColumnTableDef) docRow(p *PrettyCfg) pretty.TableRow {
 
 	// Compute expression (for computed columns).
 	if node.IsComputed() {
-		clauses = append(clauses, pretty.ConcatSpace(pretty.Keyword("AS"),
-			p.bracket("(", p.Doc(node.Computed.Expr), ") STORED"),
+		var typ string
+		if node.Computed.Virtual {
+			typ = "VIRTUAL"
+		} else {
+			typ = "STORED"
+		}
+
+		clauses = append(clauses, pretty.ConcatSpace(
+			pretty.Keyword("AS"),
+			pretty.ConcatSpace(
+				p.bracket("(", p.Doc(node.Computed.Expr), ")"),
+				pretty.Keyword(typ),
+			),
 		))
 	}
 
@@ -1814,6 +1887,12 @@ func (node *ColumnTableDef) docRow(p *PrettyCfg) pretty.TableRow {
 	if node.HasDefaultExpr() {
 		clauses = append(clauses, p.maybePrependConstraintName(&node.DefaultExpr.ConstraintName,
 			pretty.ConcatSpace(pretty.Keyword("DEFAULT"), p.Doc(node.DefaultExpr.Expr))))
+	}
+
+	// [NOT] VISIBLE constraint.
+	if node.Hidden {
+		hiddenConstraint := pretty.Keyword("NOT VISIBLE")
+		clauses = append(clauses, p.maybePrependConstraintName(&node.Nullable.ConstraintName, hiddenConstraint))
 	}
 
 	// NULL/NOT NULL constraint.

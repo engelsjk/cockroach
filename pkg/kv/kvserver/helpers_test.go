@@ -52,9 +52,10 @@ func (s *Store) Transport() *RaftTransport {
 func (s *Store) FindTargetAndTransferLease(
 	ctx context.Context, repl *Replica, desc *roachpb.RangeDescriptor, zone *zonepb.ZoneConfig,
 ) (bool, error) {
-	return s.replicateQueue.findTargetAndTransferLease(
+	transferStatus, err := s.replicateQueue.shedLease(
 		ctx, repl, desc, zone, transferLeaseOptions{},
 	)
+	return transferStatus == transferOK, err
 }
 
 // AddReplica adds the replica to the store's replica map and to the sorted
@@ -93,7 +94,7 @@ func (s *Store) ComputeMVCCStats() (enginepb.MVCCStats, error) {
 // store's consistency queue.
 func ConsistencyQueueShouldQueue(
 	ctx context.Context,
-	now hlc.Timestamp,
+	now hlc.ClockTimestamp,
 	desc *roachpb.RangeDescriptor,
 	getQueueLastProcessed func(ctx context.Context) (hlc.Timestamp, error),
 	isNodeLive func(nodeID roachpb.NodeID) (bool, error),
@@ -146,7 +147,7 @@ func (s *Store) SetSplitQueueActive(active bool) {
 	s.setSplitQueueActive(active)
 }
 
-// SetMergeQueueActive enables or disables the split queue.
+// SetMergeQueueActive enables or disables the merge queue.
 func (s *Store) SetMergeQueueActive(active bool) {
 	s.setMergeQueueActive(active)
 }
@@ -231,8 +232,8 @@ func (s *Store) AssertInvariants() {
 		// called only when there is no in-flight traffic to the store, at which
 		// point acquiring repl.raftMu is unnecessary.
 		if repl.IsInitialized() {
-			if ex := s.mu.replicasByKey.Get(repl); ex != repl {
-				log.Fatalf(ctx, "%v misplaced in replicasByKey; found %v instead", repl, ex)
+			if rbkRepl := s.mu.replicasByKey.LookupReplica(ctx, repl.Desc().StartKey); rbkRepl != repl {
+				log.Fatalf(ctx, "%v misplaced in replicasByKey; found %+v instead", repl, rbkRepl)
 			}
 		} else if _, ok := s.mu.uninitReplicas[repl.RangeID]; !ok {
 			log.Fatalf(ctx, "%v missing from uninitReplicas", repl)

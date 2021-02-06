@@ -18,13 +18,14 @@ import (
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
+	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -43,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -95,9 +97,9 @@ func (dsp *DistSQLPlanner) initRunners(ctx context.Context) {
 	// requests if a worker is actually there to receive them.
 	dsp.runnerChan = make(chan runnerRequest)
 	for i := 0; i < numRunners; i++ {
-		dsp.stopper.RunWorker(ctx, func(context.Context) {
+		_ = dsp.stopper.RunAsyncTask(ctx, "distslq-runner", func(context.Context) {
 			runnerChan := dsp.runnerChan
-			stopChan := dsp.stopper.ShouldStop()
+			stopChan := dsp.stopper.ShouldQuiesce()
 			for {
 				select {
 				case req := <-runnerChan:
@@ -124,6 +126,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 	recv *DistSQLReceiver,
 	localState distsql.LocalState,
 	vectorizeThresholdMet bool,
+	collectStats bool,
 ) (context.Context, flowinfra.Flow, error) {
 	thisNodeID := dsp.gatewayNodeID
 	_, ok := flows[thisNodeID]
@@ -140,6 +143,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 		Version:           execinfra.Version,
 		EvalContext:       evalCtxProto,
 		TraceKV:           evalCtx.Tracing.KVTracingEnabled(),
+		CollectStats:      collectStats,
 	}
 
 	// Start all the flows except the flow on this node (there is always a flow on
@@ -161,26 +165,8 @@ func (dsp *DistSQLPlanner) setupFlows(
 			// specs.
 			for _, spec := range flows {
 				if err := colflow.IsSupported(vectorizeMode, spec); err != nil {
-					// Vectorization attempt failed with an error.
-					returnVectorizationSetupError := false
-					if vectorizeMode == sessiondatapb.VectorizeExperimentalAlways {
-						returnVectorizationSetupError = true
-						// If running with VectorizeExperimentalAlways, this check makes sure
-						// that we can still run SET statements (mostly to set vectorize to
-						// off) and the like.
-						if len(spec.Processors) == 1 &&
-							spec.Processors[0].Core.LocalPlanNode != nil {
-							rsidx := spec.Processors[0].Core.LocalPlanNode.RowSourceIdx
-							lp := localState.LocalProcs[rsidx]
-							if z, ok := lp.(colflow.VectorizeAlwaysException); ok {
-								if z.IsException() {
-									returnVectorizationSetupError = false
-								}
-							}
-						}
-					}
 					log.VEventf(ctx, 1, "failed to vectorize: %s", err)
-					if returnVectorizationSetupError {
+					if vectorizeMode == sessiondatapb.VectorizeExperimentalAlways {
 						return nil, nil, err
 					}
 					// Vectorization is not supported for this flow, so we override the
@@ -241,12 +227,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 	localReq := setupReq
 	localReq.Flow = *flows[thisNodeID]
 	defer physicalplan.ReleaseSetupFlowRequest(&localReq)
-	ctx, flow, err := dsp.distSQLSrv.SetupLocalSyncFlow(ctx, evalCtx.Mon, &localReq, recv, localState)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return ctx, flow, nil
+	return dsp.distSQLSrv.SetupLocalSyncFlow(ctx, evalCtx.Mon, &localReq, recv, localState)
 }
 
 // Run executes a physical plan. The plan should have been finalized using
@@ -331,7 +312,7 @@ func (dsp *DistSQLPlanner) Run(
 		if planCtx.planner != nil && planCtx.planner.stmt.AST != nil {
 			stmtStr = planCtx.planner.stmt.String()
 		}
-		_, url, err := execinfrapb.GeneratePlanDiagramURL(stmtStr, flows, false /* showInputTypes */)
+		_, url, err := execinfrapb.GeneratePlanDiagramURL(stmtStr, flows, execinfrapb.DiagramFlags{})
 		if err != nil {
 			log.Infof(ctx, "error generating diagram: %s", err)
 		} else {
@@ -345,6 +326,7 @@ func (dsp *DistSQLPlanner) Run(
 	defer dsp.distSQLSrv.ServerConfig.Metrics.QueryStop()
 
 	recv.outputTypes = plan.GetResultTypes()
+	recv.contendedQueryMetric = dsp.distSQLSrv.Metrics.ContendedQueriesCount
 
 	vectorizedThresholdMet := plan.MaxEstimatedRowCount >= evalCtx.SessionData.VectorizeRowCountThreshold
 
@@ -354,7 +336,9 @@ func (dsp *DistSQLPlanner) Run(
 		localState.IsLocal = true
 	}
 
-	ctx, flow, err := dsp.setupFlows(ctx, evalCtx, leafInputState, flows, recv, localState, vectorizedThresholdMet)
+	ctx, flow, err := dsp.setupFlows(
+		ctx, evalCtx, leafInputState, flows, recv, localState, vectorizedThresholdMet, planCtx.collectExecStats,
+	)
 	if err != nil {
 		recv.SetError(err)
 		return func() {}
@@ -447,7 +431,7 @@ type DistSQLReceiver struct {
 	alloc  rowenc.DatumAlloc
 	closed bool
 
-	rangeCache *kvcoord.RangeDescriptorCache
+	rangeCache *rangecache.RangeCache
 	tracing    *SessionTracing
 	cleanup    func()
 
@@ -461,12 +445,18 @@ type DistSQLReceiver struct {
 
 	// A handler for clock signals arriving from remote nodes. This should update
 	// this node's clock.
-	updateClock func(observedTs hlc.Timestamp)
+	clockUpdater clockUpdater
 
 	stats topLevelQueryStats
 
 	expectedRowsRead int64
 	progressAtomic   *uint64
+
+	// contendedQueryMetric is a Counter that is incremented at most once if the
+	// query produces at least one contention event.
+	contendedQueryMetric *metric.Counter
+	// contentionRegistry is a Registry that contention events are added to.
+	contentionRegistry *contention.Registry
 }
 
 // rowResultWriter is a subset of CommandResult to be used with the
@@ -538,6 +528,13 @@ var receiverSyncPool = sync.Pool{
 	},
 }
 
+// ClockUpdater describes an object that can be updated with an observed
+// timestamp. Usually wraps an hlc.Clock.
+type clockUpdater interface {
+	// Update updates this ClockUpdater with the observed hlc.Timestamp.
+	Update(observedTS hlc.ClockTimestamp)
+}
+
 // MakeDistSQLReceiver creates a DistSQLReceiver.
 //
 // ctx is the Context that the receiver will use throughout its
@@ -550,22 +547,24 @@ func MakeDistSQLReceiver(
 	ctx context.Context,
 	resultWriter rowResultWriter,
 	stmtType tree.StatementType,
-	rangeCache *kvcoord.RangeDescriptorCache,
+	rangeCache *rangecache.RangeCache,
 	txn *kv.Txn,
-	updateClock func(observedTs hlc.Timestamp),
+	clockUpdater clockUpdater,
 	tracing *SessionTracing,
+	contentionRegistry *contention.Registry,
 ) *DistSQLReceiver {
 	consumeCtx, cleanup := tracing.TraceExecConsume(ctx)
 	r := receiverSyncPool.Get().(*DistSQLReceiver)
 	*r = DistSQLReceiver{
-		ctx:          consumeCtx,
-		cleanup:      cleanup,
-		resultWriter: resultWriter,
-		rangeCache:   rangeCache,
-		txn:          txn,
-		updateClock:  updateClock,
-		stmtType:     stmtType,
-		tracing:      tracing,
+		ctx:                consumeCtx,
+		cleanup:            cleanup,
+		resultWriter:       resultWriter,
+		rangeCache:         rangeCache,
+		txn:                txn,
+		clockUpdater:       clockUpdater,
+		stmtType:           stmtType,
+		tracing:            tracing,
+		contentionRegistry: contentionRegistry,
 	}
 	return r
 }
@@ -581,13 +580,14 @@ func (r *DistSQLReceiver) Release() {
 func (r *DistSQLReceiver) clone() *DistSQLReceiver {
 	ret := receiverSyncPool.Get().(*DistSQLReceiver)
 	*ret = DistSQLReceiver{
-		ctx:         r.ctx,
-		cleanup:     func() {},
-		rangeCache:  r.rangeCache,
-		txn:         r.txn,
-		updateClock: r.updateClock,
-		stmtType:    tree.Rows,
-		tracing:     r.tracing,
+		ctx:                r.ctx,
+		cleanup:            func() {},
+		rangeCache:         r.rangeCache,
+		txn:                r.txn,
+		clockUpdater:       r.clockUpdater,
+		stmtType:           tree.Rows,
+		tracing:            r.tracing,
+		contentionRegistry: r.contentionRegistry,
 	}
 	return ret
 }
@@ -604,6 +604,9 @@ func (r *DistSQLReceiver) Push(
 	row rowenc.EncDatumRow, meta *execinfrapb.ProducerMetadata,
 ) execinfra.ConsumerStatus {
 	if meta != nil {
+		if metaWriter, ok := r.resultWriter.(MetadataResultWriter); ok {
+			metaWriter.AddMeta(r.ctx, meta)
+		}
 		if meta.LeafTxnFinalState != nil {
 			if r.txn != nil {
 				if r.txn.ID() == meta.LeafTxnFinalState.Txn.ID {
@@ -632,7 +635,9 @@ func (r *DistSQLReceiver) Push(
 						// TODO(andrei): We don't propagate clock signals on success cases
 						// through DistSQL; we should. We also don't propagate them through
 						// non-retryable errors; we also should.
-						r.updateClock(retryErr.PErr.Now)
+						if r.clockUpdater != nil {
+							r.clockUpdater.Update(retryErr.PErr.Now)
+						}
 					}
 				}
 				r.resultWriter.SetError(meta.Err)
@@ -644,8 +649,7 @@ func (r *DistSQLReceiver) Push(
 		if len(meta.TraceData) > 0 {
 			span := tracing.SpanFromContext(r.ctx)
 			if span == nil {
-				r.resultWriter.SetError(
-					errors.New("trying to ingest remote spans but there is no recording span set up"))
+				// Nothing to do.
 			} else if err := span.ImportRemoteSpans(meta.TraceData); err != nil {
 				r.resultWriter.SetError(errors.Errorf("error ingesting remote spans: %s", err))
 			}
@@ -658,11 +662,23 @@ func (r *DistSQLReceiver) Push(
 				atomic.StoreUint64(r.progressAtomic, math.Float64bits(progress))
 			}
 			meta.Metrics.Release()
-			meta.Release()
 		}
-		if metaWriter, ok := r.resultWriter.(MetadataResultWriter); ok {
-			metaWriter.AddMeta(r.ctx, meta)
+		if len(meta.ContentionEvents) > 0 {
+			if r.contendedQueryMetric != nil {
+				// Increment the contended query metric at most once if the query sees at
+				// least one contention event.
+				r.contendedQueryMetric.Inc(1)
+				r.contendedQueryMetric = nil
+			}
+
+			for i := range meta.ContentionEvents {
+				if err := r.contentionRegistry.AddContentionEvent(meta.ContentionEvents[i]); err != nil {
+					r.resultWriter.SetError(errors.Wrap(err, "unable to add contention event to registry"))
+				}
+			}
 		}
+		// Release the meta object. It is unsafe for use after this call.
+		meta.Release()
 		return r.status
 	}
 	if r.resultWriter.Err() == nil && r.ctx.Err() != nil {
@@ -832,10 +848,11 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	).WillDistribute()
 	subqueryPlanCtx := dsp.NewPlanningCtx(ctx, evalCtx, planner, planner.txn, distributeSubquery)
 	subqueryPlanCtx.stmtType = tree.Rows
-	if planner.instrumentation.ShouldCollectBundle() {
+	if planner.instrumentation.ShouldSaveFlows() {
 		subqueryPlanCtx.saveFlows = subqueryPlanCtx.getDefaultSaveFlowsFunc(ctx, planner, planComponentTypeSubquery)
 	}
 	subqueryPlanCtx.traceMetadata = planner.instrumentation.traceMetadata
+	subqueryPlanCtx.collectExecStats = planner.instrumentation.ShouldCollectExecStats()
 	// Don't close the top-level plan from subqueries - someone else will handle
 	// that.
 	subqueryPlanCtx.ignoreClose = true
@@ -1124,10 +1141,11 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 	postqueryPlanCtx := dsp.NewPlanningCtx(ctx, evalCtx, planner, planner.txn, distributePostquery)
 	postqueryPlanCtx.stmtType = tree.Rows
 	postqueryPlanCtx.ignoreClose = true
-	if planner.instrumentation.ShouldCollectBundle() {
+	if planner.instrumentation.ShouldSaveFlows() {
 		postqueryPlanCtx.saveFlows = postqueryPlanCtx.getDefaultSaveFlowsFunc(ctx, planner, planComponentTypePostquery)
 	}
 	postqueryPlanCtx.traceMetadata = planner.instrumentation.traceMetadata
+	postqueryPlanCtx.collectExecStats = planner.instrumentation.ShouldCollectExecStats()
 
 	postqueryPhysPlan, err := dsp.createPhysPlan(postqueryPlanCtx, postqueryPlan)
 	if err != nil {

@@ -95,9 +95,14 @@ func (cb *onDeleteCascadeBuilder) Build(
 		mb.init(b, "delete", cb.childTable, tree.MakeUnqualifiedTableName(cb.childTable.Name()))
 
 		// Build a semi join of the table with the mutation input.
-		mb.outScope = b.buildDeleteCascadeMutationInput(
+		//
+		// The scope returned by buildDeleteCascadeMutationInput has one column
+		// for each public table column, making it appropriate to set it as
+		// mb.fetchScope.
+		mb.fetchScope = b.buildDeleteCascadeMutationInput(
 			cb.childTable, &mb.alias, fk, binding, bindingProps, oldValues,
 		)
+		mb.outScope = mb.fetchScope
 
 		// Set list of columns that will be fetched by the input expression.
 		mb.setFetchColIDs(mb.outScope.cols)
@@ -106,10 +111,10 @@ func (cb *onDeleteCascadeBuilder) Build(
 	})
 }
 
-// onDeleteCascadeBuilder is a memo.CascadeBuilder implementation for certain
-// cases of ON DELETE CASCADE where we are deleting the entire table or where we
-// can transfer a filter from the original statement instead of buffering the
-// deleted rows.
+// onDeleteFastCascadeBuilder is a memo.CascadeBuilder implementation for
+// certain cases of ON DELETE CASCADE where we are deleting the entire table or
+// where we can transfer a filter from the original statement instead of
+// buffering the deleted rows.
 //
 // It provides a method to build the cascading delete in the child table,
 // equivalent to a query like:
@@ -272,7 +277,7 @@ func (cb *onDeleteFastCascadeBuilder) Build(
 
 		// Build the input to the delete mutation, which is simply a Scan with a
 		// Select on top.
-		mb.outScope = b.buildScan(
+		mb.fetchScope = b.buildScan(
 			b.addTable(cb.childTable, &mb.alias),
 			tableOrdinals(cb.childTable, columnKinds{
 				includeMutations:       false,
@@ -284,6 +289,7 @@ func (cb *onDeleteFastCascadeBuilder) Build(
 			noRowLocking,
 			b.allocScope(),
 		)
+		mb.outScope = mb.fetchScope
 
 		var filters memo.FiltersExpr
 
@@ -420,9 +426,14 @@ func (cb *onDeleteSetBuilder) Build(
 		mb.init(b, "update", cb.childTable, tree.MakeUnqualifiedTableName(cb.childTable.Name()))
 
 		// Build a semi join of the table with the mutation input.
-		mb.outScope = b.buildDeleteCascadeMutationInput(
+		//
+		// The scope returned by buildDeleteCascadeMutationInput has one column
+		// for each public table column, making it appropriate to set it as
+		// mb.fetchScope.
+		mb.fetchScope = b.buildDeleteCascadeMutationInput(
 			cb.childTable, &mb.alias, fk, binding, bindingProps, oldValues,
 		)
+		mb.outScope = mb.fetchScope
 
 		// Set list of columns that will be fetched by the input expression.
 		mb.setFetchColIDs(mb.outScope.cols)
@@ -536,7 +547,7 @@ func (b *Builder) buildDeleteCascadeMutationInput(
 		))
 	}
 	outScope.expr = b.factory.ConstructSemiJoin(
-		outScope.expr, mutationInput, on, &memo.JoinPrivate{},
+		outScope.expr, mutationInput, on, memo.EmptyJoinPrivate,
 	)
 	return outScope
 }
@@ -639,6 +650,8 @@ func (cb *onUpdateCascadeBuilder) Build(
 		numFKCols := fk.ColumnCount()
 		tableScopeCols := mb.outScope.cols[:len(mb.outScope.cols)-2*numFKCols]
 		newValScopeCols := mb.outScope.cols[len(mb.outScope.cols)-numFKCols:]
+		mb.fetchScope = b.allocScope()
+		mb.fetchScope.appendColumns(tableScopeCols)
 
 		// Set list of columns that will be fetched by the input expression.
 		mb.setFetchColIDs(tableScopeCols)
@@ -842,7 +855,7 @@ func (b *Builder) buildUpdateCascadeMutationInput(
 	// inner join is equivalent.
 	// Note that this is very similar to the UPDATE ... FROM syntax.
 	outScope.expr = f.ConstructInnerJoin(
-		outScope.expr, mutationInput, on, &memo.JoinPrivate{},
+		outScope.expr, mutationInput, on, memo.EmptyJoinPrivate,
 	)
 	// Append the columns from the right-hand side to the scope.
 	for _, col := range outCols {

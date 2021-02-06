@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
@@ -42,7 +43,8 @@ func (p *planner) ReparentDatabase(
 	ctx context.Context, n *tree.ReparentDatabase,
 ) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"REPARENT DATABASE",
 	); err != nil {
 		return nil, err
@@ -54,10 +56,10 @@ func (p *planner) ReparentDatabase(
 	}
 
 	// Ensure that the cluster version is high enough to create the schema.
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.VersionUserDefinedSchemas) {
+	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.UserDefinedSchemas) {
 		return nil, pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 			`creating schemas requires all nodes to be upgraded to %s`,
-			clusterversion.VersionByKey(clusterversion.VersionUserDefinedSchemas))
+			clusterversion.ByKey(clusterversion.UserDefinedSchemas))
 	}
 
 	if string(n.Name) == p.CurrentDatabase() {
@@ -66,12 +68,14 @@ func (p *planner) ReparentDatabase(
 
 	sqltelemetry.IncrementUserDefinedSchemaCounter(sqltelemetry.UserDefinedSchemaReparentDatabase)
 
-	db, err := p.ResolveMutableDatabaseDescriptor(ctx, string(n.Name), true /* required */)
+	_, db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
+		tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return nil, err
 	}
 
-	parent, err := p.ResolveMutableDatabaseDescriptor(ctx, string(n.Parent), true /* required */)
+	_, parent, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Parent),
+		tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return nil, err
 	}
@@ -187,18 +191,18 @@ func (n *reparentDatabaseNode) startExec(params runParams) error {
 				for _, ref := range tbl.GetDependedOnBy() {
 					dep, err := p.Descriptors().GetMutableTableVersionByID(ctx, ref.ID, p.txn)
 					if err != nil {
-						return errors.Wrapf(err, errStr, n.db.Name, tblName.String())
+						return errors.Wrapf(err, errStr, n.db.Name, tblName.FQString())
 					}
 					fqName, err := p.getQualifiedTableName(ctx, dep)
 					if err != nil {
 						return errors.Wrapf(err, errStr, n.db.Name, dep.Name)
 					}
-					names = append(names, fqName.String())
+					names = append(names, fqName.FQString())
 				}
 				return sqlerrors.NewDependentObjectErrorf(
 					"could not convert database %q into schema because %q has dependent objects %v",
 					n.db.Name,
-					tblName.String(),
+					tblName.FQString(),
 					names,
 				)
 			}
@@ -296,18 +300,12 @@ func (n *reparentDatabaseNode) startExec(params runParams) error {
 
 	// Log Rename Database event. This is an auditable log event and is recorded
 	// in the same transaction as the table descriptor update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		ctx,
-		p.txn,
-		EventLogConvertToSchema,
-		int32(n.db.ID),
-		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-		struct {
-			DatabaseName    string
-			NewDatabaseName string
-			User            string
-		}{n.db.Name, n.newParent.Name, p.User().Normalized()},
-	)
+	return p.logEvent(ctx,
+		n.db.ID,
+		&eventpb.ConvertToSchema{
+			DatabaseName:      n.db.Name,
+			NewDatabaseParent: n.newParent.Name,
+		})
 }
 
 func (n *reparentDatabaseNode) Next(params runParams) (bool, error) { return false, nil }

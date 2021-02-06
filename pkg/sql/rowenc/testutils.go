@@ -188,7 +188,13 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 		return &tree.DBitArray{BitArray: r}
 	case types.StringFamily:
 		// Generate a random ASCII string.
-		p := make([]byte, rng.Intn(10))
+		var length int
+		if typ.Oid() == oid.T_char || typ.Oid() == oid.T_bpchar {
+			length = 1
+		} else {
+			length = rng.Intn(10)
+		}
+		p := make([]byte, length)
 		for i := range p {
 			p[i] = byte(1 + rng.Intn(127))
 		}
@@ -750,6 +756,16 @@ func randInterestingDatum(rng *rand.Rand, typ *types.T) tree.Datum {
 		default:
 			panic(errors.AssertionFailedf("float with an unexpected width %d", typ.Width()))
 		}
+	case types.BitFamily:
+		// A width of 64 is used by all special BitFamily datums in randInterestingDatums.
+		// If the provided bit type, typ, has a width of 0 (representing an arbitrary width) or 64 exactly,
+		// then the special datum will be valid for the provided type. Otherwise, the special type
+		// must be resized to match the width of the provided type.
+		if typ.Width() == 0 || typ.Width() == 64 {
+			return special
+		}
+		return &tree.DBitArray{BitArray: special.(*tree.DBitArray).ToWidth(uint(typ.Width()))}
+
 	default:
 		return special
 	}
@@ -984,8 +1000,8 @@ func TestingMakePrimaryIndexKey(
 	desc catalog.TableDescriptor, vals ...interface{},
 ) (roachpb.Key, error) {
 	index := desc.GetPrimaryIndex()
-	if len(vals) > len(index.ColumnIDs) {
-		return nil, errors.Errorf("got %d values, PK has %d columns", len(vals), len(index.ColumnIDs))
+	if len(vals) > index.NumColumns() {
+		return nil, errors.Errorf("got %d values, PK has %d columns", len(vals), index.NumColumns())
 	}
 	datums := make([]tree.Datum, len(vals))
 	for i, v := range vals {
@@ -1002,30 +1018,24 @@ func TestingMakePrimaryIndexKey(
 			return nil, errors.Errorf("unexpected value type %T", v)
 		}
 		// Check that the value type matches.
-		colID := index.ColumnIDs[i]
-		var done bool
-		if err := desc.ForeachPublicColumn(func(c *descpb.ColumnDescriptor) error {
-			if !done && c.ID == colID {
-				colTyp := datums[i].ResolvedType()
-				if t := colTyp.Family(); t != c.Type.Family() {
-					return errors.Errorf("column %d of type %s, got value of type %s", i, c.Type.Family(), t)
-				}
-				done = true
+		colID := index.GetColumnID(i)
+		col, _ := desc.FindColumnWithID(colID)
+		if col != nil && col.Public() {
+			colTyp := datums[i].ResolvedType()
+			if t := colTyp.Family(); t != col.GetType().Family() {
+				return nil, errors.Errorf("column %d of type %s, got value of type %s", i, col.GetType().Family(), t)
 			}
-			return nil
-		}); err != nil {
-			return nil, err
 		}
 	}
 	// Create the ColumnID to index in datums slice map needed by
 	// MakeIndexKeyPrefix.
 	var colIDToRowIndex catalog.TableColMap
 	for i := range vals {
-		colIDToRowIndex.Set(index.ColumnIDs[i], i)
+		colIDToRowIndex.Set(index.GetColumnID(i), i)
 	}
 
-	keyPrefix := MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, index.ID)
-	key, _, err := EncodeIndexKey(desc, index, colIDToRowIndex, datums, keyPrefix)
+	keyPrefix := MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, index.GetID())
+	key, _, err := EncodeIndexKey(desc, index.IndexDesc(), colIDToRowIndex, datums, keyPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -1070,7 +1080,7 @@ func RandCreateTables(
 		if i > 0 && rng.Intn(2) == 0 {
 			interleave = tables[rng.Intn(i)].(*tree.CreateTable)
 		}
-		t := RandCreateTableWithInterleave(rng, prefix, i+1, interleave)
+		t := RandCreateTableWithInterleave(rng, prefix, i+1, interleave, nil)
 		tables[i] = t
 	}
 
@@ -1083,13 +1093,25 @@ func RandCreateTables(
 
 // RandCreateTable creates a random CreateTable definition.
 func RandCreateTable(rng *rand.Rand, prefix string, tableIdx int) *tree.CreateTable {
-	return RandCreateTableWithInterleave(rng, prefix, tableIdx, nil)
+	return RandCreateTableWithInterleave(rng, prefix, tableIdx, nil, nil)
+}
+
+// RandCreateTableWithColumnIndexNumberGenerator creates a random CreateTable definition
+// using the passed function to generate column index numbers for column names.
+func RandCreateTableWithColumnIndexNumberGenerator(
+	rng *rand.Rand, prefix string, tableIdx int, generateColumnIndexNumber func() int64,
+) *tree.CreateTable {
+	return RandCreateTableWithInterleave(rng, prefix, tableIdx, nil, generateColumnIndexNumber)
 }
 
 // RandCreateTableWithInterleave creates a random CreateTable definition,
 // interleaved into the given other CreateTable definition.
 func RandCreateTableWithInterleave(
-	rng *rand.Rand, prefix string, tableIdx int, interleaveInto *tree.CreateTable,
+	rng *rand.Rand,
+	prefix string,
+	tableIdx int,
+	interleaveInto *tree.CreateTable,
+	generateColumnIndexNumber func() int64,
 ) *tree.CreateTable {
 	// columnDefs contains the list of Columns we'll add to our table.
 	nColumns := randutil.RandIntInRange(rng, 1, 20)
@@ -1132,7 +1154,11 @@ func RandCreateTableWithInterleave(
 			// Loop until we generate an indexable column type.
 			var extraCol *tree.ColumnTableDef
 			for {
-				extraCol = randColumnTableDef(rng, tableIdx, i+prefixLength)
+				colIdx := i + prefixLength
+				if generateColumnIndexNumber != nil {
+					colIdx = int(generateColumnIndexNumber())
+				}
+				extraCol = randColumnTableDef(rng, tableIdx, colIdx)
 				extraColType := tree.MustBeStaticallyKnownType(extraCol.Type)
 				if colinfo.ColumnTypeIsIndexable(extraColType) {
 					break
@@ -1169,7 +1195,11 @@ func RandCreateTableWithInterleave(
 	} else {
 		// Make new defs from scratch.
 		for i := 0; i < nColumns; i++ {
-			columnDef := randColumnTableDef(rng, tableIdx, i)
+			colIdx := i
+			if generateColumnIndexNumber != nil {
+				colIdx = int(generateColumnIndexNumber())
+			}
+			columnDef := randColumnTableDef(rng, tableIdx, colIdx)
 			columnDefs = append(columnDefs, columnDef)
 			defs = append(defs, columnDef)
 		}
@@ -1247,7 +1277,9 @@ func ColumnFamilyMutator(rng *rand.Rand, stmt tree.Statement) (changed bool) {
 			if def.HasColumnFamily() {
 				return false
 			}
-			columns = append(columns, def.Name)
+			if !def.Computed.Virtual {
+				columns = append(columns, def.Name)
+			}
 		}
 	}
 
@@ -1617,11 +1649,6 @@ func MakeIntCols(numCols int) []*types.T {
 // IntEncDatum returns an EncDatum representation of DInt(i).
 func IntEncDatum(i int) EncDatum {
 	return EncDatum{Datum: tree.NewDInt(tree.DInt(i))}
-}
-
-// StrEncDatum returns an EncDatum representation of DString(s).
-func StrEncDatum(s string) EncDatum {
-	return EncDatum{Datum: tree.NewDString(s)}
 }
 
 // NullEncDatum returns and EncDatum representation of tree.DNull.

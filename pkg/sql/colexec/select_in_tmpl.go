@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
@@ -241,6 +240,9 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 				sel := batch.Selection()
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
+					// {{if .Sliceable}}
+					//gcassert:bce
+					// {{end}}
 					v := col.Get(i)
 					if !nulls.NullAt(i) && cmpIn_TYPE(v, col, si.filterRow, si.hasNulls) == compVal {
 						sel[idx] = i
@@ -263,6 +265,9 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 				sel := batch.Selection()
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
+					// {{if .Sliceable}}
+					//gcassert:bce
+					// {{end}}
 					v := col.Get(i)
 					if cmpIn_TYPE(v, col, si.filterRow, si.hasNulls) == compVal {
 						sel[idx] = i
@@ -322,11 +327,14 @@ func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			col = execgen.SLICE(col, 0, n)
+			_ = col.Get(n - 1)
 			for i := 0; i < n; i++ {
 				if nulls.NullAt(i) {
 					projNulls.SetNull(i)
 				} else {
+					// {{if .Sliceable}}
+					//gcassert:bce
+					// {{end}}
 					v := col.Get(i)
 					cmpRes := cmpIn_TYPE(v, col, pi.filterRow, pi.hasNulls)
 					if cmpRes == siNull {
@@ -350,8 +358,11 @@ func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			col = execgen.SLICE(col, 0, n)
+			_ = col.Get(n - 1)
 			for i := 0; i < n; i++ {
+				// {{if .Sliceable}}
+				//gcassert:bce
+				// {{end}}
 				v := col.Get(i)
 				cmpRes := cmpIn_TYPE(v, col, pi.filterRow, pi.hasNulls)
 				if cmpRes == siNull {

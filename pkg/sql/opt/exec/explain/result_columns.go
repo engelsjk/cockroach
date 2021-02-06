@@ -15,7 +15,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/errors"
@@ -163,18 +162,6 @@ func getResultColumns(
 		return colinfo.SequenceSelectColumns, nil
 
 	case explainOp:
-		switch o := args.(*explainArgs).Options; o.Mode {
-		case tree.ExplainPlan:
-			return colinfo.ExplainPlanColumns, nil
-		case tree.ExplainDistSQL:
-			return colinfo.ExplainDistSQLColumns, nil
-		case tree.ExplainVec:
-			return colinfo.ExplainPlanColumns, nil
-		default:
-			return nil, errors.AssertionFailedf("unknown explain mode %v", o.Mode)
-		}
-
-	case explainPlanOp:
 		return colinfo.ExplainPlanColumns, nil
 
 	case explainOptOp:
@@ -187,7 +174,7 @@ func getResultColumns(
 		return colinfo.ShowTraceColumns, nil
 
 	case createTableOp, createTableAsOp, createViewOp, controlJobsOp, controlSchedulesOp,
-		cancelQueriesOp, cancelSessionsOp, errorIfRowsOp, deleteRangeOp:
+		cancelQueriesOp, cancelSessionsOp, createStatisticsOp, errorIfRowsOp, deleteRangeOp:
 		// These operations produce no columns.
 		return nil, nil
 

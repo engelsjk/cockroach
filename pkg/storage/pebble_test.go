@@ -152,6 +152,7 @@ func TestPebbleIterReuse(t *testing.T) {
 		t.Fatalf("expected 10 values, got %d", valuesCount)
 	}
 	iter1.Close()
+	iter1 = nil
 
 	// Create another iterator, with no lower bound but an upper bound that
 	// is lower than the previous iterator's lower bound. This should still result
@@ -159,9 +160,13 @@ func TestPebbleIterReuse(t *testing.T) {
 	// previous iterator should get zeroed.
 	iter2 := batch.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{UpperBound: []byte{10}})
 	valuesCount = 0
-	iter1.SeekGE(MVCCKey{Key: []byte{0}})
+	// This is a peculiar test that is disregarding how local and global keys
+	// affect the behavior of MVCCIterators. This test is writing []byte{0}
+	// which precedes the localPrefix. Ignore the local and preceding keys in
+	// this seek.
+	iter2.SeekGE(MVCCKey{Key: []byte{2}})
 	for ; ; iter2.Next() {
-		ok, err := iter1.Valid()
+		ok, err := iter2.Valid()
 		if err != nil {
 			t.Fatal(err)
 		} else if !ok {
@@ -175,8 +180,8 @@ func TestPebbleIterReuse(t *testing.T) {
 		valuesCount++
 	}
 
-	if valuesCount != 10 {
-		t.Fatalf("expected 10 values, got %d", valuesCount)
+	if valuesCount != 8 {
+		t.Fatalf("expected 8 values, got %d", valuesCount)
 	}
 	iter2.Close()
 }
@@ -295,6 +300,90 @@ func TestPebbleDiskSlowEmit(t *testing.T) {
 	p.eventListener.DiskSlow(pebble.DiskSlowInfo{Duration: 70 * time.Second})
 	require.Equal(t, uint64(1), p.diskSlowCount)
 	require.Equal(t, uint64(1), p.diskStallCount)
+}
+
+func TestPebbleIterConsistency(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	eng := createTestPebbleEngine()
+	defer eng.Close()
+	ts1 := hlc.Timestamp{WallTime: 1}
+	ts2 := hlc.Timestamp{WallTime: 2}
+	k1 := MVCCKey{[]byte("a"), ts1}
+	require.NoError(t, eng.PutMVCC(k1, []byte("a1")))
+
+	roEngine := eng.NewReadOnly()
+	batch := eng.NewBatch()
+
+	require.False(t, eng.ConsistentIterators())
+	require.True(t, roEngine.ConsistentIterators())
+	require.True(t, batch.ConsistentIterators())
+
+	// Since an iterator is created on pebbleReadOnly, pebbleBatch before
+	// writing a newer version of "a", the newer version will not be visible to
+	// iterators that are created later.
+	roEngine.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("a")}).Close()
+	batch.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("a")}).Close()
+	eng.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("a")}).Close()
+
+	// Write a newer version of "a"
+	require.NoError(t, eng.PutMVCC(MVCCKey{[]byte("a"), ts2}, []byte("a2")))
+
+	checkMVCCIter := func(iter MVCCIterator) {
+		iter.SeekGE(MVCCKey{Key: []byte("a")})
+		valid, err := iter.Valid()
+		require.Equal(t, true, valid)
+		require.NoError(t, err)
+		k := iter.UnsafeKey()
+		require.True(t, k1.Equal(k), "expected %s != actual %s", k1.String(), k.String())
+		iter.Next()
+		valid, err = iter.Valid()
+		require.False(t, valid)
+		require.NoError(t, err)
+		iter.Close()
+	}
+	checkEngineIter := func(iter EngineIterator) {
+		valid, err := iter.SeekEngineKeyGE(EngineKey{Key: []byte("a")})
+		require.Equal(t, true, valid)
+		require.NoError(t, err)
+		k, err := iter.UnsafeEngineKey()
+		require.NoError(t, err)
+		require.True(t, k.IsMVCCKey())
+		mvccKey, err := k.ToMVCCKey()
+		require.NoError(t, err)
+		require.True(
+			t, k1.Equal(mvccKey), "expected %s != actual %s", k1.String(), mvccKey.String())
+		valid, err = iter.NextEngineKey()
+		require.False(t, valid)
+		require.NoError(t, err)
+		iter.Close()
+	}
+
+	checkMVCCIter(roEngine.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("b")}))
+	checkMVCCIter(roEngine.NewMVCCIterator(MVCCKeyIterKind, IterOptions{Prefix: true}))
+	checkMVCCIter(batch.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("b")}))
+	checkMVCCIter(batch.NewMVCCIterator(MVCCKeyIterKind, IterOptions{Prefix: true}))
+
+	checkEngineIter(roEngine.NewEngineIterator(IterOptions{UpperBound: []byte("b")}))
+	checkEngineIter(roEngine.NewEngineIterator(IterOptions{Prefix: true}))
+	checkEngineIter(batch.NewEngineIterator(IterOptions{UpperBound: []byte("b")}))
+	checkEngineIter(batch.NewEngineIterator(IterOptions{Prefix: true}))
+
+	// The eng iterator will see both values.
+	iter := eng.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("b")})
+	defer iter.Close()
+	iter.SeekGE(MVCCKey{Key: []byte("a")})
+	count := 0
+	for ; ; iter.Next() {
+		valid, err := iter.Valid()
+		require.NoError(t, err)
+		if !valid {
+			break
+		}
+		count++
+	}
+	require.Equal(t, 2, count)
 }
 
 func BenchmarkMVCCKeyCompare(b *testing.B) {

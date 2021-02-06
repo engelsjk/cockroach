@@ -42,13 +42,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
@@ -173,6 +173,8 @@ type storage struct {
 	// acquisition to renew the lease begins.
 	leaseRenewalTimeout time.Duration
 
+	outstandingLeases *metric.Gauge
+
 	testingKnobs StorageTestingKnobs
 }
 
@@ -200,8 +202,7 @@ func (s storage) acquire(
 		if err := txn.SetUserPriority(roachpb.MaxUserPriority); err != nil {
 			return err
 		}
-		expiration := txn.ReadTimestamp()
-		expiration.WallTime += int64(s.jitteredLeaseDuration())
+		expiration := txn.ReadTimestamp().Add(int64(s.jitteredLeaseDuration()), 0)
 		if expiration.LessEq(minExpiration) {
 			// In the rare circumstances where expiration <= minExpiration
 			// use an expiration based on the minExpiration to guarantee
@@ -259,6 +260,7 @@ func (s storage) acquire(
 		if count != 1 {
 			return errors.Errorf("%s: expected 1 result, found %d", insertLease, count)
 		}
+		s.outstandingLeases.Inc(1)
 		return nil
 	})
 	if err == nil && s.testingKnobs.LeaseAcquiredEvent != nil {
@@ -303,6 +305,7 @@ func (s storage) release(ctx context.Context, stopper *stop.Stopper, lease *stor
 				"expected 1 result, found %d", lease, count)
 		}
 
+		s.outstandingLeases.Dec(1)
 		if s.testingKnobs.LeaseReleasedEvent != nil {
 			s.testingKnobs.LeaseReleasedEvent(
 				lease.id, descpb.DescriptorVersion(lease.version), err)
@@ -389,6 +392,9 @@ func CountLeases(
 	)
 	if err != nil {
 		return 0, err
+	}
+	if values == nil {
+		return 0, errors.New("failed to count leases")
 	}
 	count := int(tree.MustBeDInt(values[0]))
 	return count, nil
@@ -542,10 +548,15 @@ type descriptorState struct {
 		// entry is created with the expiration time of the new lease and
 		// the older entry is removed.
 		active descriptorSet
-		// Indicates that the has been dropped, or is being dropped.
+
+		// Indicates that the descriptor has been, or is being, dropped or taken
+		// offline.
 		// If set, leases are released from the store as soon as their
 		// refcount drops to 0, as opposed to waiting until they expire.
-		dropped bool
+		// This flag will be unset by any subsequent lease acquisition, which can
+		// happen after the table came back online again after having been taken
+		// offline temporarily (as opposed to dropped).
+		takenOffline bool
 
 		// acquisitionsInProgress indicates that at least one caller is currently
 		// in the process of performing an acquisition. This tracking is critical
@@ -864,6 +875,7 @@ func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, erro
 		}
 		t := m.findDescriptorState(id, false /* create */)
 		t.mu.Lock()
+		t.mu.takenOffline = false
 		defer t.mu.Unlock()
 		toRelease, err = t.upsertLocked(newCtx, desc)
 		if err != nil {
@@ -905,9 +917,9 @@ func (t *descriptorState) release(
 		// when the refcount drops to 0). If so, we'll need to mark the lease as
 		// invalid.
 		removeOnceDereferenced = removeOnceDereferenced ||
-			// Release from the store if the descriptor has been dropped; no leases
-			// can be acquired any more.
-			t.mu.dropped ||
+			// Release from the store if the descriptor has been dropped or taken
+			// offline.
+			t.mu.takenOffline ||
 			// Release from the store if the lease is not for the latest
 			// version; only leases for the latest version can be acquired.
 			s != t.mu.active.findNewest()
@@ -983,9 +995,9 @@ func purgeOldVersions(
 		return nil
 	}
 
-	removeInactives := func(drop bool) {
+	removeInactives := func(takenOffline bool) {
 		t.mu.Lock()
-		t.mu.dropped = drop
+		t.mu.takenOffline = takenOffline
 		leases := t.removeInactiveVersions()
 		t.mu.Unlock()
 		for _, l := range leases {
@@ -1035,9 +1047,6 @@ func (t *descriptorState) maybeQueueLeaseRenewal(
 	// Start the renewal. When it finishes, it will reset t.renewalInProgress.
 	return t.stopper.RunAsyncTask(context.Background(),
 		"lease renewal", func(ctx context.Context) {
-			var cleanup func()
-			ctx, cleanup = tracing.EnsureContext(ctx, m.ambientCtx.Tracer, "lease renewal")
-			defer cleanup()
 			t.startLeaseRenewal(ctx, m, id, name)
 		})
 }
@@ -1320,6 +1329,12 @@ func NewLeaseManager(
 			leaseJitterFraction: cfg.DescriptorLeaseJitterFraction,
 			leaseRenewalTimeout: cfg.DescriptorLeaseRenewalTimeout,
 			testingKnobs:        testingKnobs.LeaseStoreTestingKnobs,
+			outstandingLeases: metric.NewGauge(metric.Metadata{
+				Name:        "sql.leases.active",
+				Help:        "The number of outstanding SQL schema leases.",
+				Measurement: "Outstanding leases",
+				Unit:        metric.Unit_COUNT,
+			}),
 		},
 		testingKnobs: testingKnobs,
 		names: nameCache{
@@ -1653,11 +1668,13 @@ func (m *Manager) findDescriptorState(id descpb.ID, create bool) *descriptorStat
 // RefreshLeases starts a goroutine that refreshes the lease manager
 // leases for descriptors received in the latest system configuration via gossip or
 // rangefeeds. This function must be passed a non-nil gossip if
-// VersionRangefeedLeases is not active.
+// RangefeedLeases is not active.
 func (m *Manager) RefreshLeases(
 	ctx context.Context, s *stop.Stopper, db *kv.DB, g gossip.OptionalGossip,
 ) {
-	s.RunWorker(ctx, func(ctx context.Context) {
+	// TODO(ajwerner): is this task needed? refreshLeases appears to already
+	// delegate everything to a goroutine.
+	_ = s.RunAsyncTask(ctx, "refresh-leases", func(ctx context.Context) {
 		m.refreshLeases(ctx, g, db, s)
 	})
 }
@@ -1667,7 +1684,7 @@ func (m *Manager) refreshLeases(
 ) {
 	descUpdateCh := make(chan *descpb.Descriptor)
 	m.watchForUpdates(ctx, s, db, g, descUpdateCh)
-	s.RunWorker(ctx, func(ctx context.Context) {
+	_ = s.RunAsyncTask(ctx, "refresh-leases", func(ctx context.Context) {
 		for {
 			select {
 			case desc := <-descUpdateCh:
@@ -1718,7 +1735,7 @@ func (m *Manager) watchForUpdates(
 	descUpdateCh chan *descpb.Descriptor,
 ) {
 	useRangefeeds := m.testingKnobs.AlwaysUseRangefeeds ||
-		m.storage.settings.Version.IsActive(ctx, clusterversion.VersionRangefeedLeases)
+		m.storage.settings.Version.IsActive(ctx, clusterversion.RangefeedLeases)
 	if useRangefeeds {
 		m.watchForRangefeedUpdates(ctx, s, db, descUpdateCh)
 		return
@@ -1761,17 +1778,17 @@ func (m *Manager) watchForGossipUpdates(
 ) {
 	rawG, err := g.OptionalErr(47150)
 	if err != nil {
-		if v := clusterversion.VersionRangefeedLeases; !m.storage.settings.Version.IsActive(ctx, v) {
-			log.Fatalf(ctx, "required gossip until %v is active: %v", clusterversion.VersionRangefeedLeases, err)
+		if v := clusterversion.RangefeedLeases; !m.storage.settings.Version.IsActive(ctx, v) {
+			log.Fatalf(ctx, "required gossip until %v is active: %v", clusterversion.RangefeedLeases, err)
 		}
 		return
 	}
 
-	s.RunWorker(ctx, func(ctx context.Context) {
-		descKeyPrefix := m.storage.codec.TablePrefix(uint32(systemschema.DescriptorTable.ID))
+	_ = s.RunAsyncTask(ctx, "gossip-updates", func(ctx context.Context) {
+		descKeyPrefix := m.storage.codec.TablePrefix(uint32(systemschema.DescriptorTable.GetID()))
 		// TODO(ajwerner): Add a mechanism to unregister this channel upon
 		// return. NB: this call is allowed to bypass OptionalGossip because
-		// we'll never get here after VersionRangefeedLeases.
+		// we'll never get here after RangefeedLeases.
 		gossipUpdateC := rawG.RegisterSystemConfigChannel()
 		filter := gossip.MakeSystemConfigDeltaFilter(descKeyPrefix)
 
@@ -1810,7 +1827,7 @@ func (m *Manager) watchForRangefeedUpdates(
 			Closer:         s.ShouldQuiesce(),
 		}); r.Next(); i++ {
 			ts := m.getResolvedTimestamp()
-			descKeyPrefix := m.storage.codec.TablePrefix(uint32(systemschema.DescriptorTable.ID))
+			descKeyPrefix := m.storage.codec.TablePrefix(uint32(systemschema.DescriptorTable.GetID()))
 			span := roachpb.Span{
 				Key:    descKeyPrefix,
 				EndKey: descKeyPrefix.PrefixEnd(),
@@ -1865,9 +1882,11 @@ func (m *Manager) watchForRangefeedUpdates(
 		case descUpdateCh <- &descriptor:
 		}
 	}
-	s.RunWorker(ctx, func(ctx context.Context) {
+	_ = s.RunAsyncTask(ctx, "lease-rangefeed", func(ctx context.Context) {
 		for {
 			select {
+			case <-m.stopper.ShouldQuiesce():
+				return
 			case <-ctx.Done():
 				return
 			case e := <-eventCh:
@@ -1950,12 +1969,13 @@ func (m *Manager) waitForRangefeedsToBeUsable(ctx context.Context, s *stop.Stopp
 	upgradeChan := make(chan struct{})
 	timer := timeutil.NewTimer()
 	timer.Reset(0)
-	s.RunWorker(ctx, func(ctx context.Context) {
+	// NB: we intentionally do *not* close upgradeChan if the task never starts.
+	_ = s.RunAsyncTask(ctx, "wait-rangefeed-version", func(ctx context.Context) {
 		for {
 			select {
 			case <-timer.C:
 				timer.Read = true
-				if m.storage.settings.Version.IsActive(ctx, clusterversion.VersionRangefeedLeases) {
+				if m.storage.settings.Version.IsActive(ctx, clusterversion.RangefeedLeases) {
 					close(upgradeChan)
 					return
 				}
@@ -1993,14 +2013,14 @@ func (m *Manager) getResolvedTimestamp() hlc.Timestamp {
 var leaseRefreshLimit = settings.RegisterIntSetting(
 	"sql.tablecache.lease.refresh_limit",
 	"maximum number of descriptors to periodically refresh leases for",
-	50,
+	500,
 )
 
 // PeriodicallyRefreshSomeLeases so that leases are fresh and can serve
 // traffic immediately.
 // TODO(vivek): Remove once epoch based table leases are implemented.
 func (m *Manager) PeriodicallyRefreshSomeLeases(ctx context.Context) {
-	m.stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = m.stopper.RunAsyncTask(ctx, "lease-refresher", func(ctx context.Context) {
 		if m.storage.leaseDuration <= 0 {
 			return
 		}
@@ -2037,9 +2057,9 @@ func (m *Manager) refreshSomeLeases(ctx context.Context) {
 			break
 		}
 		desc.mu.Lock()
-		dropped := desc.mu.dropped
+		takenOffline := desc.mu.takenOffline
 		desc.mu.Unlock()
-		if !dropped {
+		if !takenOffline {
 			ids = append(ids, k)
 		}
 	}
@@ -2079,7 +2099,7 @@ func (m *Manager) DeleteOrphanedLeases(timeThreshold int64) {
 
 	// Run as async worker to prevent blocking the main server Start method.
 	// Exit after releasing all the orphaned leases.
-	m.stopper.RunWorker(context.Background(), func(ctx context.Context) {
+	_ = m.stopper.RunAsyncTask(context.Background(), "del-orphaned-leases", func(ctx context.Context) {
 		// This could have been implemented using DELETE WHERE, but DELETE WHERE
 		// doesn't implement AS OF SYSTEM TIME.
 
@@ -2118,7 +2138,6 @@ SELECT "descID", version, expiration FROM system.public.lease AS OF SYSTEM TIME 
 					log.Infof(ctx, "released orphaned lease: %+v", lease)
 					wg.Done()
 				}); err != nil {
-				log.Warningf(ctx, "did not release orphaned lease: %+v, err = %s", lease, err)
 				wg.Done()
 			}
 		}
@@ -2135,12 +2154,25 @@ func (m *Manager) Codec() keys.SQLCodec {
 	return m.storage.codec
 }
 
+// Metrics contains a pointer to all relevant lease.Manager metrics, for
+// registration.
+type Metrics struct {
+	OutstandingLeases *metric.Gauge
+}
+
+// MetricsStruct returns a struct containing all of this Manager's metrics.
+func (m *Manager) MetricsStruct() Metrics {
+	return Metrics{
+		OutstandingLeases: m.storage.outstandingLeases,
+	}
+}
+
 // VisitLeases introspects the state of leases managed by the Manager.
 //
 // TODO(ajwerner): consider refactoring the function to take a struct, maybe
 // called LeaseInfo.
 func (m *Manager) VisitLeases(
-	f func(desc catalog.Descriptor, dropped bool, refCount int, expiration tree.DTimestamp) (wantMore bool),
+	f func(desc catalog.Descriptor, takenOffline bool, refCount int, expiration tree.DTimestamp) (wantMore bool),
 ) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2149,7 +2181,7 @@ func (m *Manager) VisitLeases(
 			ts.mu.Lock()
 			defer ts.mu.Unlock()
 
-			dropped := ts.mu.dropped
+			takenOffline := ts.mu.takenOffline
 
 			for _, state := range ts.mu.active.data {
 				state.mu.Lock()
@@ -2161,7 +2193,7 @@ func (m *Manager) VisitLeases(
 					continue
 				}
 
-				if !f(state.Descriptor, dropped, refCount, lease.expiration) {
+				if !f(state.Descriptor, takenOffline, refCount, lease.expiration) {
 					return false
 				}
 			}
@@ -2190,4 +2222,10 @@ func (m *Manager) TestingAcquireAndAssertMinVersion(
 		return nil, hlc.Timestamp{}, err
 	}
 	return desc.Descriptor, desc.expiration, nil
+}
+
+// TestingOutstandingLeasesGauge returns the outstanding leases gauge that is
+// used by this lease manager.
+func (m *Manager) TestingOutstandingLeasesGauge() *metric.Gauge {
+	return m.storage.outstandingLeases
 }

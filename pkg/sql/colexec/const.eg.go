@@ -184,9 +184,9 @@ func (c constBoolOp) Next(ctx context.Context) coldata.Batch {
 					col[i] = c.constVal
 				}
 			} else {
-				col = col[0:n]
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
+					//gcassert:bce
 					col[i] = c.constVal
 				}
 			}
@@ -232,9 +232,6 @@ func (c constBytesOp) Next(ctx context.Context) coldata.Batch {
 					col.Set(i, c.constVal)
 				}
 			} else {
-				col = col
-				_ = 0
-				_ = n
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
 					col.Set(i, c.constVal)
@@ -282,9 +279,9 @@ func (c constDecimalOp) Next(ctx context.Context) coldata.Batch {
 					col[i].Set(&c.constVal)
 				}
 			} else {
-				col = col[0:n]
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
+					//gcassert:bce
 					col[i].Set(&c.constVal)
 				}
 			}
@@ -330,9 +327,9 @@ func (c constInt16Op) Next(ctx context.Context) coldata.Batch {
 					col[i] = c.constVal
 				}
 			} else {
-				col = col[0:n]
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
+					//gcassert:bce
 					col[i] = c.constVal
 				}
 			}
@@ -378,9 +375,9 @@ func (c constInt32Op) Next(ctx context.Context) coldata.Batch {
 					col[i] = c.constVal
 				}
 			} else {
-				col = col[0:n]
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
+					//gcassert:bce
 					col[i] = c.constVal
 				}
 			}
@@ -426,9 +423,9 @@ func (c constInt64Op) Next(ctx context.Context) coldata.Batch {
 					col[i] = c.constVal
 				}
 			} else {
-				col = col[0:n]
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
+					//gcassert:bce
 					col[i] = c.constVal
 				}
 			}
@@ -474,9 +471,9 @@ func (c constFloat64Op) Next(ctx context.Context) coldata.Batch {
 					col[i] = c.constVal
 				}
 			} else {
-				col = col[0:n]
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
+					//gcassert:bce
 					col[i] = c.constVal
 				}
 			}
@@ -522,9 +519,9 @@ func (c constTimestampOp) Next(ctx context.Context) coldata.Batch {
 					col[i] = c.constVal
 				}
 			} else {
-				col = col[0:n]
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
+					//gcassert:bce
 					col[i] = c.constVal
 				}
 			}
@@ -570,9 +567,9 @@ func (c constIntervalOp) Next(ctx context.Context) coldata.Batch {
 					col[i] = c.constVal
 				}
 			} else {
-				col = col[0:n]
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
+					//gcassert:bce
 					col[i] = c.constVal
 				}
 			}
@@ -618,7 +615,6 @@ func (c constDatumOp) Next(ctx context.Context) coldata.Batch {
 					col.Set(i, c.constVal)
 				}
 			} else {
-				col = col.Slice(0, n)
 				_ = col.Get(n - 1)
 				for i := 0; i < n; i++ {
 					col.Set(i, c.constVal)

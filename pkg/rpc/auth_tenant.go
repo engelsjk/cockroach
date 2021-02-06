@@ -99,6 +99,7 @@ var reqMethodAllowlist = [...]bool{
 	roachpb.QueryIntent:    true,
 	roachpb.InitPut:        true,
 	roachpb.AddSSTable:     true,
+	roachpb.Export:         true,
 	roachpb.Refresh:        true,
 	roachpb.RefreshRange:   true,
 }
@@ -160,6 +161,7 @@ func (a tenantAuthorizer) authGossipSubscription(
 // keyspace that GossipSubscription RPC invocations are allowed to touch.
 // WIP: can't import gossip directly.
 var gossipSubscriptionPatternAllowlist = []string{
+	"cluster-id",
 	"node:.*",
 	"system-db",
 }

@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logconfig"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -78,9 +78,7 @@ var serverCfg = func() server.Config {
 	st := cluster.MakeClusterSettings()
 	settings.SetCanonicalValuesContainer(&st.SV)
 
-	s := server.MakeConfig(context.Background(), st)
-	s.AuditLogDirName = &sqlAuditLogDir
-	return s
+	return server.MakeConfig(context.Background(), st)
 }()
 
 // setServerContextDefaults set the default values in serverCfg.  This
@@ -93,6 +91,7 @@ func setServerContextDefaults() {
 	serverCfg.ExternalIODirConfig = base.ExternalIODirConfig{}
 	serverCfg.GoroutineDumpDirName = ""
 	serverCfg.HeapProfileDirName = ""
+	serverCfg.CPUProfileDirName = ""
 
 	serverCfg.AutoInitializeCluster = false
 	serverCfg.KVConfig.ReadyFn = nil
@@ -100,6 +99,9 @@ func setServerContextDefaults() {
 	serverCfg.KVConfig.JoinList = nil
 	serverCfg.KVConfig.JoinPreferSRVRecords = false
 	serverCfg.KVConfig.DefaultSystemZoneConfig = zonepb.DefaultSystemZoneConfig()
+	// Reset the store list.
+	storeSpec, _ := base.NewStoreSpec(server.DefaultStorePath)
+	serverCfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{storeSpec}}
 
 	serverCfg.TenantKVAddrs = []string{"127.0.0.1:26257"}
 
@@ -123,11 +125,17 @@ type cliContext struct {
 	// is, the commands executed are extremely likely to be *input* from
 	// a human user: the standard input is a terminal and `-e` was not
 	// used (the shell has a prompt).
+	//
+	// Refer to README.md to understand the general design guidelines for
+	// CLI utilities with interactive vs non-interactive input.
 	isInteractive bool
 
 	// terminalOutput indicates whether output is going to a terminal,
 	// that is, it is not going to a file, another program for automated
 	// processing, etc.: the standard output is a terminal.
+	//
+	// Refer to README.md to understand the general design guidelines for
+	// CLI utilities with terminal vs non-terminal output.
 	terminalOutput bool
 
 	// tableDisplayFormat indicates how to format result tables.
@@ -164,11 +172,32 @@ type cliContext struct {
 	// provided this way.
 	// TODO(knz): Relax this when SCRAM is implemented.
 	allowUnencryptedClientPassword bool
+
+	// logConfigInput is the YAML input for the logging configuration.
+	logConfigInput settableString
+	// logConfig is the resulting logging configuration after the input
+	// configuration has been parsed and validated.
+	logConfig logconfig.Config
+	// deprecatedLogOverrides is the legacy pre-v21.1 discrete flag
+	// overrides for the logging configuration.
+	// TODO(knz): Deprecated in v21.1. Remove this.
+	deprecatedLogOverrides *logConfigFlags
+	// ambiguousLogDir is populated during setupLogging() to indicate
+	// that no log directory was specified and there were multiple
+	// on-disk stores.
+	ambiguousLogDir bool
+
+	// For `cockroach version --build-tag`.
+	showVersionUsingOnlyBuildTag bool
 }
 
 // cliCtx captures the command-line parameters common to most CLI utilities.
 // See below for defaults.
-var cliCtx = cliContext{Config: baseCfg}
+var cliCtx = cliContext{
+	Config: baseCfg,
+	// TODO(knz): Deprecated in v21.1. Remove this.
+	deprecatedLogOverrides: newLogConfigOverrides(),
+}
 
 // setCliContextDefaults set the default values in cliCtx.  This
 // function is called by initCLIDefaults() and thus re-called in every
@@ -195,6 +224,12 @@ func setCliContextDefaults() {
 	cliCtx.sqlConnDBName = ""
 	cliCtx.extraConnURLOptions = nil
 	cliCtx.allowUnencryptedClientPassword = false
+	cliCtx.logConfigInput = settableString{s: ""}
+	cliCtx.logConfig = logconfig.Config{}
+	cliCtx.ambiguousLogDir = false
+	// TODO(knz): Deprecated in v21.1. Remove this.
+	cliCtx.deprecatedLogOverrides.reset()
+	cliCtx.showVersionUsingOnlyBuildTag = false
 }
 
 // sqlCtx captures the configuration of the `sql` command.
@@ -234,6 +269,11 @@ var sqlCtx = struct {
 	// "intelligent behavior" in the SQL shell as possible and become
 	// more verbose (sets echo).
 	debugMode bool
+
+	// embeddedMode, when set, reduces the amount of informational
+	// messages printed out to exclude details that are not
+	// under user's control when the shell is run by a playground environment.
+	embeddedMode bool
 
 	// Determines whether to display server execution timings in the CLI.
 	enableServerExecutionTimings bool
@@ -395,9 +435,6 @@ var startCtx struct {
 	// pidFile indicates the file to which the server writes its PID
 	// when it is ready.
 	pidFile string
-
-	// logging settings specific to file logging.
-	logDir log.DirName
 
 	// geoLibsDir is used to specify locations of the GEOS library.
 	geoLibsDir string

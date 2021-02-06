@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
@@ -128,7 +129,7 @@ func (c *CustomFuncs) GenerateMergeJoins(
 //  1. The index has all the columns we need; this is the simple case, where we
 //     generate a LookupJoin expression in the current group:
 //
-//         Join                       LookupJoin(t@idx))
+//         Join                       LookupJoin(t@idx)
 //         /   \                           |
 //        /     \            ->            |
 //      Input  Scan(t)                   Input
@@ -161,6 +162,45 @@ func (c *CustomFuncs) GenerateMergeJoins(
 //     "sides" (in this example x,y on the left and z on the right) but there is
 //     no overlap.
 //
+// A lookup join can be created when the ON condition or implicit filters from
+// CHECK constraints and computed columns constrain a prefix of the index
+// columns to non-ranging constant values. To support this, the constant values
+// are cross-joined with the input and used as key columns for the parent lookup
+// join.
+//
+// For example, consider the tables and query below.
+//
+//   CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
+//   CREATE TABLE xyz (
+//     x INT PRIMARY KEY,
+//     y INT,
+//     z INT NOT NULL,
+//     CHECK z IN (1, 2, 3),
+//     INDEX (z, y)
+//   )
+//   SELECT a, x FROM abc JOIN xyz ON a=y
+//
+// GenerateLookupJoins will perform the following transformation.
+//
+//         Join                       LookupJoin(t@idx)
+//         /   \                           |
+//        /     \            ->            |
+//      Input  Scan(t)                   Join
+//                                       /   \
+//                                      /     \
+//                                    Input  Values(1, 2, 3)
+//
+// If a column is constrained to a single constant value, inlining normalization
+// rules will reduce the cross join into a project.
+//
+//         Join                       LookupJoin(t@idx)
+//         /   \                           |
+//        /     \            ->            |
+//      Input  Scan(t)                  Project
+//                                         |
+//                                         |
+//                                       Input
+//
 func (c *CustomFuncs) GenerateLookupJoins(
 	grp memo.RelExpr,
 	joinType opt.Operator,
@@ -181,6 +221,12 @@ func (c *CustomFuncs) GenerateLookupJoins(
 		return
 	}
 
+	// Generate implicit filters from CHECK constraints and computed columns as
+	// optional filters to help generate lookup join keys.
+	optionalFilters := c.checkConstraintFilters(scanPrivate.Table)
+	computedColFilters := c.computedColFilters(scanPrivate, on, optionalFilters)
+	optionalFilters = append(optionalFilters, computedColFilters...)
+
 	var pkCols opt.ColList
 	var iter scanIndexIter
 	iter.Init(c.e.mem, &c.im, scanPrivate, on, rejectInvertedIndexes)
@@ -189,8 +235,8 @@ func (c *CustomFuncs) GenerateLookupJoins(
 		// an equality with another column or a constant.
 		numIndexKeyCols := index.LaxKeyColumnCount()
 
-		var projections memo.ProjectionsExpr
 		var constFilters memo.FiltersExpr
+		allFilters := append(onFilters, optionalFilters...)
 
 		// Check if the first column in the index has an equality constraint, or if
 		// it is constrained to a constant value. This check doesn't guarantee that
@@ -198,7 +244,7 @@ func (c *CustomFuncs) GenerateLookupJoins(
 		// in most cases.
 		firstIdxCol := scanPrivate.Table.IndexColumnID(index, 0)
 		if _, ok := rightEq.Find(firstIdxCol); !ok {
-			if _, _, ok := c.findConstantFilter(onFilters, firstIdxCol); !ok {
+			if _, _, ok := c.findJoinFilterConstants(allFilters, firstIdxCol); !ok {
 				return
 			}
 		}
@@ -211,7 +257,6 @@ func (c *CustomFuncs) GenerateLookupJoins(
 
 		lookupJoin.KeyCols = make(opt.ColList, 0, numIndexKeyCols)
 		rightSideCols := make(opt.ColList, 0, numIndexKeyCols)
-		needProjection := false
 
 		// All the lookup conditions must apply to the prefix of the index and so
 		// the projected columns created must be created in order.
@@ -223,36 +268,44 @@ func (c *CustomFuncs) GenerateLookupJoins(
 				continue
 			}
 
-			// Try to find a filter that constrains this column to a non-NULL constant
-			// value. We cannot use a NULL value because the lookup join implements
-			// logic equivalent to simple equality between columns (where NULL never
-			// equals anything).
-			foundVal, onIdx, ok := c.findConstantFilter(onFilters, idxCol)
-			if !ok || foundVal == tree.DNull {
+			// Try to find a filter that constrains this column to non-NULL
+			// constant values. We cannot use a NULL value because the lookup
+			// join implements logic equivalent to simple equality between
+			// columns (where NULL never equals anything).
+			foundVals, allIdx, ok := c.findJoinFilterConstants(allFilters, idxCol)
+			if !ok {
 				break
 			}
 
-			// We will project this constant value in the input to make it an equality
-			// column.
-			if projections == nil {
-				projections = make(memo.ProjectionsExpr, 0, numIndexKeyCols-j)
+			if len(foundVals) > 1 && (joinType == opt.LeftJoinOp || joinType == opt.AntiJoinOp) {
+				// We cannot create a lookup join in this case, because constructing a
+				// cross join with foundVals will increase the size of the input. As a
+				// result, non-matching input rows will show up more than once in the
+				// output, which is incorrect (see #59615).
+				// TODO(rytaft,mgartner): find a way to create a lookup join for this
+				// case.
+				return
+			}
+
+			// We will join these constant values with the input to make
+			// equality columns for the lookup join.
+			if constFilters == nil {
 				constFilters = make(memo.FiltersExpr, 0, numIndexKeyCols-j)
 			}
 
 			idxColType := c.e.f.Metadata().ColumnMeta(idxCol).Type
-			constColID := c.e.f.Metadata().AddColumn(
-				fmt.Sprintf("project_const_col_@%d", idxCol),
+			constColAlias := fmt.Sprintf("lookup_join_const_col_@%d", idxCol)
+			join, constColID := c.constructJoinWithConstants(
+				lookupJoin.Input,
+				foundVals,
 				idxColType,
+				constColAlias,
 			)
-			projections = append(projections, c.e.f.ConstructProjectionsItem(
-				c.e.f.ConstructConst(foundVal, idxColType),
-				constColID,
-			))
 
-			needProjection = true
+			lookupJoin.Input = join
 			lookupJoin.KeyCols = append(lookupJoin.KeyCols, constColID)
 			rightSideCols = append(rightSideCols, idxCol)
-			constFilters = append(constFilters, onFilters[onIdx])
+			constFilters = append(constFilters, allFilters[allIdx])
 		}
 
 		if len(lookupJoin.KeyCols) == 0 {
@@ -264,11 +317,6 @@ func (c *CustomFuncs) GenerateLookupJoins(
 		// A lookup join will drop any input row which contains NULLs, so a lax key
 		// is sufficient.
 		lookupJoin.LookupColsAreTableKey = tableFDs.ColsAreLaxKey(rightSideCols.ToSet())
-
-		// Construct the projections for the constant columns.
-		if needProjection {
-			lookupJoin.Input = c.e.f.ConstructProject(input, projections, input.Relational().OutputCols)
-		}
 
 		// Remove the redundant filters and update the lookup condition.
 		lookupJoin.On = memo.ExtractRemainingJoinFilters(onFilters, lookupJoin.KeyCols, rightSideCols)
@@ -336,11 +384,7 @@ func (c *CustomFuncs) GenerateLookupJoins(
 		}
 
 		if pkCols == nil {
-			pkIndex := md.Table(scanPrivate.Table).Index(cat.PrimaryIndex)
-			pkCols = make(opt.ColList, pkIndex.KeyColumnCount())
-			for i := range pkCols {
-				pkCols[i] = scanPrivate.Table.IndexColumnID(pkIndex, i)
-			}
+			pkCols = c.getPkCols(scanPrivate.Table)
 		}
 
 		// The lower LookupJoin must return all PK columns (they are needed as key
@@ -431,39 +475,148 @@ func (c *CustomFuncs) GenerateInvertedJoins(
 
 	inputCols := input.Relational().OutputCols
 	var pkCols opt.ColList
+	var newScanPrivate *memo.ScanPrivate
+
+	eqColsAndOptionalFiltersCalculated := false
+	var leftEqCols opt.ColList
+	var rightEqCols opt.ColList
+	var rightSideCols opt.ColList
+	var optionalFilters memo.FiltersExpr
 
 	var iter scanIndexIter
 	iter.Init(c.e.mem, &c.im, scanPrivate, on, rejectNonInvertedIndexes)
-	iter.ForEach(func(index cat.Index, on memo.FiltersExpr, indexCols opt.ColSet, isCovering bool) {
-		// Check whether the filter can constrain the index.
+	iter.ForEach(func(index cat.Index, onFilters memo.FiltersExpr, indexCols opt.ColSet, isCovering bool) {
+		invertedJoin := memo.InvertedJoinExpr{Input: input}
+		numPrefixCols := index.NonInvertedPrefixColumnCount()
+
+		var allFilters memo.FiltersExpr
+		if numPrefixCols > 0 {
+			// Only calculate the left and right equality columns and optional
+			// filters if there is a multi-column inverted index.
+			if !eqColsAndOptionalFiltersCalculated {
+				inputProps := input.Relational()
+				leftEqCols, rightEqCols = memo.ExtractJoinEqualityColumns(inputProps.OutputCols, scanPrivate.Cols, onFilters)
+
+				// Generate implicit filters from CHECK constraints and computed
+				// columns as optional filters. We build the computed column
+				// optional filters from the original on filters, not the
+				// filters within the context of the iter.ForEach callback. The
+				// latter may be reduced during partial index implication and
+				// using them here would result in a reduced set of optional
+				// filters.
+				optionalFilters = c.checkConstraintFilters(scanPrivate.Table)
+				computedColFilters := c.computedColFilters(scanPrivate, on, optionalFilters)
+				optionalFilters = append(optionalFilters, computedColFilters...)
+
+				eqColsAndOptionalFiltersCalculated = true
+			}
+
+			// Combine the ON filters and optional filters together. This set of
+			// filters will be used to attempt to constrain non-inverted prefix
+			// columns of the multi-column inverted index.
+			allFilters = append(onFilters, optionalFilters...)
+		}
+
+		// The non-inverted prefix columns of a multi-column inverted index must
+		// be constrained in order to perform an inverted join. We attempt to
+		// constrain each prefix column to non-ranging constant values. These
+		// values are joined with the input to create key columns for the
+		// InvertedJoin, similar to GenerateLookupJoins.
+		var constFilters memo.FiltersExpr
+		for i := 0; i < numPrefixCols; i++ {
+			prefixCol := scanPrivate.Table.IndexColumnID(index, i)
+
+			// Check if prefixCol is constrained by an equality constraint.
+			if eqIdx, ok := rightEqCols.Find(prefixCol); ok {
+				invertedJoin.PrefixKeyCols = append(invertedJoin.PrefixKeyCols, leftEqCols[eqIdx])
+				rightSideCols = append(rightSideCols, prefixCol)
+				continue
+			}
+
+			// Try to constrain prefixCol to constant, non-ranging values.
+			foundVals, allIdx, ok := c.findJoinFilterConstants(allFilters, prefixCol)
+			if !ok {
+				// Cannot constrain prefix column and therefore cannot generate
+				// an inverted join.
+				return
+			}
+
+			if len(foundVals) > 1 && (joinType == opt.LeftJoinOp || joinType == opt.AntiJoinOp) {
+				// We cannot create an inverted join in this case, because constructing
+				// a cross join with foundVals will increase the size of the input. As a
+				// result, non-matching input rows will show up more than once in the
+				// output, which is incorrect (see #59615).
+				// TODO(rytaft,mgartner): find a way to create an inverted join for this
+				// case.
+				return
+			}
+
+			// We will join these constant values with the input to make
+			// equality columns for the inverted join.
+			if constFilters == nil {
+				constFilters = make(memo.FiltersExpr, 0, numPrefixCols)
+			}
+
+			prefixColType := c.e.f.Metadata().ColumnMeta(prefixCol).Type
+			constColAlias := fmt.Sprintf("inverted_join_const_col_@%d", prefixCol)
+			join, constColID := c.constructJoinWithConstants(
+				invertedJoin.Input,
+				foundVals,
+				prefixColType,
+				constColAlias,
+			)
+
+			invertedJoin.Input = join
+			invertedJoin.PrefixKeyCols = append(invertedJoin.PrefixKeyCols, constColID)
+			constFilters = append(constFilters, allFilters[allIdx])
+		}
+
+		// Remove the redundant filters and update the ON condition if there are
+		// non-inverted prefix columns that have been constrained.
+		if len(rightSideCols) > 0 || len(constFilters) > 0 {
+			onFilters = memo.ExtractRemainingJoinFilters(onFilters, invertedJoin.PrefixKeyCols, rightSideCols)
+			onFilters.RemoveCommonFilters(constFilters)
+			invertedJoin.ConstFilters = constFilters
+		}
+
+		// Check whether the filter can constrain the inverted column.
 		invertedExpr := invertedidx.TryJoinInvertedIndex(
-			c.e.evalCtx.Context, c.e.f, on, scanPrivate.Table, index, inputCols,
+			c.e.evalCtx.Context, c.e.f, onFilters, scanPrivate.Table, index, inputCols,
 		)
 		if invertedExpr == nil {
 			return
 		}
 
-		// All geospatial and JSON inverted joins that are currently supported are
-		// not covering, so we must wrap them in an index join.
-		// TODO(rytaft): Avoid adding an index join if possible for Array inverted
-		//  joins.
+		// All geospatial and JSON inverted joins that are currently supported
+		// are not covering, so we must wrap them in an index join.
+		// TODO(rytaft): Avoid adding an index join if possible for Array
+		// inverted joins.
 		if scanPrivate.Flags.NoIndexJoin {
 			return
 		}
 
 		if pkCols == nil {
-			tab := c.e.mem.Metadata().Table(scanPrivate.Table)
-			pkIndex := tab.Index(cat.PrimaryIndex)
-			pkCols = make(opt.ColList, pkIndex.KeyColumnCount())
-			for i := range pkCols {
-				pkCols[i] = scanPrivate.Table.IndexColumnID(pkIndex, i)
-			}
+			pkCols = c.getPkCols(scanPrivate.Table)
 		}
 
 		// Though the index is marked as containing the column being indexed, it
 		// doesn't actually, and it is only valid to extract the primary key
-		// columns from it.
+		// columns and non-inverted prefix columns from it.
 		indexCols = pkCols.ToSet()
+		for i, n := 0, index.NonInvertedPrefixColumnCount(); i < n; i++ {
+			prefixCol := scanPrivate.Table.IndexColumnID(index, i)
+			indexCols.Add(prefixCol)
+		}
+
+		// Create a new ScanPrivate, which will be used below for the inverted join.
+		// Note: this must happen before the continuation column is created to ensure
+		// that the continuation column will have the highest column ID.
+		//
+		// See the comment where this newScanPrivate is used below in mapInvertedJoin
+		// for details about why it's needed.
+		if newScanPrivate == nil {
+			newScanPrivate = c.DuplicateScanPrivate(scanPrivate)
+		}
 
 		continuationCol := opt.ColumnID(0)
 		invertedJoinType := joinType
@@ -478,13 +631,11 @@ func (c *CustomFuncs) GenerateInvertedJoins(
 			continuationCol = c.constructContinuationColumnForPairedJoin()
 			invertedJoinType = opt.InnerJoinOp
 		}
-		invertedJoin := memo.InvertedJoinExpr{Input: input}
 		invertedJoin.JoinPrivate = *joinPrivate
 		invertedJoin.JoinType = invertedJoinType
 		invertedJoin.Table = scanPrivate.Table
 		invertedJoin.Index = index.Ordinal()
 		invertedJoin.InvertedExpr = invertedExpr
-		invertedJoin.InvertedCol = scanPrivate.Table.IndexColumnID(index, 0)
 		invertedJoin.Cols = indexCols.Union(inputCols)
 		if continuationCol != 0 {
 			invertedJoin.Cols.Add(continuationCol)
@@ -497,8 +648,24 @@ func (c *CustomFuncs) GenerateInvertedJoins(
 		// ON may have some conditions that are bound by the columns in the index
 		// and some conditions that refer to other columns. We can put the former
 		// in the InvertedJoin and the latter in the index join.
-		invertedJoin.On = c.ExtractBoundConditions(on, invertedJoin.Cols)
-		indexJoin.On = c.ExtractUnboundConditions(on, invertedJoin.Cols)
+		invertedJoin.On = c.ExtractBoundConditions(onFilters, invertedJoin.Cols)
+		indexJoin.On = c.ExtractUnboundConditions(onFilters, invertedJoin.Cols)
+
+		// Map the inverted join to use the new table and column IDs from the
+		// newScanPrivate created above. We want to make sure that the column IDs
+		// returned by the inverted join are different from the IDs that will be
+		// returned by the top level index join.
+		//
+		// In addition to avoiding subtle bugs in the optimizer when the same
+		// column ID is reused, this mapping is also essential for correct behavior
+		// at execution time in the case of a left paired join. This is because a
+		// row that matches in the first left join (the inverted join) might be a
+		// false positive and fail to match in the second left join (the lookup
+		// join). If an original left row has no matches after the second left join,
+		// it must appear as a null-extended row with all right-hand columns null.
+		// If one of the right-hand columns comes from the inverted join, however,
+		// it might incorrectly show up as non-null (see #58892).
+		c.mapInvertedJoin(&invertedJoin, indexCols, newScanPrivate)
 
 		indexJoin.Input = c.e.f.ConstructInvertedJoin(
 			invertedJoin.Input,
@@ -508,62 +675,140 @@ func (c *CustomFuncs) GenerateInvertedJoins(
 		indexJoin.JoinType = joinType
 		indexJoin.Table = scanPrivate.Table
 		indexJoin.Index = cat.PrimaryIndex
-		indexJoin.KeyCols = pkCols
+		indexJoin.KeyCols = c.getPkCols(invertedJoin.Table)
 		indexJoin.Cols = scanPrivate.Cols.Union(inputCols)
 		indexJoin.LookupColsAreTableKey = true
 		if continuationCol != 0 {
 			indexJoin.IsSecondJoinInPairedJoiner = true
 		}
 
-		// If this is not a semi- or anti-join, create the LookupJoin for the index
-		// join in the same group.
-		if joinType != opt.SemiJoinOp && joinType != opt.AntiJoinOp {
-			c.e.mem.AddLookupJoinToGroup(&indexJoin, grp)
-			return
+		// If this is a semi- or anti-join, ensure the columns do not include any
+		// unneeded right-side columns.
+		if joinType == opt.SemiJoinOp || joinType == opt.AntiJoinOp {
+			indexJoin.Cols = inputCols.Union(indexJoin.On.OuterCols())
 		}
 
-		// Some semi and anti joins require a project on top (see below). Avoid
-		// adding that projection if it will be a no-op (i.e., we already have
-		// the correct output columns from the lookup join).
-		outputCols := indexJoin.Cols.Intersection(indexJoin.Input.Relational().OutputCols)
-		if outputCols.SubsetOf(inputCols) {
-			c.e.mem.AddLookupJoinToGroup(&indexJoin, grp)
-			return
-		}
-
-		// For some semi and anti joins, we need to add a project on top to ensure
-		// that only the original left-side columns are output. Normally, the
-		// LookupJoin would be able to perform the necessary projection for semi
-		// and anti joins by intersecting Cols with the OutputCols of its input,
-		// but that doesn't work for paired joins since the input to the second
-		// join may include more columns than the original input.
-		var project memo.ProjectExpr
-		project.Input = c.e.f.ConstructLookupJoin(
-			indexJoin.Input,
-			indexJoin.On,
-			&indexJoin.LookupJoinPrivate,
-		)
-		project.Passthrough = grp.Relational().OutputCols
-		c.e.mem.AddProjectToGroup(&project, grp)
+		// Create the LookupJoin for the index join in the same group.
+		c.e.mem.AddLookupJoinToGroup(&indexJoin, grp)
 	})
 }
 
-// findConstantFilter tries to find a filter that is exactly equivalent to
-// constraining the given column to a constant value. Note that the constant
-// value can be NULL (for an `x IS NULL` filter).
-func (c *CustomFuncs) findConstantFilter(
+// getPkCols gets the primary key columns for the given table as a ColList.
+func (c *CustomFuncs) getPkCols(tabID opt.TableID) opt.ColList {
+	tab := c.e.mem.Metadata().Table(tabID)
+	pkIndex := tab.Index(cat.PrimaryIndex)
+	pkCols := make(opt.ColList, pkIndex.KeyColumnCount())
+	for i := range pkCols {
+		pkCols[i] = tabID.IndexColumnID(pkIndex, i)
+	}
+	return pkCols
+}
+
+// mapInvertedJoin maps the given inverted join to use the table and columns
+// provided in newScanPrivate. The inverted join is modified in place. indexCols
+// contains the pre-calculated index columns used by the given invertedJoin.
+//
+// Note that columns from the input are not mapped. For example, PrefixKeyCols
+// does not need to be mapped below since it only contains input columns.
+func (c *CustomFuncs) mapInvertedJoin(
+	invertedJoin *memo.InvertedJoinExpr, indexCols opt.ColSet, newScanPrivate *memo.ScanPrivate,
+) {
+	tabID := invertedJoin.Table
+	newTabID := newScanPrivate.Table
+
+	// Get the catalog index (same for both new and old tables).
+	index := c.e.mem.Metadata().TableMeta(tabID).Table.Index(invertedJoin.Index)
+
+	// Though the index is marked as containing the column being indexed, it
+	// doesn't actually, and it is only valid to extract the primary key
+	// columns and non-inverted prefix columns from it.
+	newPkCols := c.getPkCols(newTabID)
+	newIndexCols := newPkCols.ToSet()
+	for i, n := 0, index.NonInvertedPrefixColumnCount(); i < n; i++ {
+		prefixCol := newTabID.IndexColumnID(index, i)
+		newIndexCols.Add(prefixCol)
+	}
+
+	// Get the source and destination ColSets, including the inverted source
+	// columns, which will be used in the invertedExpr.
+	srcCols := indexCols.Copy()
+	dstCols := newIndexCols.Copy()
+	ord := index.VirtualInvertedColumn().InvertedSourceColumnOrdinal()
+	invertedSourceCol := tabID.ColumnID(ord)
+	newInvertedSourceCol := newTabID.ColumnID(ord)
+	srcCols.Add(invertedSourceCol)
+	dstCols.Add(newInvertedSourceCol)
+
+	invertedJoin.Table = newTabID
+	invertedJoin.InvertedExpr = c.mapScalarExprCols(invertedJoin.InvertedExpr, srcCols, dstCols)
+	invertedJoin.Cols = invertedJoin.Cols.Difference(indexCols).Union(newIndexCols)
+	invertedJoin.ConstFilters = c.MapFilterCols(invertedJoin.ConstFilters, srcCols, dstCols)
+	invertedJoin.On = c.MapFilterCols(invertedJoin.On, srcCols, dstCols)
+}
+
+// findJoinFilterConstants tries to find a filter that is exactly equivalent to
+// constraining the given column to a constant value or a set of constant
+// values. If successful, the constant values and the index of the constraining
+// FiltersItem are returned. Note that the returned constant values do not
+// contain NULL.
+func (c *CustomFuncs) findJoinFilterConstants(
 	filters memo.FiltersExpr, col opt.ColumnID,
-) (value tree.Datum, filterIdx int, ok bool) {
+) (values tree.Datums, filterIdx int, ok bool) {
 	for filterIdx := range filters {
 		props := filters[filterIdx].ScalarProps()
 		if props.TightConstraints {
-			constCol, constVal, ok := props.Constraints.IsSingleColumnConstValue(c.e.evalCtx)
-			if ok && constCol == col {
-				return constVal, filterIdx, true
+			constCol, constVals, ok := props.Constraints.HasSingleColumnConstValues(c.e.evalCtx)
+			if !ok || constCol != col {
+				continue
+			}
+			hasNull := false
+			for i := range constVals {
+				if constVals[i] == tree.DNull {
+					hasNull = true
+					break
+				}
+			}
+			if !hasNull {
+				return constVals, filterIdx, true
 			}
 		}
 	}
 	return nil, -1, false
+}
+
+// constructJoinWithConstants constructs a cross join that joins every row in
+// the input with every value in vals. The cross join will be converted into a
+// projection by inlining normalization rules if vals contains only a single
+// value. The constructed expression and the column ID of the constant value
+// column are returned.
+func (c *CustomFuncs) constructJoinWithConstants(
+	input memo.RelExpr, vals tree.Datums, typ *types.T, columnAlias string,
+) (join memo.RelExpr, constColID opt.ColumnID) {
+	constColID = c.e.f.Metadata().AddColumn(columnAlias, typ)
+	tupleType := types.MakeTuple([]*types.T{typ})
+
+	constRows := make(memo.ScalarListExpr, len(vals))
+	for i := range constRows {
+		constRows[i] = c.e.f.ConstructTuple(
+			memo.ScalarListExpr{c.e.f.ConstructConst(vals[i], typ)},
+			tupleType,
+		)
+	}
+
+	values := c.e.f.ConstructValues(
+		constRows,
+		&memo.ValuesPrivate{
+			Cols: opt.ColList{constColID},
+			ID:   c.e.mem.Metadata().NextUniqueID(),
+		},
+	)
+
+	// We purposefully do not propagate any join flags into this JoinPrivate. If
+	// a LOOKUP join hint was propagated to this cross join, the cost of the
+	// cross join would be artificially inflated and the lookup join would not
+	// be selected as the optimal plan.
+	join = c.e.f.ConstructInnerJoin(input, values, nil /* on */, &memo.JoinPrivate{})
+	return join, constColID
 }
 
 // ShouldReorderJoins returns whether the optimizer should attempt to find
@@ -584,7 +829,7 @@ func (c *CustomFuncs) ShouldReorderJoins(root memo.RelExpr) bool {
 
 	// Ensure that this join expression was not added to the memo by a previous
 	// reordering, as well as that the join does not have hints.
-	return !private.WasReordered && c.NoJoinHints(private)
+	return !private.SkipReorderJoins && c.NoJoinHints(private)
 }
 
 // ReorderJoins adds alternate orderings of the given join tree to the memo. The

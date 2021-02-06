@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/blobs/blobspb"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -37,12 +38,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -68,12 +71,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
 	"google.golang.org/grpc"
 )
 
-type sqlServer struct {
+// SQLServer encapsulates the part of a CRDB server that is dedicated to SQL
+// processing. All SQL commands are reduced to primitive operations on the
+// lower-level KV layer. Multi-tenant installations of CRDB run zero or more
+// standalone SQLServer instances per tenant (the KV layer is shared across all
+// tenants).
+type SQLServer struct {
+	stopper          *stop.Stopper
+	sqlIDContainer   *base.SQLIDContainer
 	pgServer         *pgwire.Server
 	distSQLServer    *distsql.ServerImpl
 	execCfg          *sql.ExecutorConfig
@@ -94,12 +106,17 @@ type sqlServer struct {
 	stmtDiagnosticsRegistry *stmtdiagnostics.Registry
 	sqlLivenessProvider     sqlliveness.Provider
 	metricsRegistry         *metric.Registry
+	diagnosticsReporter     *diagnostics.Reporter
 
 	// pgL is the shared RPC/SQL listener, opened when RPC was initialized.
 	pgL net.Listener
 	// connManager is the connection manager to use to set up additional
 	// SQL listeners in AcceptClients().
 	connManager netutil.Server
+
+	// set to true when the server has started accepting client conns.
+	// Used by health checks.
+	acceptingClients syncutil.AtomicBool
 }
 
 // sqlServerOptionalKVArgs are the arguments supplied to newSQLServer which are
@@ -121,7 +138,7 @@ type sqlServerOptionalKVArgs struct {
 	// To register blob and DistSQL servers.
 	grpcServer *grpc.Server
 	// For the temporaryObjectCleaner.
-	isMeta1Leaseholder func(context.Context, hlc.Timestamp) (bool, error)
+	isMeta1Leaseholder func(context.Context, hlc.ClockTimestamp) (bool, error)
 	// DistSQL, lease management, and others want to know the node they're on.
 	nodeIDContainer *base.SQLIDContainer
 
@@ -205,15 +222,18 @@ type sqlServerArgs struct {
 	sqlStatusServer serverpb.SQLStatusServer
 }
 
-func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
+func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	// NB: ValidateAddrs also fills in defaults.
 	if err := cfg.Config.ValidateAddrs(ctx); err != nil {
 		return nil, err
 	}
 	execCfg := &sql.ExecutorConfig{}
 	codec := keys.MakeSQLCodec(cfg.SQLConfig.TenantID)
-	if override := cfg.SQLConfig.TenantIDCodecOverride; override != (roachpb.TenantID{}) {
-		codec = keys.MakeSQLCodec(override)
+	if knobs := cfg.TestingKnobs.TenantTestingKnobs; knobs != nil {
+		override := knobs.(*sql.TenantTestingKnobs).TenantIDCodecOverride
+		if override != (roachpb.TenantID{}) {
+			codec = keys.MakeSQLCodec(override)
+		}
 	}
 
 	// Create blob service for inter-node file sharing.
@@ -281,6 +301,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		cfg.stopper,
 		cfg.LeaseManagerConfig,
 	)
+	cfg.registry.AddMetricStruct(leaseMgr.MetricsStruct())
 
 	rootSQLMetrics := sql.MakeBaseMemMetrics("root", cfg.HistogramWindowInterval())
 	cfg.registry.AddMetricStruct(rootSQLMetrics)
@@ -361,10 +382,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		RPCContext:     cfg.rpcContext,
 		Stopper:        cfg.stopper,
 
-		LatencyGetter: &serverpb.LatencyGetter{
-			NodesStatusServer: &cfg.nodesStatusServer,
-		},
-
 		TempStorage:     tempEngine,
 		TempStoragePath: cfg.TempStorageConfig.Path,
 		TempFS:          tempFS,
@@ -383,6 +400,10 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 			// Attach a child memory monitor to enable control over the BulkAdder's
 			// memory usage.
 			bulkMon := execinfra.NewMonitor(ctx, bulkMemoryMonitor, "bulk-adder-monitor")
+			if !codec.ForSystemTenant() {
+				// Tenants aren't allowed to split, so force off the split-after opt.
+				opts.SplitAndScatterAfter = func() int64 { return kvserverbase.DisableExplicitSplits }
+			}
 			return bulk.MakeBulkAdder(ctx, db, cfg.distSender.RangeDescriptorCache(), cfg.Settings, ts, opts, bulkMon)
 		},
 
@@ -423,8 +444,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	} else {
 		sqlExecutorTestingKnobs = sql.ExecutorTestingKnobs{}
 	}
-
-	loggerCtx, _ := cfg.stopper.WithCancelOnStop(ctx)
 
 	nodeInfo := sql.NodeInfo{
 		AdminURL:  cfg.AdminURL,
@@ -497,54 +516,13 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 			cfg.Settings,
 		),
 
-		// Note: don't forget to add the secondary loggers as closers
-		// on the Stopper, below.
-
-		ExecLogger: log.NewSecondaryLogger(
-			loggerCtx, nil /* dirName */, "sql-exec",
-			true /* enableGc */, false /* forceSyncWrites */, true, /* enableMsgCount */
-		),
-
-		// Note: the auth logger uses sync writes because we don't want an
-		// attacker to easily "erase their traces" after an attack by
-		// crashing the server before it has a chance to write the last
-		// few log lines to disk.
-		//
-		// TODO(knz): We could worry about disk I/O activity incurred by
-		// logging here in case a malicious user spams the server with
-		// (failing) connection attempts to cause a DoS failure; this
-		// would be a good reason to invest into a syslog sink for logs.
-		AuthLogger: log.NewSecondaryLogger(
-			loggerCtx, nil /* dirName */, "auth",
-			true /* enableGc */, true /* forceSyncWrites */, true, /* enableMsgCount */
-		),
-
-		// AuditLogger syncs to disk for the same reason as AuthLogger.
-		AuditLogger: log.NewSecondaryLogger(
-			loggerCtx, cfg.AuditLogDirName, "sql-audit",
-			true /* enableGc */, true /* forceSyncWrites */, true, /* enableMsgCount */
-		),
-
-		SlowQueryLogger: log.NewSecondaryLogger(
-			loggerCtx, nil, "sql-slow",
-			true /* enableGc */, false /* forceSyncWrites */, true, /* enableMsgCount */
-		),
-
-		SlowInternalQueryLogger: log.NewSecondaryLogger(loggerCtx, nil, "sql-slow-internal-only",
-			true /* enableGc */, false /* forceSyncWrites */, true /* enableMsgCount */),
-
 		QueryCache:                 querycache.New(cfg.QueryCacheSize),
 		ProtectedTimestampProvider: cfg.protectedtsProvider,
 		ExternalIODirConfig:        cfg.ExternalIODirConfig,
 		HydratedTables:             hydratedTablesCache,
 		GCJobNotifier:              gcJobNotifier,
+		ContentionRegistry:         contention.NewRegistry(),
 	}
-
-	cfg.stopper.AddCloser(execCfg.ExecLogger)
-	cfg.stopper.AddCloser(execCfg.AuditLogger)
-	cfg.stopper.AddCloser(execCfg.SlowQueryLogger)
-	cfg.stopper.AddCloser(execCfg.SlowInternalQueryLogger)
-	cfg.stopper.AddCloser(execCfg.AuthLogger)
 
 	if sqlSchemaChangerTestingKnobs := cfg.TestingKnobs.SQLSchemaChanger; sqlSchemaChangerTestingKnobs != nil {
 		execCfg.SchemaChangerTestingKnobs = sqlSchemaChangerTestingKnobs.(*sql.SchemaChangerTestingKnobs)
@@ -558,6 +536,9 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	}
 	execCfg.SchemaChangerMetrics = sql.NewSchemaChangerMetrics()
 	cfg.registry.AddMetricStruct(execCfg.SchemaChangerMetrics)
+
+	execCfg.FeatureFlagMetrics = featureflag.NewFeatureFlagMetrics()
+	cfg.registry.AddMetricStruct(execCfg.FeatureFlagMetrics)
 
 	if gcJobTestingKnobs := cfg.TestingKnobs.GCJob; gcJobTestingKnobs != nil {
 		execCfg.GCJobTestingKnobs = gcJobTestingKnobs.(*sql.GCJobTestingKnobs)
@@ -621,6 +602,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	}
 	distSQLServer.ServerConfig.SessionBoundInternalExecutorFactory = ieFactory
 	jobRegistry.SetSessionBoundInternalExecutorFactory(ieFactory)
+	execCfg.IndexBackfiller = sql.NewIndexBackfiller(execCfg, ieFactory)
 
 	distSQLServer.ServerConfig.ProtectedTimestampProvider = execCfg.ProtectedTimestampProvider
 
@@ -666,7 +648,27 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		leaseMgr,
 	)
 
-	return &sqlServer{
+	reporter := &diagnostics.Reporter{
+		StartTime:     timeutil.Now(),
+		AmbientCtx:    &cfg.AmbientCtx,
+		Config:        cfg.BaseConfig.Config,
+		Settings:      cfg.Settings,
+		ClusterID:     cfg.rpcContext.ClusterID.Get,
+		TenantID:      cfg.rpcContext.TenantID,
+		SQLInstanceID: cfg.nodeIDContainer.SQLInstanceID,
+		SQLServer:     pgServer.SQLServer,
+		InternalExec:  cfg.circularInternalExecutor,
+		DB:            cfg.db,
+		Recorder:      cfg.recorder,
+		Locality:      cfg.Locality,
+	}
+	if cfg.TestingKnobs.Server != nil {
+		reporter.TestingKnobs = &cfg.TestingKnobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs
+	}
+
+	return &SQLServer{
+		stopper:                 cfg.stopper,
+		sqlIDContainer:          cfg.nodeIDContainer,
 		pgServer:                pgServer,
 		distSQLServer:           distSQLServer,
 		execCfg:                 execCfg,
@@ -683,10 +685,11 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		stmtDiagnosticsRegistry: stmtDiagnosticsRegistry,
 		sqlLivenessProvider:     cfg.sqlLivenessProvider,
 		metricsRegistry:         cfg.registry,
+		diagnosticsReporter:     reporter,
 	}, nil
 }
 
-func (s *sqlServer) preStart(
+func (s *SQLServer) preStart(
 	ctx context.Context,
 	stopper *stop.Stopper,
 	knobs base.TestingKnobs,
@@ -696,7 +699,9 @@ func (s *sqlServer) preStart(
 	orphanedLeasesTimeThresholdNanos int64,
 ) error {
 	// If necessary, start the tenant proxy first, to ensure all other
-	// components can properly route to KV nodes.
+	// components can properly route to KV nodes. The Start method will block
+	// until a connection is established to the cluster and its ID has been
+	// determined.
 	if s.tenantConnect != nil {
 		if err := s.tenantConnect.Start(ctx); err != nil {
 			return err
@@ -785,11 +790,11 @@ func (s *sqlServer) preStart(
 		// Since we don't record this version anywhere, we do the next-best thing
 		// and pass a lower-bound on the bootstrap version. We know that no tenants
 		// could have been created before the start of the v20.2 dev cycle, so we
-		// pass VersionStart20_2. bootstrapVersion is only used to avoid performing
+		// pass Start20_2. bootstrapVersion is only used to avoid performing
 		// superfluous but necessarily idempotent SQL migrations, so at worst, we're
 		// doing more work than strictly necessary during the first time that the
 		// migrations are run.
-		bootstrapVersion = clusterversion.VersionByKey(clusterversion.VersionStart20_2)
+		bootstrapVersion = clusterversion.ByKey(clusterversion.Start20_2)
 	}
 
 	// Run startup migrations (note: these depend on jobs subsystem running).
@@ -809,8 +814,8 @@ func (s *sqlServer) preStart(
 		// This clause exists to support sqlmigrations tests which intentionally
 		// inject a binary version below the one which includes the relevant
 		// migration. In this case we won't start the sqlliveness subsystem.
-		(!s.execCfg.Settings.Version.BinaryVersion().Less(clusterversion.VersionByKey(
-			clusterversion.VersionAlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable))) {
+		(!s.execCfg.Settings.Version.BinaryVersion().Less(clusterversion.ByKey(
+			clusterversion.AlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable))) {
 		s.sqlLivenessProvider.Start(ctx)
 	}
 	// Start the async migration to upgrade namespace entries from the old
@@ -843,4 +848,18 @@ func (s *sqlServer) preStart(
 	)
 
 	return nil
+}
+
+// SQLInstanceID returns the ephemeral ID assigned to each SQL instance. The ID
+// is guaranteed to be unique across all currently running instances, but may be
+// reused once an instance is stopped.
+func (s *SQLServer) SQLInstanceID() base.SQLInstanceID {
+	return s.sqlIDContainer.SQLInstanceID()
+}
+
+// StartDiagnostics starts periodic diagnostics reporting.
+// NOTE: This is not called in preStart so that it's disabled by default for
+// testing.
+func (s *SQLServer) StartDiagnostics(ctx context.Context) {
+	s.diagnosticsReporter.PeriodicallyReportDiagnostics(ctx, s.stopper)
 }

@@ -53,7 +53,7 @@ type flowWithNode struct {
 func (n *explainVecNode) startExec(params runParams) error {
 	n.run.values = make(tree.Datums, 1)
 	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
-	distribution := getPlanDistributionForExplainPurposes(
+	distribution := getPlanDistribution(
 		params.ctx, params.p, params.extendedEvalCtx.ExecCfg.NodeID,
 		params.extendedEvalCtx.SessionData.DistSQLMode, n.plan.main,
 	)
@@ -98,7 +98,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 	verbose := n.options.Flags[tree.ExplainFlagVerbose]
 	for _, flow := range sortedFlows {
 		node := root.Childf("Node %d", flow.nodeID)
-		opChains, cleanup, err := colflow.ConvertToVecTree(params.ctx, flowCtx, flow.flow, !willDistribute)
+		opChains, cleanup, err := colflow.ConvertToVecTree(params.ctx, flowCtx, flow.flow, physPlan.LocalProcessors, !willDistribute)
 		defer cleanup()
 		if err != nil {
 			return err

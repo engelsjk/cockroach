@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -153,7 +154,7 @@ func runIterate(
 		}
 		it := makeIterator(eng, startTime, endTime)
 		defer it.Close()
-		for it.SeekGE(storage.MVCCKey{}); ; it.Next() {
+		for it.SeekGE(storage.MVCCKey{Key: keys.LocalMax}); ; it.Next() {
 			if ok, err := it.Valid(); !ok {
 				if err != nil {
 					b.Fatal(err)
@@ -180,7 +181,7 @@ func BenchmarkTimeBoundIterate(b *testing.B) {
 			})
 			b.Run("TimeBoundIterator", func(b *testing.B) {
 				runIterate(b, loadFactor, func(e storage.Engine, startTime, endTime hlc.Timestamp) storage.MVCCIterator {
-					return e.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+					return e.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
 						MinTimestampHint: startTime,
 						MaxTimestampHint: endTime,
 						UpperBound:       roachpb.KeyMax,

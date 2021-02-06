@@ -255,9 +255,334 @@ func TestDescriptorRepair(t *testing.T) {
 		op                 string
 		expErrRE           string
 		expEventLogEntries []eventLogPattern
+		after              []string
 	}{
 		{
+			op: upsertRepair,
+			expEventLogEntries: []eventLogPattern{
+				{
+					typ:  "unsafe_upsert_descriptor",
+					info: `"DescriptorID":59`,
+				},
+				{
+					typ:  "alter_table_owner",
+					info: `"DescriptorID":59,"TableName":"foo","Owner":"root"`,
+				},
+				{
+					typ:  "change_table_privilege",
+					info: `"DescriptorID":59,"Grantee":"root","GrantedPrivileges":\["ALL"\]`,
+				},
+				{
+					typ:  "change_table_privilege",
+					info: `"DescriptorID":59,"Grantee":"admin","GrantedPrivileges":\["ALL"\]`,
+				},
+			},
+		},
+		{
+			before: []string{
+				upsertRepair,
+			},
+			op: upsertUpdatePrivileges,
+			expEventLogEntries: []eventLogPattern{
+				{
+					typ:  "alter_table_owner",
+					info: `"DescriptorID":59,"TableName":"foo","Owner":"admin"`,
+				},
+				{
+					typ:  "change_table_privilege",
+					info: `"DescriptorID":59,"Grantee":"root","GrantedPrivileges":\["DROP"\],"RevokedPrivileges":\["ALL"\]`,
+				},
+				{
+					typ:  "change_table_privilege",
+					info: `"DescriptorID":59,"Grantee":"newuser","GrantedPrivileges":\["CREATE"\]`,
+				},
+				{
+					typ:  "change_table_privilege",
+					info: `"DescriptorID":59,"Grantee":"admin","RevokedPrivileges":\["ALL"\]`,
+				},
+			},
+		},
+		{
+			before: []string{
+				`CREATE SCHEMA foo`,
+			},
 			op: `
+SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
+  FROM system.namespace WHERE name = 'foo';
+`,
+			expErrRE: `crdb_internal.unsafe_delete_namespace_entry\(\): refusing to delete namespace entry for non-dropped descriptor`,
+		},
+		{
+			// Upsert a descriptor which is invalid, then try to upsert a namespace
+			// entry for it and show that it fails.
+			before: []string{
+				upsertInvalidateDuplicateColumnDescriptor,
+			},
+			op:       `SELECT crdb_internal.unsafe_upsert_namespace_entry(50, 29, 'foo', 52);`,
+			expErrRE: `failed to retrieve descriptor 52: duplicate column name: "i"`,
+		},
+		{
+			// Upsert a descriptor which is invalid, then try to upsert a namespace
+			// entry for it and show that it succeeds with the force flag.
+			before: []string{
+				upsertInvalidateDuplicateColumnDescriptor,
+			},
+			op: `SELECT crdb_internal.unsafe_upsert_namespace_entry(50, 29, 'foo', 52, true);`,
+			expEventLogEntries: []eventLogPattern{
+				{
+					typ:  "unsafe_upsert_namespace_entry",
+					info: `"Force":true,"FailedValidation":true,"ValidationErrors":"failed to retrieve descriptor 52: duplicate column name: \\"i\\""`,
+				},
+			},
+		},
+		{
+			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
+			// then show that deleting the descriptor fails without the force flag.
+			before: []string{
+				upsertInvalidateDuplicateColumnDescriptor,
+				`SELECT crdb_internal.unsafe_upsert_namespace_entry(50, 29, 'foo', 52, true);`,
+			},
+			op:       `SELECT crdb_internal.unsafe_delete_descriptor(52);`,
+			expErrRE: `duplicate column name: "i"`,
+		},
+		{
+			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
+			// then show that deleting the descriptor succeeds with the force flag.
+			before: []string{
+				upsertInvalidateDuplicateColumnDescriptor,
+				`SELECT crdb_internal.unsafe_upsert_namespace_entry(50, 29, 'foo', 52, true);`,
+			},
+			op: `SELECT crdb_internal.unsafe_delete_descriptor(52, true);`,
+			expEventLogEntries: []eventLogPattern{
+				{
+					typ:  "unsafe_delete_descriptor",
+					info: `"Force":true,"ForceNotice":"[^"]*duplicate column name: \\"i\\""`,
+				},
+			},
+		},
+		{
+			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
+			// then show that updating the descriptor fails without the force flag.
+			before: []string{
+				upsertInvalidateDuplicateColumnDescriptor,
+				`SELECT crdb_internal.unsafe_upsert_namespace_entry(50, 29, 'foo', 52, true);`,
+			},
+			op:       updateInvalidateDuplicateColumnDescriptorNoForce,
+			expErrRE: `duplicate column name: "i"`,
+		},
+		{
+			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
+			// then show that updating the descriptor succeeds the force flag.
+			before: []string{
+				upsertInvalidateDuplicateColumnDescriptor,
+				`SELECT crdb_internal.unsafe_upsert_namespace_entry(50, 29, 'foo', 52, true);`,
+			},
+			op: updateInvalidateDuplicateColumnDescriptorForce,
+			expEventLogEntries: []eventLogPattern{
+				{
+					typ:  "unsafe_upsert_descriptor",
+					info: `"Force":true,"ForceNotice":"[^"]*duplicate column name: \\"i\\""`,
+				},
+			},
+			after: []string{
+				// Ensure that the table is usable.
+				`INSERT INTO [52 as t] VALUES (1), (2)`,
+			},
+		},
+		{
+			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
+			// then show that deleting the namespace entry fails without the force flag.
+			before: []string{
+				upsertInvalidateDuplicateColumnDescriptor,
+				`SELECT crdb_internal.unsafe_upsert_namespace_entry(50, 29, 'foo', 52, true);`,
+			},
+			op:       `SELECT crdb_internal.unsafe_delete_namespace_entry(50, 29, 'foo', 52);`,
+			expErrRE: `duplicate column name: "i"`,
+		},
+		{
+			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
+			// then show that deleting the namespace entry succeeds with the force flag.
+			before: []string{
+				upsertInvalidateDuplicateColumnDescriptor,
+				`SELECT crdb_internal.unsafe_upsert_namespace_entry(50, 29, 'foo', 52, true);`,
+			},
+			op: `SELECT crdb_internal.unsafe_delete_namespace_entry(50, 29, 'foo', 52, true);`,
+			expEventLogEntries: []eventLogPattern{
+				{
+					typ:  "unsafe_delete_namespace_entry",
+					info: `"Force":true,"ForceNotice":"[^"]*duplicate column name: \\"i\\""`,
+				},
+			},
+		},
+	} {
+		t.Run(tc.op, func(t *testing.T) {
+			s, db, cleanup := setup(t)
+			now := s.Clock().Now().GoTime()
+			defer cleanup()
+			tdb := sqlutils.MakeSQLRunner(db)
+			for _, op := range tc.before {
+				tdb.Exec(t, op)
+			}
+			_, err := db.Exec(tc.op)
+			if tc.expErrRE == "" {
+				require.NoError(t, err)
+			} else {
+				require.Regexp(t, tc.expErrRE, err)
+			}
+			rows := tdb.Query(t, `SELECT "eventType", info FROM system.eventlog WHERE timestamp > $1`,
+				now)
+			mat, err := sqlutils.RowsToStrMatrix(rows)
+			require.NoError(t, err)
+		outer:
+			for _, exp := range tc.expEventLogEntries {
+				for _, e := range mat {
+					if e[0] != exp.typ {
+						continue
+					}
+					if matched, err := regexp.MatchString(exp.info, e[1]); err != nil {
+						t.Fatal(err)
+					} else if matched {
+						continue outer
+					}
+				}
+				t.Errorf("failed to find log entry matching %+v in:\n%s", exp, sqlutils.MatrixToStr(mat))
+			}
+		})
+	}
+}
+
+const (
+
+	// This is the json representation of a descriptor which has duplicate
+	// columns i and will subsequently fail validation.
+	invalidDuplicateColumnDescriptor = `'{
+  "table": {
+    "auditMode": "DISABLED",
+    "columns": [
+      {
+        "id": 1,
+        "name": "i",
+        "type": {"family": "IntFamily", "oid": 20, "width": 64}
+      },
+      {
+        "id": 1,
+        "name": "i",
+        "type": {"family": "IntFamily", "oid": 20, "width": 64}
+      }
+    ],
+    "families": [
+      {
+        "columnIds": [
+          1
+        ],
+        "columnNames": [
+          "i"
+        ],
+        "defaultColumnId": 0,
+        "id": 0,
+        "name": "primary"
+      }
+    ],
+    "formatVersion": 3,
+    "id": 52,
+    "name": "foo",
+    "nextColumnId": 2,
+    "nextFamilyId": 1,
+    "nextIndexId": 2,
+    "nextMutationId": 2,
+    "parentId": 50,
+    "primaryIndex": {
+      "columnDirections": [
+        "ASC"
+      ],
+      "columnIds": [
+        1
+      ],
+      "columnNames": [
+        "i"
+      ],
+      "compositeColumnIds": [],
+      "createdExplicitly": false,
+      "encodingType": 0,
+      "id": 1,
+      "name": "primary",
+      "type": "FORWARD",
+      "unique": true,
+      "version": 2
+    },
+    "privileges": {
+      "ownerProto": "root",
+      "users": [
+        {
+          "privileges": 2,
+          "userProto": "admin"
+        },
+        {
+          "privileges": 2,
+          "userProto": "root"
+        }
+      ],
+      "version": 1
+    },
+    "state": "PUBLIC",
+    "unexposedParentSchemaId": 29,
+    "version": 1
+  }
+}'`
+
+	// This is a statement to insert the invalid descriptor above using
+	// crdb_internal.unsafe_upsert_descriptor.
+	upsertInvalidateDuplicateColumnDescriptor = `
+SELECT crdb_internal.unsafe_upsert_descriptor(52,
+    crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', ` +
+		invalidDuplicateColumnDescriptor + `))`
+
+	// These are CTEs for the below statements to update the above descriptor
+	// and fix its validation problems.
+	updateInvalidateDuplicateColumnDescriptorCTEs = `
+  WITH as_json AS (
+                SELECT crdb_internal.pb_to_json(
+                            'cockroach.sql.sqlbase.Descriptor',
+                            descriptor,
+                            false -- emit_defaults
+                        ) AS descriptor
+                  FROM system.descriptor
+                 WHERE id = 52
+               ),
+       updated AS (
+                SELECT crdb_internal.json_to_pb(
+                        'cockroach.sql.sqlbase.Descriptor',
+                        json_set(
+                            descriptor,
+                            ARRAY['table', 'columns'],
+                            json_build_array(
+                                descriptor->'table'->'columns'->0
+                            )
+                        )
+                       ) AS descriptor
+                  FROM as_json
+               )
+`
+
+	// This is a statement to update the above descriptor fixing its validity
+	// problems without the force flag.
+	updateInvalidateDuplicateColumnDescriptorNoForce = `` +
+		updateInvalidateDuplicateColumnDescriptorCTEs + `
+SELECT crdb_internal.unsafe_upsert_descriptor(52, descriptor)
+  FROM updated;
+`
+
+	// This is a statement to update the above descriptor fixing its validity
+	// problems with the force flag.
+	updateInvalidateDuplicateColumnDescriptorForce = `` +
+		updateInvalidateDuplicateColumnDescriptorCTEs + `
+SELECT crdb_internal.unsafe_upsert_descriptor(52, descriptor, true)
+  FROM updated;
+`
+
+	// This is a statement to repair an invalid descriptor using
+	// crdb_internal.unsafe_upsert_descriptor.
+	upsertRepair = `
 SELECT crdb_internal.unsafe_upsert_descriptor(59, crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', 
 '{
   "table": {
@@ -300,57 +625,53 @@ SELECT crdb_internal.unsafe_upsert_descriptor(59, crdb_internal.json_to_pb('cock
   }
 }
 '))
-`,
-			expEventLogEntries: []eventLogPattern{
-				{
-					typ:  "unsafe_upsert_descriptor",
-					info: `"id":59`,
-				},
-			},
-		},
-		{
-			before: []string{
-				`CREATE SCHEMA foo`,
-			},
-			op: `
-SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
-  FROM system.namespace WHERE name = 'foo';
-`,
-			expErrRE: `crdb_internal.unsafe_delete_namespace_entry\(\): refusing to delete namespace entry for non-dropped descriptor`,
-		},
-	} {
-		t.Run(tc.op, func(t *testing.T) {
-			s, db, cleanup := setup(t)
-			now := s.Clock().Now().GoTime()
-			defer cleanup()
-			tdb := sqlutils.MakeSQLRunner(db)
-			for _, op := range tc.before {
-				tdb.Exec(t, op)
-			}
-			_, err := db.Exec(tc.op)
-			if tc.expErrRE == "" {
-				require.NoError(t, err)
-			} else {
-				require.Regexp(t, tc.expErrRE, err)
-			}
-			rows := tdb.Query(t, `SELECT "eventType", info FROM system.eventlog WHERE timestamp > $1`,
-				now)
-			mat, err := sqlutils.RowsToStrMatrix(rows)
-			require.NoError(t, err)
-		outer:
-			for _, exp := range tc.expEventLogEntries {
-				for _, e := range mat {
-					if e[0] != exp.typ {
-						continue
-					}
-					if matched, err := regexp.MatchString(exp.info, e[1]); err != nil {
-						t.Fatal(err)
-					} else if matched {
-						continue outer
-					}
-				}
-				t.Errorf("failed to find log entry matching %s in %s", exp, sqlutils.MatrixToStr(mat))
-			}
-		})
-	}
+`
+
+	// This is a statement to update the above descriptor's privileges.
+	// It will change the table owner, add privileges for a new user,
+	// alter the privilege of an existing user, and revoke all privileges for an old user.
+	upsertUpdatePrivileges = `
+SELECT crdb_internal.unsafe_upsert_descriptor(59, crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', 
+'{
+  "table": {
+    "columns": [ { "id": 1, "name": "i" } ],
+    "families": [
+      {
+        "columnIds": [ 1 ],
+        "columnNames": [ "i" ],
+        "defaultColumnId": 0,
+        "id": 0,
+        "name": "primary"
+      }
+    ],
+    "formatVersion": 3,
+    "id": 59,
+    "name": "foo",
+    "nextColumnId": 2,
+    "nextFamilyId": 1,
+    "nextIndexId": 2,
+    "nextMutationId": 1,
+    "parentId": 52,
+    "primaryIndex": {
+      "columnDirections": [ "ASC" ],
+      "columnIds": [ 1 ],
+      "columnNames": [ "i" ],
+      "id": 1,
+      "name": "primary",
+      "type": "FORWARD",
+      "unique": true,
+      "version": 1
+    },
+    "privileges": {
+      "owner_proto": "admin",
+      "users": [ { "privileges": 5, "user_proto": "newuser" }, { "privileges": 8, "user_proto": "root" } ],
+      "version": 1
+    },
+    "state": "PUBLIC",
+    "unexposedParentSchemaId": 29,
+    "version": 1
+  }
 }
+'))
+`
+)

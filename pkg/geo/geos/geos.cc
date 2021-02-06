@@ -129,6 +129,11 @@ typedef int (*CR_GEOS_HausdorffDistance_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_
 typedef int (*CR_GEOS_HausdorffDistanceDensify_r)(CR_GEOS_Handle, CR_GEOS_Geometry,
                                                   CR_GEOS_Geometry, double, double*);
 
+typedef CR_GEOS_PreparedInternalGeometry (*CR_GEOS_Prepare_r)(CR_GEOS_Handle, CR_GEOS_Geometry);
+typedef void (*CR_GEOS_PreparedGeom_destroy_r)(CR_GEOS_Handle, CR_GEOS_PreparedInternalGeometry);
+
+typedef char (*CR_GEOS_PreparedIntersects_r)(CR_GEOS_Handle, CR_GEOS_PreparedInternalGeometry, CR_GEOS_Geometry);
+
 typedef char (*CR_GEOS_Covers_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geometry);
 typedef char (*CR_GEOS_CoveredBy_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geometry);
 typedef char (*CR_GEOS_Contains_r)(CR_GEOS_Handle, CR_GEOS_Geometry, CR_GEOS_Geometry);
@@ -160,6 +165,14 @@ typedef CR_GEOS_Geometry (*CR_GEOS_SharedPaths_r)(CR_GEOS_Handle, CR_GEOS_Geomet
                                                   CR_GEOS_Geometry);
 
 typedef CR_GEOS_Geometry (*CR_GEOS_Node_r)(CR_GEOS_Handle, CR_GEOS_Geometry);
+
+typedef CR_GEOS_Geometry (*CR_GEOS_VoronoiDiagram_r)(CR_GEOS_Handle, CR_GEOS_Geometry,
+                                                  CR_GEOS_Geometry, double, int);
+
+typedef char (*CR_GEOS_EqualsExact_r)(CR_GEOS_Handle, CR_GEOS_Geometry,
+                                                  CR_GEOS_Geometry, double);
+
+typedef CR_GEOS_Geometry (*CR_GEOS_MinimumRotatedRectangle_r)(CR_GEOS_Handle, CR_GEOS_Geometry);
 
 std::string ToString(CR_GEOS_Slice slice) { return std::string(slice.data, slice.len); }
 
@@ -234,6 +247,11 @@ struct CR_GEOS {
   CR_GEOS_HausdorffDistance_r GEOSHausdorffDistance_r;
   CR_GEOS_HausdorffDistanceDensify_r GEOSHausdorffDistanceDensify_r;
 
+  CR_GEOS_Prepare_r GEOSPrepare_r;
+  CR_GEOS_PreparedGeom_destroy_r GEOSPreparedGeom_destroy_r;
+
+  CR_GEOS_PreparedIntersects_r GEOSPreparedIntersects_r;
+
   CR_GEOS_Covers_r GEOSCovers_r;
   CR_GEOS_CoveredBy_r GEOSCoveredBy_r;
   CR_GEOS_Contains_r GEOSContains_r;
@@ -259,6 +277,9 @@ struct CR_GEOS {
   CR_GEOS_ClipByRect_r GEOSClipByRect_r;
 
   CR_GEOS_SharedPaths_r GEOSSharedPaths_r;
+  CR_GEOS_VoronoiDiagram_r GEOSVoronoiDiagram_r;
+  CR_GEOS_EqualsExact_r GEOSEqualsExact_r;
+  CR_GEOS_MinimumRotatedRectangle_r GEOSMinimumRotatedRectangle_r;
 
   CR_GEOS_Node_r GEOSNode_r;
 
@@ -330,6 +351,9 @@ struct CR_GEOS {
     INIT(GEOSFrechetDistanceDensify_r);
     INIT(GEOSHausdorffDistance_r);
     INIT(GEOSHausdorffDistanceDensify_r);
+    INIT(GEOSPrepare_r);
+    INIT(GEOSPreparedGeom_destroy_r);
+    INIT(GEOSPreparedIntersects_r);
     INIT(GEOSCovers_r);
     INIT(GEOSCoveredBy_r);
     INIT(GEOSContains_r);
@@ -341,6 +365,9 @@ struct CR_GEOS {
     INIT(GEOSTouches_r);
     INIT(GEOSWithin_r);
     INIT(GEOSRelate_r);
+    INIT(GEOSVoronoiDiagram_r);
+    INIT(GEOSEqualsExact_r);
+    INIT(GEOSMinimumRotatedRectangle_r);
     INIT(GEOSRelateBoundaryNodeRule_r);
     INIT(GEOSRelatePattern_r);
     INIT(GEOSSharedPaths_r);
@@ -1147,6 +1174,70 @@ CR_GEOS_Status CR_GEOS_HausdorffDistanceDensify(CR_GEOS* lib, CR_GEOS_Slice a, C
 }
 
 //
+// PreparedGeometry
+//
+
+CR_GEOS_Status CR_GEOS_Prepare(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_PreparedGeometry** ret) {
+  std::string error;
+  auto handle = initHandleWithErrorBuffer(lib, &error);
+
+  auto wkbReader = lib->GEOSWKBReader_create_r(handle);
+  auto geom = lib->GEOSWKBReader_read_r(handle, wkbReader, a.data, a.len);
+  lib->GEOSWKBReader_destroy_r(handle, wkbReader);
+  if (geom != nullptr) {
+    auto preparedGeom = lib->GEOSPrepare_r(handle, geom);
+    auto tmp = new CR_GEOS_PreparedGeometry();
+    tmp->g = geom;
+    tmp->p = preparedGeom;
+    *ret = tmp;
+  }
+  lib->GEOS_finish_r(handle);
+  return toGEOSString(error.data(), error.length());
+}
+
+CR_GEOS_Status CR_GEOS_PreparedGeometryDestroy(CR_GEOS* lib, CR_GEOS_PreparedGeometry* a) {
+  std::string error;
+  auto handle = initHandleWithErrorBuffer(lib, &error);
+  lib->GEOSPreparedGeom_destroy_r(handle, a->p);
+  lib->GEOSGeom_destroy_r(handle, a->g);
+  lib->GEOS_finish_r(handle);
+  delete a;
+  return toGEOSString(error.data(), error.length());
+}
+
+template <typename T>
+CR_GEOS_Status CR_GEOS_PreparedBinaryPredicate(CR_GEOS* lib, T fn, CR_GEOS_PreparedInternalGeometry a, CR_GEOS_Slice b,
+                                       char* ret) {
+  std::string error;
+  auto handle = initHandleWithErrorBuffer(lib, &error);
+
+  auto wkbReader = lib->GEOSWKBReader_create_r(handle);
+  auto geomB = lib->GEOSWKBReader_read_r(handle, wkbReader, b.data, b.len);
+  lib->GEOSWKBReader_destroy_r(handle, wkbReader);
+
+  if (geomB != nullptr) {
+    auto r = fn(handle, a, geomB);
+    // ret == 2 indicates an exception.
+    if (r == 2) {
+      if (error.length() == 0) {
+        error.assign(CR_GEOS_NO_ERROR_DEFINED_MESSAGE);
+      }
+    } else {
+      *ret = r;
+    }
+  }
+  if (geomB != nullptr) {
+    lib->GEOSGeom_destroy_r(handle, geomB);
+  }
+  lib->GEOS_finish_r(handle);
+  return toGEOSString(error.data(), error.length());
+}
+
+CR_GEOS_Status CR_GEOS_PreparedIntersects(CR_GEOS* lib, CR_GEOS_PreparedGeometry* a, CR_GEOS_Slice b, char* ret) {
+  return CR_GEOS_PreparedBinaryPredicate(lib, lib->GEOSPreparedIntersects_r, a->p, b, ret);
+}
+
+//
 // Binary predicates
 //
 
@@ -1212,6 +1303,10 @@ CR_GEOS_Status CR_GEOS_Intersects(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_Slice b
 
 CR_GEOS_Status CR_GEOS_Overlaps(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_Slice b, char* ret) {
   return CR_GEOS_BinaryPredicate(lib, lib->GEOSOverlaps_r, a, b, ret);
+}
+
+CR_GEOS_Status CR_GEOS_PreparedIntersects(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_Slice b, char* ret) {
+  return CR_GEOS_BinaryPredicate(lib, lib->GEOSPreparedIntersects_r, a, b, ret);
 }
 
 CR_GEOS_Status CR_GEOS_Touches(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_Slice b, char* ret) {
@@ -1354,6 +1449,75 @@ CR_GEOS_Status CR_GEOS_Node(CR_GEOS* lib, CR_GEOS_Slice a, CR_GEOS_String* nodeE
       lib->GEOSGeom_destroy_r(handle, r);
     }
     lib->GEOSGeom_destroy_r(handle, geom);
+  }
+
+  lib->GEOS_finish_r(handle);
+  return toGEOSString(error.data(), error.length());
+}
+
+CR_GEOS_Status CR_GEOS_VoronoiDiagram(CR_GEOS* lib, CR_GEOS_Slice g, CR_GEOS_Slice env,
+                                      double tolerance, int onlyEdges, CR_GEOS_String* ret) {
+  std::string error;
+  auto handle = initHandleWithErrorBuffer(lib, &error);
+
+  auto geomG = CR_GEOS_GeometryFromSlice(lib, handle, g);
+  CR_GEOS_Geometry geomEnv = nullptr;
+  if (env.data != nullptr) {
+   geomEnv = CR_GEOS_GeometryFromSlice(lib, handle, env);
+  }
+  *ret = {.data = NULL, .len = 0};
+
+  if (geomG != nullptr) {
+    auto r = lib->GEOSVoronoiDiagram_r(handle, geomG, geomEnv, tolerance, onlyEdges);
+    if (r != NULL) {
+      auto srid = lib->GEOSGetSRID_r(handle, r);
+      CR_GEOS_writeGeomToEWKB(lib, handle, r, ret, srid);
+      lib->GEOSGeom_destroy_r(handle, r);
+    }
+    lib->GEOSGeom_destroy_r(handle, geomG);
+  }
+  if (geomEnv != nullptr) {
+    lib->GEOSGeom_destroy_r(handle, geomEnv);
+  }
+
+  lib->GEOS_finish_r(handle);
+  return toGEOSString(error.data(), error.length());
+}
+
+CR_GEOS_Status CR_GEOS_EqualsExact(CR_GEOS* lib, CR_GEOS_Slice lhs, CR_GEOS_Slice rhs,
+                                      double tolerance, char* ret) {
+  std::string error;
+  auto handle = initHandleWithErrorBuffer(lib, &error);
+  auto lhsGeom = CR_GEOS_GeometryFromSlice(lib, handle, lhs);
+  auto rhsGeom = CR_GEOS_GeometryFromSlice(lib, handle, rhs);
+  *ret = 0;
+  if (lhsGeom != nullptr && rhsGeom != nullptr) {
+    auto r = lib->GEOSEqualsExact_r(handle, lhsGeom, rhsGeom, tolerance);
+    *ret = r;
+  }
+  if (lhsGeom != nullptr) {
+    lib->GEOSGeom_destroy_r(handle, lhsGeom);
+  }
+  if (rhsGeom != nullptr) {
+    lib->GEOSGeom_destroy_r(handle, rhsGeom);
+  }
+  lib->GEOS_finish_r(handle);
+  return toGEOSString(error.data(), error.length());
+}
+
+CR_GEOS_Status CR_GEOS_MinimumRotatedRectangle(CR_GEOS* lib, CR_GEOS_Slice g, CR_GEOS_String* ret) {
+  std::string error;
+  auto handle = initHandleWithErrorBuffer(lib, &error);
+  auto gGeom = CR_GEOS_GeometryFromSlice(lib, handle, g);
+  *ret = {.data = NULL, .len = 0};
+  if (gGeom != nullptr) {
+    auto r = lib->GEOSMinimumRotatedRectangle_r(handle, gGeom);
+    if (r != NULL) {
+      auto srid = lib->GEOSGetSRID_r(handle, r);
+      CR_GEOS_writeGeomToEWKB(lib, handle, r, ret, srid);
+      lib->GEOSGeom_destroy_r(handle, r);
+    }
+    lib->GEOSGeom_destroy_r(handle, gGeom);
   }
 
   lib->GEOS_finish_r(handle);

@@ -13,6 +13,7 @@ package sql
 import (
 	"context"
 	"encoding/hex"
+	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -24,6 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
@@ -55,7 +59,7 @@ import (
 // all descriptors at the end of the transaction to ensure that this operation
 // didn't break a reference to this descriptor.
 func (p *planner) UnsafeUpsertDescriptor(
-	ctx context.Context, descID int64, encodedDesc []byte,
+	ctx context.Context, descID int64, encodedDesc []byte, force bool,
 ) error {
 	const method = "crdb_internal.unsafe_upsert_descriptor()"
 	if err := checkPlannerStateForRepairFunctions(ctx, p, method); err != nil {
@@ -69,14 +73,25 @@ func (p *planner) UnsafeUpsertDescriptor(
 	}
 
 	// Fetch the existing descriptor.
+
 	existing, err := p.Descriptors().GetMutableDescriptorByID(ctx, id, p.txn)
+	var forceNoticeString string // for the event
 	if !errors.Is(err, catalog.ErrDescriptorNotFound) && err != nil {
-		return err
+		if force {
+			notice := pgnotice.NewWithSeverityf("WARNING",
+				"failed to retrieve existing descriptor, continuing with force flag: %v", err)
+			p.BufferClientNotice(ctx, notice)
+			forceNoticeString = notice.Error()
+		} else {
+			return err
+		}
 	}
 
 	// Validate that existing is sane and store its hex serialization into
 	// existingStr to be written to the event log.
 	var existingStr string
+	var previousOwner string
+	var previousUserPrivileges []descpb.UserPrivileges
 	if existing != nil {
 		if existing.IsUncommittedVersion() {
 			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
@@ -92,27 +107,38 @@ func (p *planner) UnsafeUpsertDescriptor(
 			return errors.AssertionFailedf("failed to marshal existing descriptor %v: %v", existing, err)
 		}
 		existingStr = hex.EncodeToString(marshaled)
+		previousOwner = existing.GetPrivileges().Owner().Normalized()
+		previousUserPrivileges = existing.GetPrivileges().Users
 	}
 
+	var objectType privilege.ObjectType
 	switch md := existing.(type) {
 	case *tabledesc.Mutable:
 		md.TableDescriptor = *desc.GetTable() // nolint:descriptormarshal
+		objectType = privilege.Table
 	case *schemadesc.Mutable:
 		md.SchemaDescriptor = *desc.GetSchema()
+		objectType = privilege.Schema
 	case *dbdesc.Mutable:
 		md.DatabaseDescriptor = *desc.GetDatabase()
+		objectType = privilege.Database
 	case *typedesc.Mutable:
 		md.TypeDescriptor = *desc.GetType()
+		objectType = privilege.Type
 	case nil:
 		// nolint:descriptormarshal
 		if tableDesc := desc.GetTable(); tableDesc != nil {
 			existing = tabledesc.NewCreatedMutable(*tableDesc)
+			objectType = privilege.Table
 		} else if schemaDesc := desc.GetSchema(); schemaDesc != nil {
 			existing = schemadesc.NewCreatedMutable(*schemaDesc)
+			objectType = privilege.Schema
 		} else if dbDesc := desc.GetDatabase(); dbDesc != nil {
 			existing = dbdesc.NewCreatedMutable(*dbDesc)
+			objectType = privilege.Database
 		} else if typeDesc := desc.GetType(); typeDesc != nil {
 			existing = typedesc.NewCreatedMutable(*typeDesc)
+			objectType = privilege.Type
 		} else {
 			return pgerror.New(pgcode.InvalidTableDefinition, "invalid ")
 		}
@@ -130,21 +156,185 @@ func (p *planner) UnsafeUpsertDescriptor(
 			return err
 		}
 	}
-	return MakeEventLogger(p.execCfg).InsertEventRecord(
-		ctx,
-		p.txn,
-		EventLogUnsafeUpsertDescriptor,
-		int32(id),
-		int32(p.EvalContext().NodeID.SQLInstanceID()),
-		&struct {
-			ID                 descpb.ID `json:"id"`
-			ExistingDescriptor string    `json:"existing_descriptor,omitempty"`
-			Descriptor         string    `json:"descriptor,omitempty"`
-		}{
-			ID:                 id,
-			ExistingDescriptor: existingStr,
-			Descriptor:         hex.EncodeToString(encodedDesc),
+
+	// Log any ownership changes.
+	newOwner := existing.GetPrivileges().Owner().Normalized()
+	if previousOwner != newOwner {
+		if err := logOwnerEvents(ctx, p, newOwner, existing); err != nil {
+			return err
+		}
+	}
+
+	// Log any privilege changes.
+	if err := comparePrivileges(
+		ctx, p, existing, previousUserPrivileges, objectType,
+	); err != nil {
+		return err
+	}
+
+	return p.logEvent(ctx, id, &eventpb.UnsafeUpsertDescriptor{
+		PreviousDescriptor: existingStr,
+		NewDescriptor:      hex.EncodeToString(encodedDesc),
+		Force:              force,
+		ForceNotice:        forceNoticeString,
+	})
+}
+
+// comparePrivileges iterates through all users and for each user, compares
+// their old privileges to their new privileges.
+// It then logs the granted and/or revoked privileges for that user.
+func comparePrivileges(
+	ctx context.Context,
+	p *planner,
+	existing catalog.MutableDescriptor,
+	prevUserPrivileges []descpb.UserPrivileges,
+	objectType privilege.ObjectType,
+) error {
+	computePrivilegeChanges := func(prev, cur *descpb.UserPrivileges) (granted, revoked []string) {
+		// User has no privileges anymore after upsert, all privileges revoked.
+		if cur == nil {
+			revoked = privilege.ListFromBitField(prev.Privileges, objectType).SortedNames()
+			return nil, revoked
+		}
+
+		// User privileges have not changed.
+		if prev.Privileges == cur.Privileges {
+			return nil, nil
+		}
+
+		// Construct a set of this user's old privileges (before upsert).
+		prevPrivilegeSet := make(map[string]struct{})
+		for _, priv := range privilege.ListFromBitField(prev.Privileges, objectType).SortedNames() {
+			prevPrivilegeSet[priv] = struct{}{}
+		}
+
+		// Compare with this user's new privileges.
+		for _, priv := range privilege.ListFromBitField(cur.Privileges, objectType).SortedNames() {
+			if _, ok := prevPrivilegeSet[priv]; !ok {
+				// New privileges that do not exist in the old privileges set imply that they have been granted.
+				granted = append(granted, priv)
+			} else {
+				// Old privilege still exists, remove it from set.
+				delete(prevPrivilegeSet, priv)
+			}
+		}
+
+		// Any remaining old privileges imply they do not exist in
+		// the new privilege set, so they have been revoked.
+		for priv := range prevPrivilegeSet {
+			revoked = append(revoked, priv)
+		}
+		sort.Strings(revoked)
+
+		return granted, revoked
+	}
+
+	curUserPrivileges := existing.GetPrivileges().Users
+	curUserMap := make(map[string]*descpb.UserPrivileges)
+	for i := range curUserPrivileges {
+		curUser := &curUserPrivileges[i]
+		curUserMap[curUser.User().Normalized()] = curUser
+	}
+
+	for i := range prevUserPrivileges {
+		prev := &prevUserPrivileges[i]
+		username := prev.User().Normalized()
+		cur := curUserMap[username]
+		granted, revoked := computePrivilegeChanges(prev, cur)
+		delete(curUserMap, username)
+
+		// Log events.
+		if err := logPrivilegeEvents(
+			ctx, p, existing, granted, revoked, username,
+		); err != nil {
+			return err
+		}
+	}
+
+	// Any leftovers in the new users map indicate privileges for a new user.
+	for i := range curUserPrivileges {
+		username := curUserPrivileges[i].User().Normalized()
+		if _, ok := curUserMap[username]; ok {
+			granted := privilege.ListFromBitField(curUserPrivileges[i].Privileges, objectType).SortedNames()
+			if err := logPrivilegeEvents(
+				ctx, p, existing, granted, nil, username,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// logPrivilegeEvents logs the privilege event for each user.
+func logPrivilegeEvents(
+	ctx context.Context,
+	p *planner,
+	existing catalog.MutableDescriptor,
+	grantedPrivileges []string,
+	revokedPrivileges []string,
+	grantee string,
+) error {
+
+	eventDetails := eventpb.CommonSQLPrivilegeEventDetails{
+		Grantee:           grantee,
+		GrantedPrivileges: grantedPrivileges,
+		RevokedPrivileges: revokedPrivileges,
+	}
+
+	switch md := existing.(type) {
+	case *tabledesc.Mutable:
+		return p.logEvent(ctx, existing.GetID(), &eventpb.ChangeTablePrivilege{
+			CommonSQLPrivilegeEventDetails: eventDetails,
+			TableName:                      md.GetName(),
 		})
+	case *schemadesc.Mutable:
+		return p.logEvent(ctx, existing.GetID(), &eventpb.ChangeSchemaPrivilege{
+			CommonSQLPrivilegeEventDetails: eventDetails,
+			SchemaName:                     md.GetName(),
+		})
+	case *dbdesc.Mutable:
+		return p.logEvent(ctx, existing.GetID(), &eventpb.ChangeDatabasePrivilege{
+			CommonSQLPrivilegeEventDetails: eventDetails,
+			DatabaseName:                   md.GetName(),
+		})
+	case *typedesc.Mutable:
+		return p.logEvent(ctx, existing.GetID(), &eventpb.ChangeTypePrivilege{
+			CommonSQLPrivilegeEventDetails: eventDetails,
+			TypeName:                       md.GetName(),
+		})
+	}
+	return nil
+}
+
+// logPrivilegeEvents logs the owner event for a descriptor.
+func logOwnerEvents(
+	ctx context.Context, p *planner, newOwner string, existing catalog.MutableDescriptor,
+) error {
+	switch md := existing.(type) {
+	case *tabledesc.Mutable:
+		return p.logEvent(ctx, md.GetID(), &eventpb.AlterTableOwner{
+			TableName: md.GetName(),
+			Owner:     newOwner,
+		})
+	case *schemadesc.Mutable:
+		return p.logEvent(ctx, md.GetID(), &eventpb.AlterSchemaOwner{
+			SchemaName: md.GetName(),
+			Owner:      newOwner,
+		})
+	case *dbdesc.Mutable:
+		return p.logEvent(ctx, md.GetID(), &eventpb.AlterDatabaseOwner{
+			DatabaseName: md.GetName(),
+			Owner:        newOwner,
+		})
+	case *typedesc.Mutable:
+		return p.logEvent(ctx, md.GetID(), &eventpb.AlterTypeOwner{
+			TypeName: md.GetName(),
+			Owner:    newOwner,
+		})
+	}
+	return nil
 }
 
 // UnsafeUpsertNamespaceEntry powers the repair builtin of the same name. The
@@ -275,27 +465,14 @@ func (p *planner) UnsafeUpsertNamespaceEntry(
 	if validationErr != nil {
 		validationErrStr = validationErr.Error()
 	}
-	return MakeEventLogger(p.execCfg).InsertEventRecord(
-		ctx,
-		p.txn,
-		EventLogUnsafeUpsertNamespaceEntry,
-		int32(descID),
-		int32(p.EvalContext().NodeID.SQLInstanceID()),
-		&struct {
-			ParentID         descpb.ID `json:"parent_id,omitempty"`
-			ParentSchemaID   descpb.ID `json:"parent_schema_id,omitempty"`
-			Name             string    `json:"name"`
-			ID               descpb.ID `json:"id"`
-			ExistingID       descpb.ID `json:"existing_id,omitempty"`
-			Force            bool      `json:"force,omitempty"`
-			ValidationErrors string    `json:"validation_errors,omitempty"`
-		}{
-			ParentID:         parentID,
-			ParentSchemaID:   parentSchemaID,
-			ID:               descID,
+	return p.logEvent(ctx, descID,
+		&eventpb.UnsafeUpsertNamespaceEntry{
+			ParentID:         uint32(parentID),
+			ParentSchemaID:   uint32(parentSchemaID),
 			Name:             name,
-			ExistingID:       existingID,
+			PreviousID:       uint32(existingID),
 			Force:            force,
+			FailedValidation: validationErr != nil,
 			ValidationErrors: validationErrStr,
 		})
 }
@@ -308,7 +485,11 @@ func (p *planner) UnsafeUpsertNamespaceEntry(
 // will ensure that the entry does not correspond to a non-dropped descriptor
 // and that the entry exists with the provided ID.
 func (p *planner) UnsafeDeleteNamespaceEntry(
-	ctx context.Context, parentIDInt, parentSchemaIDInt int64, name string, descIDInt int64,
+	ctx context.Context,
+	parentIDInt, parentSchemaIDInt int64,
+	name string,
+	descIDInt int64,
+	force bool,
 ) error {
 	const method = "crdb_internal.unsafe_delete_namespace_entry()"
 	if err := checkPlannerStateForRepairFunctions(ctx, p, method); err != nil {
@@ -336,8 +517,16 @@ func (p *planner) UnsafeDeleteNamespaceEntry(
 		}
 	}
 	desc, err := p.Descriptors().GetMutableDescriptorByID(ctx, descID, p.txn)
+	var forceNoticeString string // for the event
 	if err != nil && !errors.Is(err, catalog.ErrDescriptorNotFound) {
-		return errors.Wrapf(err, "failed to retrieve descriptor %d", descID)
+		if force {
+			notice := pgnotice.NewWithSeverityf("WARNING",
+				"failed to retrieve existing descriptor, continuing with force flag: %v", err)
+			p.BufferClientNotice(ctx, notice)
+			forceNoticeString = notice.Error()
+		} else {
+			return errors.Wrapf(err, "failed to retrieve descriptor %d", descID)
+		}
 	}
 	if err == nil && !desc.Dropped() {
 		return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
@@ -346,23 +535,13 @@ func (p *planner) UnsafeDeleteNamespaceEntry(
 	if err := p.txn.Del(ctx, key); err != nil {
 		return errors.Wrap(err, "failed to delete entry")
 	}
-	return MakeEventLogger(p.execCfg).InsertEventRecord(
-		ctx,
-		p.txn,
-		EventLogUnsafeDeleteNamespaceEntry,
-		int32(descID),
-		int32(p.EvalContext().NodeID.SQLInstanceID()),
-		&struct {
-			ParentID       descpb.ID `json:"parent_id,omitempty"`
-			ParentSchemaID descpb.ID `json:"parent_schema_id,omitempty"`
-			Name           string    `json:"name"`
-			ID             descpb.ID `json:"id"`
-			ExistingID     descpb.ID `json:"existing_id,omitempty"`
-		}{
-			ParentID:       parentID,
-			ParentSchemaID: parentSchemaID,
-			ID:             descID,
+	return p.logEvent(ctx, descID,
+		&eventpb.UnsafeDeleteNamespaceEntry{
+			ParentID:       uint32(parentID),
+			ParentSchemaID: uint32(parentSchemaID),
 			Name:           name,
+			Force:          force,
+			ForceNotice:    forceNoticeString,
 		})
 }
 
@@ -373,37 +552,48 @@ func (p *planner) UnsafeDeleteNamespaceEntry(
 // This method will perform very minimal validation. An error will be returned
 // if no such descriptor exists. This method can very easily introduce
 // corruption, beware.
-func (p *planner) UnsafeDeleteDescriptor(ctx context.Context, descID int64) error {
+func (p *planner) UnsafeDeleteDescriptor(ctx context.Context, descID int64, force bool) error {
 	const method = "crdb_internal.unsafe_delete_descriptor()"
 	if err := checkPlannerStateForRepairFunctions(ctx, p, method); err != nil {
 		return err
 	}
 	id := descpb.ID(descID)
 	mut, err := p.Descriptors().GetMutableDescriptorByID(ctx, id, p.txn)
+	var forceNoticeString string // for the event
 	if err != nil {
-		return err
+		if !errors.Is(err, catalog.ErrDescriptorNotFound) && force {
+			notice := pgnotice.NewWithSeverityf("WARNING",
+				"failed to retrieve existing descriptor, continuing with force flag: %v", err)
+			p.BufferClientNotice(ctx, notice)
+			forceNoticeString = notice.Error()
+		} else {
+			return err
+		}
+	}
+
+	// Set the descriptor to dropped so that subsequent attempts to use it in
+	// the transaction fail and deleting its namespace entry becomes permitted.
+	if mut != nil {
+		mut.MaybeIncrementVersion()
+		mut.SetDropped()
+		if err := p.Descriptors().AddUncommittedDescriptor(mut); err != nil {
+			return errors.WithAssertionFailure(err)
+		}
 	}
 	descKey := catalogkeys.MakeDescMetadataKey(p.execCfg.Codec, id)
 	if err := p.txn.Del(ctx, descKey); err != nil {
 		return err
 	}
-	return MakeEventLogger(p.execCfg).InsertEventRecord(
-		ctx,
-		p.txn,
-		EventLogUnsafeDeleteDescriptor,
-		int32(descID),
-		int32(p.EvalContext().NodeID.SQLInstanceID()),
-		&struct {
-			ParentID       descpb.ID `json:"parent_id,omitempty"`
-			ParentSchemaID descpb.ID `json:"parent_schema_id,omitempty"`
-			Name           string    `json:"name"`
-			ID             descpb.ID `json:"id"`
-		}{
-			ParentID:       mut.GetParentID(),
-			ParentSchemaID: mut.GetParentSchemaID(),
-			ID:             mut.GetID(),
-			Name:           mut.GetName(),
-		})
+	ev := &eventpb.UnsafeDeleteDescriptor{
+		Force:       force,
+		ForceNotice: forceNoticeString,
+	}
+	if mut != nil {
+		ev.ParentID = uint32(mut.GetParentID())
+		ev.ParentSchemaID = uint32(mut.GetParentSchemaID())
+		ev.Name = mut.GetName()
+	}
+	return p.logEvent(ctx, id, ev)
 }
 
 func checkPlannerStateForRepairFunctions(ctx context.Context, p *planner, method string) error {

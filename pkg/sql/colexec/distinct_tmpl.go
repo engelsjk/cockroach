@@ -49,7 +49,7 @@ var (
 // last distinct operator in that chain as well as its output column.
 func OrderedDistinctColsToOperators(
 	input colexecbase.Operator, distinctCols []uint32, typs []*types.T,
-) (colexecbase.Operator, []bool, error) {
+) (ResettableOperator, []bool, error) {
 	distinctCol := make([]bool, coldata.BatchSize())
 	// zero the boolean column on every iteration.
 	input = fnOp{
@@ -86,7 +86,7 @@ var _ ResettableOperator = &distinctChainOps{}
 // input columns with the given types.
 func NewOrderedDistinct(
 	input colexecbase.Operator, distinctCols []uint32, typs []*types.T,
-) (colexecbase.Operator, error) {
+) (ResettableOperator, error) {
 	op, outputCol, err := OrderedDistinctColsToOperators(input, distinctCols, typs)
 	if err != nil {
 		return nil, err
@@ -249,31 +249,27 @@ func (p *distinct_TYPEOp) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
 				lastVal, lastValNull = checkDistinctWithNulls(idx, idx, lastVal, nulls, lastValNull, col, outputCol)
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				lastVal = checkDistinct(idx, idx, lastVal, col, outputCol)
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				lastVal, lastValNull = checkDistinctWithNulls(idx, idx, lastVal, nulls, lastValNull, col, outputCol)
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				lastVal = checkDistinct(idx, idx, lastVal, col, outputCol)
 			}
@@ -303,19 +299,19 @@ func (p partitioner_TYPE) partitionWithOrder(
 	}
 
 	col := colVec.TemplateType()
-	col = execgen.SLICE(col, 0, n)
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			lastVal, lastValNull = checkDistinctWithNulls(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			lastVal = checkDistinct(checkIdx, outputIdx, lastVal, col, outputCol)
 		}
 	}
@@ -334,6 +330,7 @@ func (p partitioner_TYPE) partition(colVec coldata.Vec, outputCol []bool, n int)
 	col := colVec.TemplateType()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {

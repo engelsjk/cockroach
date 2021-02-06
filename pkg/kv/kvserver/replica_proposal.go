@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"time"
 	"unsafe"
 
@@ -36,10 +35,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
-	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	opentracing "github.com/opentracing/opentracing-go"
 	"golang.org/x/time/rate"
@@ -296,16 +293,16 @@ A file preventing this node from restarting was placed at:
 	}
 }
 
-// leasePostApply updates the Replica's internal state to reflect the
+// leasePostApplyLocked updates the Replica's internal state to reflect the
 // application of a new Range lease. The method is idempotent, so it can be
 // called repeatedly for the same lease safely. However, the method will panic
 // if passed a lease with a lower sequence number than the current lease. By
 // default, the method will also panic if passed a lease that indicates a
 // forward sequence number jump (i.e. a skipped lease). This behavior can
 // be disabled by passing permitJump as true.
-func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, permitJump bool) {
-	r.mu.RLock()
-	replicaID := r.mu.replicaID
+func (r *Replica) leasePostApplyLocked(
+	ctx context.Context, newLease roachpb.Lease, permitJump bool,
+) {
 	// Pull out the last lease known to this Replica. It's possible that this is
 	// not actually the last lease in the Range's lease sequence because the
 	// Replica may have missed the application of a lease between prevLease and
@@ -313,7 +310,6 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 	// lease update. All other forms of lease updates should be continuous
 	// without jumps (see permitJump).
 	prevLease := *r.mu.state.Lease
-	r.mu.RUnlock()
 
 	// Sanity check to make sure that the lease sequence is moving in the right
 	// direction.
@@ -340,7 +336,7 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 		}
 	}
 
-	iAmTheLeaseHolder := newLease.Replica.ReplicaID == replicaID
+	iAmTheLeaseHolder := newLease.Replica.ReplicaID == r.mu.replicaID
 	// NB: in the case in which a node restarts, minLeaseProposedTS forces it to
 	// get a new lease and we make sure it gets a new sequence number, thus
 	// causing the right half of the disjunction to fire so that we update the
@@ -366,7 +362,7 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 		// TODO(aayush): In the future, if we permit co-operative lease transfers
 		// when a range is subsumed, it should be relatively straightforward to
 		// allow historical reads on the subsumed RHS after such lease transfers.
-		if err := r.maybeWatchForMerge(ctx, hlc.Timestamp{} /* freezeStart */); err != nil {
+		if err := r.maybeWatchForMergeLocked(ctx, hlc.Timestamp{} /* freezeStart */); err != nil {
 			// We were unable to determine whether a merge was in progress. We cannot
 			// safely proceed.
 			log.Fatalf(ctx, "failed checking for in-progress merge while installing new lease %s: %s",
@@ -384,7 +380,7 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 		// requests, this is kosher). This means that we don't use the old
 		// lease's expiration but instead use the new lease's start to initialize
 		// the timestamp cache low water.
-		setTimestampCacheLowWaterMark(r.store.tsCache, r.Desc(), newLease.Start)
+		setTimestampCacheLowWaterMark(r.store.tsCache, r.descRLocked(), newLease.Start.ToTimestamp())
 
 		// Reset the request counts used to make lease placement decisions whenever
 		// starting a new lease.
@@ -394,6 +390,10 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 	}
 
 	// Inform the concurrency manager that the lease holder has been updated.
+	// We do this before installing the new lease in `r.mu.state` as we have
+	// an invariant that any replica with a lease has the concurrency manager
+	// enabled. (In practice, since both happen under `r.mu`, it is likely
+	// to not matter).
 	r.concMgr.OnRangeLeaseUpdated(newLease.Sequence, iAmTheLeaseHolder)
 
 	// Ordering is critical here. We only install the new lease after we've
@@ -401,22 +401,21 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 	// ordering were reversed, it would be possible for requests to see the new
 	// lease but not the updated merge or timestamp cache state, which can result
 	// in serializability violations.
-	r.mu.Lock()
 	r.mu.state.Lease = &newLease
 	expirationBasedLease := r.requiresExpiringLeaseRLocked()
-	r.mu.Unlock()
 
 	// Gossip the first range whenever its lease is acquired. We check to make
 	// sure the lease is active so that a trailing replica won't process an old
 	// lease request and attempt to gossip the first range.
-	if leaseChangingHands && iAmTheLeaseHolder && r.IsFirstRange() && r.IsLeaseValid(ctx, newLease, r.store.Clock().Now()) {
-		r.gossipFirstRange(ctx)
+	now := r.store.Clock().NowAsClockTimestamp()
+	if leaseChangingHands && iAmTheLeaseHolder && r.IsFirstRange() && r.ownsValidLeaseRLocked(ctx, now) {
+		r.gossipFirstRangeLocked(ctx)
 	}
 
 	// Whenever we first acquire an expiration-based lease, notify the lease
 	// renewer worker that we want it to keep proactively renewing the lease
 	// before it expires.
-	if leaseChangingHands && iAmTheLeaseHolder && expirationBasedLease && r.IsLeaseValid(ctx, newLease, r.store.Clock().Now()) {
+	if leaseChangingHands && iAmTheLeaseHolder && expirationBasedLease && r.ownsValidLeaseRLocked(ctx, now) {
 		r.store.renewableLeases.Store(int64(r.RangeID), unsafe.Pointer(r))
 		select {
 		case r.store.renewableLeasesSignal <- struct{}{}:
@@ -427,7 +426,7 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 	// If we're the current raft leader, may want to transfer the leadership to
 	// the new leaseholder. Note that this condition is also checked periodically
 	// when ticking the replica.
-	r.maybeTransferRaftLeadershipToLeaseholder(ctx)
+	r.maybeTransferRaftLeadershipToLeaseholderLocked(ctx)
 
 	// Notify the store that a lease change occurred and it may need to
 	// gossip the updated store descriptor (with updated capacity).
@@ -452,18 +451,21 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 	// will be gossiped rarely because it falls on a range with an epoch-based
 	// range lease that is only reacquired extremely infrequently.
 	if iAmTheLeaseHolder {
-		if err := r.MaybeGossipSystemConfig(ctx); err != nil {
-			log.Errorf(ctx, "%v", err)
-		}
-		if err := r.MaybeGossipNodeLiveness(ctx, keys.NodeLivenessSpan); err != nil {
-			log.Errorf(ctx, "%v", err)
-		}
+		// NB: run these in an async task to keep them out of the critical section
+		// (r.mu is held here).
+		_ = r.store.stopper.RunAsyncTask(ctx, "lease-triggers", func(ctx context.Context) {
+			if err := r.MaybeGossipSystemConfig(ctx); err != nil {
+				log.Errorf(ctx, "%v", err)
+			}
+			if err := r.MaybeGossipNodeLiveness(ctx, keys.NodeLivenessSpan); err != nil {
+				log.Errorf(ctx, "%v", err)
+			}
 
-		// Emit an MLAI on the leaseholder replica, as follower will be looking
-		// for one and if we went on to quiesce, they wouldn't necessarily get
-		// one otherwise (unless they ask for it, which adds latency).
-		r.EmitMLAI()
-
+			// Emit an MLAI on the leaseholder replica, as follower will be looking
+			// for one and if we went on to quiesce, they wouldn't necessarily get
+			// one otherwise (unless they ask for it, which adds latency).
+			r.EmitMLAI()
+		})
 		if leaseChangingHands && log.V(1) {
 			// This logging is useful to troubleshoot incomplete drains.
 			log.Info(ctx, "is now leaseholder")
@@ -506,64 +508,24 @@ func addSSTablePreApply(
 	if eng.InMem() {
 		path = fmt.Sprintf("%x", checksum)
 		if err := eng.WriteFile(path, sst.Data); err != nil {
-			panic(err)
+			log.Fatalf(ctx, "unable to write sideloaded SSTable at term %d, index %d: %s", term, index, err)
 		}
 	} else {
 		ingestPath := path + ".ingested"
 
-		canLinkToRaftFile := false
-		// The SST may already be on disk, thanks to the sideloading mechanism.  If
-		// so we can try to add that file directly, via a new hardlink if the file-
-		// system support it, rather than writing a new copy of it. However, this is
-		// only safe if we can do so without modifying the file since it is still
-		// part of an immutable raft log message, but in some cases, described in
-		// DBIngestExternalFile, RocksDB would modify the file. Fortunately we can
-		// tell Rocks that it is not allowed to modify the file, in which case it
-		// will return and error if it would have tried to do so, at which point we
-		// can fall back to writing a new copy for Rocks to ingest.
-		if _, links, err := sysutil.StatAndLinkCount(path); err == nil {
-			// HACK: RocksDB does not like ingesting the same file (by inode) twice.
-			// See facebook/rocksdb#5133. We can tell that we have tried to ingest
-			// this file already if it has more than one link – one from the file raft
-			// wrote and one from rocks. In that case, we should not try to give
-			// rocks a link to the same file again.
-			if links == 1 {
-				canLinkToRaftFile = true
-			} else {
-				log.Warningf(ctx, "SSTable at index %d term %d may have already been ingested (link count %d) -- falling back to ingesting a copy",
-					index, term, links)
+		// The SST may already be on disk, thanks to the sideloading
+		// mechanism.  If so we can try to add that file directly, via a new
+		// hardlink if the filesystem supports it, rather than writing a new
+		// copy of it.  We cannot pass it the path in the sideload store as
+		// the engine deletes the passed path on success.
+		if linkErr := eng.Link(path, ingestPath); linkErr == nil {
+			ingestErr := eng.IngestExternalFiles(ctx, []string{ingestPath})
+			if ingestErr != nil {
+				log.Fatalf(ctx, "while ingesting %s: %v", ingestPath, ingestErr)
 			}
-		}
-
-		if canLinkToRaftFile {
-			// If the fs supports it, make a hard-link for rocks to ingest. We cannot
-			// pass it the path in the sideload store as it deletes the passed path on
-			// success.
-			if linkErr := eng.Link(path, ingestPath); linkErr == nil {
-				ingestErr := eng.IngestExternalFiles(ctx, []string{ingestPath})
-				if ingestErr == nil {
-					// Adding without modification succeeded, no copy necessary.
-					log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
-					return false
-				}
-				if rmErr := eng.Remove(ingestPath); rmErr != nil {
-					log.Fatalf(ctx, "failed to move ingest sst: %v", rmErr)
-				}
-				const seqNoMsg = "Global seqno is required, but disabled"
-				const seqNoOnReIngest = "external file have non zero sequence number"
-				// Repeated ingestion is still possible even with the link count checked
-				// above, since rocks might have already compacted away the file.
-				// However it does not flush compacted files from its cache, so it can
-				// still react poorly to attempting to ingest again. If we get an error
-				// that indicates we can't ingest, we'll make a copy and try again. That
-				// attempt must succeed or we'll fatal, so any persistent error is still
-				// going to be surfaced.
-				ingestErrMsg := ingestErr.Error()
-				isSeqNoErr := strings.Contains(ingestErrMsg, seqNoMsg) || strings.Contains(ingestErrMsg, seqNoOnReIngest)
-				if ingestErr := (*storage.Error)(nil); !errors.As(err, &ingestErr) || !isSeqNoErr {
-					log.Fatalf(ctx, "while ingesting %s: %v", ingestPath, ingestErr)
-				}
-			}
+			// Adding without modification succeeded, no copy necessary.
+			log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
+			return false
 		}
 
 		path = ingestPath
@@ -578,8 +540,8 @@ func addSSTablePreApply(
 		if _, err := eng.Stat(path); err == nil {
 			// The file we want to ingest exists. This can happen since the
 			// ingestion may apply twice (we ingest before we mark the Raft
-			// command as committed). Just unlink the file (RocksDB created a
-			// hard link); after that we're free to write it again.
+			// command as committed). Just unlink the file (the storage engine
+			// created a hard link); after that we're free to write it again.
 			if err := eng.Remove(path); err != nil {
 				log.Fatalf(ctx, "while removing existing file during ingestion of %s: %+v", path, err)
 			}
@@ -663,7 +625,7 @@ func (r *Replica) handleReadWriteLocalEvalResult(ctx context.Context, lResult re
 	}
 
 	if lResult.MaybeAddToSplitQueue {
-		r.store.splitQueue.MaybeAddAsync(ctx, r, r.store.Clock().Now())
+		r.store.splitQueue.MaybeAddAsync(ctx, r, r.store.Clock().NowAsClockTimestamp())
 		lResult.MaybeAddToSplitQueue = false
 	}
 
@@ -800,7 +762,7 @@ func (r *Replica) evaluateProposal(
 		// If the cluster version doesn't track abort span size in MVCCStats, we
 		// zero it out to prevent inconsistencies in MVCCStats across nodes in a
 		// possibly mixed-version cluster.
-		if !r.ClusterSettings().Version.IsActive(ctx, clusterversion.VersionAbortSpanBytes) {
+		if !r.ClusterSettings().Version.IsActive(ctx, clusterversion.AbortSpanBytes) {
 			res.Replicated.Delta.AbortSpanBytes = 0
 		}
 
@@ -816,12 +778,23 @@ func (r *Replica) evaluateProposal(
 		usingAppliedStateKey := r.mu.state.UsingAppliedStateKey
 		r.mu.RUnlock()
 		if !usingAppliedStateKey {
+			// The range applied state was originally introduced in v2.1, and in
+			// v21.1 we guarantee that it's used for all ranges, which we assert
+			// on below. If we're not running 21.1 yet, migrate over as we've
+			// done since the introduction of the applied state key.
+			activeVersion := r.ClusterSettings().Version.ActiveVersion(ctx).Version
+			migrationVersion := clusterversion.ByKey(clusterversion.TruncatedAndRangeAppliedStateMigration)
+			if migrationVersion.Less(activeVersion) {
+				log.Fatal(ctx, "not using applied state key in v21.1")
+			}
 			// The range applied state was introduced in v2.1. It's possible to
 			// still find ranges that haven't activated it. If so, activate it.
 			// We can remove this code if we introduce a boot-time check that
 			// fails the startup process when any legacy replicas are found. The
 			// operator can then run the old binary for a while to upgrade the
 			// stragglers.
+			//
+			// TODO(irfansharif): Is this still applicable?
 			if res.Replicated.State == nil {
 				res.Replicated.State = &kvserverpb.ReplicaState{}
 			}

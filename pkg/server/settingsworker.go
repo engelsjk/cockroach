@@ -17,9 +17,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -36,8 +36,8 @@ func processSystemConfigKVs(
 
 	a := &rowenc.DatumAlloc{}
 	codec := keys.TODOSQLCodec
-	settingsTablePrefix := codec.TablePrefix(uint32(tbl.ID))
-	colIdxMap := row.ColIDtoRowIndexFromCols(tbl.Columns)
+	settingsTablePrefix := codec.TablePrefix(uint32(tbl.GetID()))
+	colIdxMap := catalog.ColumnIDToOrdinalMap(tbl.PublicColumns())
 
 	var settingsKVs []roachpb.KeyValue
 	processKV := func(ctx context.Context, kv roachpb.KeyValue, u settings.Updater) error {
@@ -48,9 +48,9 @@ func processSystemConfigKVs(
 		var k, v, t string
 		// First we need to decode the setting name field from the index key.
 		{
-			types := []*types.T{tbl.Columns[0].Type}
+			types := []*types.T{tbl.PublicColumns()[0].GetType()}
 			nameRow := make([]rowenc.EncDatum, 1)
-			_, matches, _, err := rowenc.DecodeIndexKey(codec, tbl, &tbl.PrimaryIndex, types, nameRow, nil, kv.Key)
+			_, matches, _, err := rowenc.DecodeIndexKey(codec, tbl, tbl.GetPrimaryIndex().IndexDesc(), types, nameRow, nil, kv.Key)
 			if err != nil {
 				return errors.Wrap(err, "failed to decode key")
 			}
@@ -83,16 +83,16 @@ func processSystemConfigKVs(
 				colID := lastColID + descpb.ColumnID(colIDDiff)
 				lastColID = colID
 				if idx, ok := colIdxMap.Get(colID); ok {
-					res, bytes, err = rowenc.DecodeTableValue(a, tbl.Columns[idx].Type, bytes)
+					res, bytes, err = rowenc.DecodeTableValue(a, tbl.PublicColumns()[idx].GetType(), bytes)
 					if err != nil {
 						return err
 					}
 					switch colID {
-					case tbl.Columns[1].ID: // value
+					case tbl.PublicColumns()[1].GetID(): // value
 						v = string(tree.MustBeDString(res))
-					case tbl.Columns[3].ID: // valueType
+					case tbl.PublicColumns()[3].GetID(): // valueType
 						t = string(tree.MustBeDString(res))
-					case tbl.Columns[2].ID: // lastUpdated
+					case tbl.PublicColumns()[2].GetID(): // lastUpdated
 						// TODO(dt): we could decode just the len and then seek `bytes` past
 						// it, without allocating/decoding the unused timestamp.
 					default:
@@ -130,7 +130,7 @@ func (s *Server) refreshSettings(initialSettingsKVs []roachpb.KeyValue) error {
 		}
 	}
 	// Setup updater that listens for changes in settings.
-	s.stopper.RunWorker(ctx, func(ctx context.Context) {
+	return s.stopper.RunAsyncTask(ctx, "refresh-settings", func(ctx context.Context) {
 		gossipUpdateC := s.gossip.RegisterSystemConfigChannel()
 		// No new settings can be defined beyond this point.
 		for {
@@ -141,10 +141,9 @@ func (s *Server) refreshSettings(initialSettingsKVs []roachpb.KeyValue) error {
 				if err := processSystemConfigKVs(ctx, cfg.Values, u, s.engines[0]); err != nil {
 					log.Warningf(ctx, "error processing config KVs: %+v", err)
 				}
-			case <-s.stopper.ShouldStop():
+			case <-s.stopper.ShouldQuiesce():
 				return
 			}
 		}
 	})
-	return nil
 }

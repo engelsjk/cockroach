@@ -20,7 +20,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -47,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -160,9 +160,9 @@ var mysqlOutAllowedOptions = makeStringSet(
 	mysqlOutfileRowSep, mysqlOutfileFieldSep, mysqlOutfileEnclose,
 	mysqlOutfileEscape, csvNullIf, csvSkip, csvRowLimit,
 )
-var mysqlDumpAllowedOptions = makeStringSet(importOptionSkipFKs)
+var mysqlDumpAllowedOptions = makeStringSet(importOptionSkipFKs, csvRowLimit)
 var pgCopyAllowedOptions = makeStringSet(pgCopyDelimiter, pgCopyNull, optMaxRowSize)
-var pgDumpAllowedOptions = makeStringSet(optMaxRowSize, importOptionSkipFKs)
+var pgDumpAllowedOptions = makeStringSet(optMaxRowSize, importOptionSkipFKs, csvRowLimit)
 
 // DROP is required because the target table needs to be take offline during
 // IMPORT INTO.
@@ -177,10 +177,11 @@ var allowedIntoFormats = map[string]struct{}{
 }
 
 // featureImportEnabled is used to enable and disable the IMPORT feature.
-var featureImportEnabled = settings.RegisterPublicBoolSetting(
+var featureImportEnabled = settings.RegisterBoolSetting(
 	"feature.import.enabled",
 	"set to true to enable imports, false to disable; default is true",
-	featureflag.FeatureFlagEnabledDefault)
+	featureflag.FeatureFlagEnabledDefault,
+).WithPublic()
 
 func validateFormatOptions(
 	format string, specified map[string]string, formatAllowed map[string]struct{},
@@ -268,8 +269,10 @@ func importPlanHook(
 
 	addToFileFormatTelemetry(importStmt.FileFormat, "attempted")
 
-	if err := featureflag.CheckEnabled(featureImportEnabled,
-		&p.ExecCfg().Settings.SV,
+	if err := featureflag.CheckEnabled(
+		ctx,
+		p.ExecCfg(),
+		featureImportEnabled,
 		"IMPORT",
 	); err != nil {
 		return nil, nil, nil, false, err
@@ -317,7 +320,7 @@ func importPlanHook(
 		// Certain ExternalStorage URIs require super-user access. Check all the
 		// URIs passed to the IMPORT command.
 		for _, file := range filenamePatterns {
-			hasExplicitAuth, uriScheme, err := cloudimpl.AccessIsWithExplicitAuth(file)
+			hasExplicitAuth, uriScheme, err := cloud.AccessIsWithExplicitAuth(file)
 			if err != nil {
 				return err
 			}
@@ -546,6 +549,16 @@ func importPlanHook(
 				return err
 			}
 			format.Format = roachpb.IOFileFormat_Mysqldump
+			if override, ok := opts[csvRowLimit]; ok {
+				rowLimit, err := strconv.Atoi(override)
+				if err != nil {
+					return pgerror.Wrapf(err, pgcode.Syntax, "invalid numeric %s value", csvRowLimit)
+				}
+				if rowLimit <= 0 {
+					return pgerror.Newf(pgcode.Syntax, "%s must be > 0", csvRowLimit)
+				}
+				format.MysqlDump.RowLimit = int64(rowLimit)
+			}
 		case "PGCOPY":
 			if err = validateFormatOptions(importStmt.FileFormat, opts, pgCopyAllowedOptions); err != nil {
 				return err
@@ -594,6 +607,17 @@ func importPlanHook(
 				maxRowSize = int32(sz)
 			}
 			format.PgDump.MaxRowSize = maxRowSize
+
+			if override, ok := opts[csvRowLimit]; ok {
+				rowLimit, err := strconv.Atoi(override)
+				if err != nil {
+					return pgerror.Wrapf(err, pgcode.Syntax, "invalid numeric %s value", csvRowLimit)
+				}
+				if rowLimit <= 0 {
+					return pgerror.Newf(pgcode.Syntax, "%s must be > 0", csvRowLimit)
+				}
+				format.PgDump.RowLimit = int64(rowLimit)
+			}
 		case "AVRO":
 			if err = validateFormatOptions(importStmt.FileFormat, opts, avroAllowedOptions); err != nil {
 				return err
@@ -694,29 +718,29 @@ func importPlanHook(
 			var intoCols []string
 			var isTargetCol = make(map[string]bool)
 			for _, name := range importStmt.IntoCols {
-				active, err := found.FindActiveColumnsByNames(tree.NameList{name})
+				active, err := tabledesc.FindPublicColumnsWithNames(found, tree.NameList{name})
 				if err != nil {
 					return errors.Wrap(err, "verifying target columns")
 				}
 
-				isTargetCol[active[0].Name] = true
-				intoCols = append(intoCols, active[0].Name)
+				isTargetCol[active[0].GetName()] = true
+				intoCols = append(intoCols, active[0].GetName())
 			}
 
 			// Ensure that non-target columns that don't have default
 			// expressions are nullable.
 			if len(isTargetCol) != 0 {
 				for _, col := range found.VisibleColumns() {
-					if !(isTargetCol[col.Name] || col.Nullable || col.HasDefault() || col.IsComputed()) {
+					if !(isTargetCol[col.GetName()] || col.IsNullable() || col.HasDefault() || col.IsComputed()) {
 						return errors.Newf(
 							"all non-target columns in IMPORT INTO must be nullable "+
 								"or have default expressions, or have computed expressions"+
 								" but violated by column %q",
-							col.Name,
+							col.GetName(),
 						)
 					}
-					if isTargetCol[col.Name] && col.IsComputed() {
-						return schemaexpr.CannotWriteToComputedColError(col.Name)
+					if isTargetCol[col.GetName()] && col.IsComputed() {
+						return schemaexpr.CannotWriteToComputedColError(col.GetName())
 					}
 				}
 			}
@@ -860,7 +884,7 @@ func importPlanHook(
 
 		var sj *jobs.StartableJob
 		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-			sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn, resultsCh)
+			sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn)
 			if err != nil {
 				return err
 			}
@@ -883,13 +907,14 @@ func importPlanHook(
 			return err
 		}
 
-		err = sj.Run(ctx)
-		if err != nil {
+		if err := sj.Start(ctx); err != nil {
 			return err
 		}
 		addToFileFormatTelemetry(format.Format.String(), "started")
-
-		return nil
+		if err := sj.AwaitCompletion(ctx); err != nil {
+			return err
+		}
+		return sj.ReportExecutionResults(ctx, resultsCh)
 	}
 	return fn, utilccl.BulkJobExecutionResultHeader, nil, false, nil
 }
@@ -1025,11 +1050,8 @@ func prepareNewTableDescsForIngestion(
 		}
 		seqVals[id] = tableDesc.SeqVal
 	}
-	// TODO(ajwerner): Remove this in 21.1.
-	canResetModTime := p.ExecCfg().Settings.Version.IsActive(
-		ctx, clusterversion.VersionLeasedDatabaseDescriptors)
 	if err := backupccl.RewriteTableDescs(
-		newMutableTableDescriptors, tableRewrites, "", canResetModTime,
+		newMutableTableDescriptors, tableRewrites, "",
 	); err != nil {
 		return nil, err
 	}
@@ -1075,7 +1097,7 @@ func prepareNewTableDescsForIngestion(
 	// Write the new TableDescriptors and flip the namespace entries over to
 	// them. After this call, any queries on a table will be served by the newly
 	// imported data.
-	if err := backupccl.WriteDescriptors(ctx, txn, p.User(), descsCol,
+	if err := backupccl.WriteDescriptors(ctx, p.ExecCfg().Codec, txn, p.User(), descsCol,
 		nil /* databases */, nil, /* schemas */
 		tableDescs, nil, tree.RequestedDescriptors,
 		p.ExecCfg().Settings, seqValKVs); err != nil {
@@ -1210,6 +1232,23 @@ func (r *importResumer) prepareTableDescsForIngestion(
 	return err
 }
 
+// ReportResults implements JobResultsReporter interface.
+func (r *importResumer) ReportResults(ctx context.Context, resultsCh chan<- tree.Datums) error {
+	select {
+	case resultsCh <- tree.Datums{
+		tree.NewDInt(tree.DInt(*r.job.ID())),
+		tree.NewDString(string(jobs.StatusSucceeded)),
+		tree.NewDFloat(tree.DFloat(1.0)),
+		tree.NewDInt(tree.DInt(r.res.Rows)),
+		tree.NewDInt(tree.DInt(r.res.IndexEntries)),
+		tree.NewDInt(tree.DInt(r.res.DataSize)),
+	}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // parseAndCreateBundleTableDescs parses and creates the table
 // descriptors for bundle formats.
 func parseAndCreateBundleTableDescs(
@@ -1332,9 +1371,7 @@ func (r *importResumer) parseBundleSchemaIfNeeded(ctx context.Context, phs inter
 }
 
 // Resume is part of the jobs.Resumer interface.
-func (r *importResumer) Resume(
-	ctx context.Context, execCtx interface{}, resultsCh chan<- tree.Datums,
-) error {
+func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	p := execCtx.(sql.JobExecContext)
 	if err := r.parseBundleSchemaIfNeeded(ctx, p); err != nil {
 		return err
@@ -1403,7 +1440,7 @@ func (r *importResumer) Resume(
 		// case we can cheaply clear-range instead of revert-range to cleanup.
 		for i := range details.Tables {
 			if !details.Tables[i].IsNew {
-				tblSpan := tabledesc.NewImmutable(*details.Tables[i].Desc).TableSpan(keys.TODOSQLCodec)
+				tblSpan := tabledesc.NewImmutable(*details.Tables[i].Desc).TableSpan(p.ExecCfg().Codec)
 				res, err := p.ExecCfg().DB.Scan(ctx, tblSpan.Key, tblSpan.EndKey, 1 /* maxRows */)
 				if err != nil {
 					return errors.Wrap(err, "checking if existing table is empty")
@@ -1417,7 +1454,8 @@ func (r *importResumer) Resume(
 		}
 	}
 
-	res, err := sql.DistIngest(ctx, p, r.job, tables, files, format, details.Walltime, r.testingKnobs.alwaysFlushJobProgress)
+	res, err := sql.DistIngest(ctx, p, r.job, tables, files, format, details.Walltime,
+		r.testingKnobs.alwaysFlushJobProgress)
 	if err != nil {
 		return err
 	}
@@ -1469,15 +1507,6 @@ func (r *importResumer) Resume(
 	// Tiny imports may skew throughput numbers due to overhead.
 	if sizeMb > 10 {
 		telemetry.CountBucketed("import.speed-mbps.over10mb", mbps)
-	}
-
-	resultsCh <- tree.Datums{
-		tree.NewDInt(tree.DInt(*r.job.ID())),
-		tree.NewDString(string(jobs.StatusSucceeded)),
-		tree.NewDFloat(tree.DFloat(1.0)),
-		tree.NewDInt(tree.DInt(r.res.Rows)),
-		tree.NewDInt(tree.DInt(r.res.IndexEntries)),
-		tree.NewDInt(tree.DInt(r.res.DataSize)),
 	}
 
 	return nil
@@ -1612,15 +1641,15 @@ func (r *importResumer) dropTables(
 		return nil
 	}
 
-	var revert []*tabledesc.Immutable
-	var empty []*tabledesc.Immutable
+	var revert []catalog.TableDescriptor
+	var empty []catalog.TableDescriptor
 	for _, tbl := range details.Tables {
 		if !tbl.IsNew {
 			desc, err := descsCol.GetMutableTableVersionByID(ctx, tbl.Desc.ID, txn)
 			if err != nil {
 				return err
 			}
-			imm := desc.ImmutableCopy().(*tabledesc.Immutable)
+			imm := desc.ImmutableCopy().(catalog.TableDescriptor)
 			if tbl.WasEmpty {
 				empty = append(empty, imm)
 			} else {
@@ -1629,19 +1658,22 @@ func (r *importResumer) dropTables(
 		}
 	}
 
-	// NB: if a revert fails it will abort the rest of this failure txn, which is
-	// also what brings tables back online. We _could_ change the error handling
-	// or just move the revert into Resume()'s error return path, however it isn't
-	// clear that just bringing a table back online with partially imported data
-	// that may or may not be partially reverted is actually a good idea. It seems
-	// better to do the revert here so that the table comes back if and only if,
-	// it was rolled back to its pre-IMPORT state, and instead provide a manual
-	// admin knob (e.g. ALTER TABLE REVERT TO SYSTEM TIME) if anything goes wrong.
-	if len(revert) > 0 {
-		// Sanity check Walltime so it doesn't become a TRUNCATE if there's a bug.
-		if details.Walltime == 0 {
-			return errors.Errorf("invalid pre-IMPORT time to rollback")
-		}
+	// The walltime can be 0 if there is a failure between publishing the tables
+	// as OFFLINE and then choosing a ingestion timestamp. This might happen
+	// while waiting for the descriptor version to propagate across the cluster
+	// for example.
+	//
+	// In this case, we don't want to rollback the data since data ingestion has
+	// not yet begun (since we have not chosen a timestamp at which to ingest.)
+	if details.Walltime != 0 && len(revert) > 0 {
+		// NB: if a revert fails it will abort the rest of this failure txn, which is
+		// also what brings tables back online. We _could_ change the error handling
+		// or just move the revert into Resume()'s error return path, however it isn't
+		// clear that just bringing a table back online with partially imported data
+		// that may or may not be partially reverted is actually a good idea. It seems
+		// better to do the revert here so that the table comes back if and only if,
+		// it was rolled back to its pre-IMPORT state, and instead provide a manual
+		// admin knob (e.g. ALTER TABLE REVERT TO SYSTEM TIME) if anything goes wrong.
 		ts := hlc.Timestamp{WallTime: details.Walltime}.Prev()
 		if err := sql.RevertTables(ctx, txn.DB(), execCfg, revert, ts, sql.RevertTableDefaultBatchSize); err != nil {
 			return errors.Wrap(err, "rolling back partially completed IMPORT")
@@ -1650,7 +1682,7 @@ func (r *importResumer) dropTables(
 
 	for i := range empty {
 		if err := gcjob.ClearTableData(ctx, execCfg.DB, execCfg.DistSender, execCfg.Codec, empty[i]); err != nil {
-			return errors.Wrapf(err, "clearing data for table %d", empty[i].ID)
+			return errors.Wrapf(err, "clearing data for table %d", empty[i].GetID())
 		}
 	}
 

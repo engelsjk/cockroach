@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
 
@@ -205,6 +206,45 @@ func (desc *Immutable) DescriptorProto() *descpb.Descriptor {
 	}
 }
 
+// IsMultiRegion returns whether the database has multi-region properties
+// configured. If so, desc.RegionConfig can be used.
+func (desc *Immutable) IsMultiRegion() bool {
+	return desc.RegionConfig != nil
+}
+
+// RegionNames returns the multi-region regions that have been added to a
+// database.
+func (desc *Immutable) RegionNames() (descpb.RegionNames, error) {
+	if !desc.IsMultiRegion() {
+		return nil, errors.AssertionFailedf(
+			"can not get regions of a non multi-region database")
+	}
+	regions := make(descpb.RegionNames, len(desc.RegionConfig.Regions))
+	for i, region := range desc.RegionConfig.Regions {
+		regions[i] = region.Name
+	}
+	return regions, nil
+}
+
+// MultiRegionEnumID returns the ID of the multi-region enum if the database
+// is a multi-region database, and an error otherwise.
+func (desc *Immutable) MultiRegionEnumID() (descpb.ID, error) {
+	if !desc.IsMultiRegion() {
+		return descpb.InvalidID, errors.AssertionFailedf(
+			"can not get multi-region enum ID of a non multi-region database")
+	}
+	return desc.RegionConfig.RegionEnumID, nil
+}
+
+// PrimaryRegionName returns the primary region for a multi-region database.
+func (desc *Immutable) PrimaryRegionName() (descpb.RegionName, error) {
+	if !desc.IsMultiRegion() {
+		return "", errors.AssertionFailedf(
+			"can not get the primary region of a non multi-region database")
+	}
+	return desc.RegionConfig.PrimaryRegion, nil
+}
+
 // SetName sets the name on the descriptor.
 func (desc *Mutable) SetName(name string) {
 	desc.Name = name
@@ -219,6 +259,30 @@ func (desc *Immutable) Validate() error {
 	}
 	if desc.GetID() == 0 {
 		return fmt.Errorf("invalid database ID %d", desc.GetID())
+	}
+
+	if desc.IsMultiRegion() {
+		// Ensure no regions are duplicated.
+		regions := make(map[descpb.RegionName]struct{})
+		dbRegions, err := desc.RegionNames()
+		if err != nil {
+			return err
+		}
+		for _, region := range dbRegions {
+			if _, seen := regions[region]; seen {
+				return errors.AssertionFailedf("region %q seen twice on db %d", region, desc.GetID())
+			}
+			regions[region] = struct{}{}
+		}
+
+		if desc.RegionConfig.PrimaryRegion == "" {
+			return errors.AssertionFailedf("primary region unset on a multi-region db %d", desc.GetID())
+		}
+
+		if _, found := regions[desc.RegionConfig.PrimaryRegion]; !found {
+			return errors.AssertionFailedf(
+				"primary region not found in list of regions on db %d", desc.GetID())
+		}
 	}
 
 	// Fill in any incorrect privileges that may have been missed due to mixed-versions.

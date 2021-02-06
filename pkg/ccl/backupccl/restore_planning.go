@@ -17,7 +17,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -72,10 +71,11 @@ const (
 )
 
 // featureRestoreEnabled is used to enable and disable the RESTORE feature.
-var featureRestoreEnabled = settings.RegisterPublicBoolSetting(
+var featureRestoreEnabled = settings.RegisterBoolSetting(
 	"feature.restore.enabled",
 	"set to true to enable restore, false to disable; default is true",
-	featureflag.FeatureFlagEnabledDefault)
+	featureflag.FeatureFlagEnabledDefault,
+).WithPublic()
 
 // rewriteViewQueryDBNames rewrites the passed table's ViewQuery replacing all
 // non-empty db qualifiers with `newDB`.
@@ -929,15 +929,13 @@ func rewriteTypeDescs(types []*typedesc.Mutable, descriptorRewrites DescRewriteM
 			}
 		}
 		switch t := typ.Kind; t {
-		case descpb.TypeDescriptor_ENUM:
+		case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_MULTIREGION_ENUM:
 			if rw, ok := descriptorRewrites[typ.ArrayTypeID]; ok {
 				typ.ArrayTypeID = rw.ID
 			}
 		case descpb.TypeDescriptor_ALIAS:
 			// We need to rewrite any ID's present in the aliased types.T.
 			rewriteIDsInTypesT(typ.Alias, descriptorRewrites)
-		case descpb.TypeDescriptor_MULTIREGION_ENUM:
-			typ.ArrayTypeID = descpb.InvalidID
 		default:
 			return errors.AssertionFailedf("unknown type kind %s", t.String())
 		}
@@ -980,17 +978,9 @@ func maybeRewriteSchemaID(
 
 // RewriteTableDescs mutates tables to match the ID and privilege specified
 // in descriptorRewrites, as well as adjusting cross-table references to use the
-// new IDs. overrideDB can be specified to set database names in views. The
-// canResetModTime parameter is set based on the cluster version. It is unsafe
-// to reset the mod time in a mixed version state as 20.1 nodes expect the mod
-// time to be set on all descriptors which are deserialized, even at version 1.
-//
-// TODO(ajwerner): Remove canResetModTime in 21.1.
+// new IDs. overrideDB can be specified to set database names in views.
 func RewriteTableDescs(
-	tables []*tabledesc.Mutable,
-	descriptorRewrites DescRewriteMap,
-	overrideDB string,
-	canResetModTime bool,
+	tables []*tabledesc.Mutable, descriptorRewrites DescRewriteMap, overrideDB string,
 ) error {
 	for _, table := range tables {
 		tableRewrite, ok := descriptorRewrites[table.ID]
@@ -999,9 +989,7 @@ func RewriteTableDescs(
 		}
 		// Reset the version and modification time on this new descriptor.
 		table.Version = 1
-		if canResetModTime {
-			table.ModificationTime = hlc.Timestamp{}
-		}
+		table.ModificationTime = hlc.Timestamp{}
 
 		if table.IsView() && overrideDB != "" {
 			// restore checks that all dependencies are also being restored, but if
@@ -1033,7 +1021,8 @@ func RewriteTableDescs(
 			return err
 		}
 
-		if err := table.ForeachNonDropIndex(func(index *descpb.IndexDescriptor) error {
+		if err := catalog.ForEachNonDropIndex(table, func(indexI catalog.Index) error {
+			index := indexI.IndexDesc()
 			// Verify that for any interleaved index being restored, the interleave
 			// parent is also being restored. Otherwise, the interleave entries in the
 			// restored IndexDescriptors won't have anything to point to.
@@ -1194,7 +1183,7 @@ func errOnMissingRange(span covering.Range, start, end hlc.Timestamp) error {
 func getUserDescriptorNames(
 	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec,
 ) ([]string, error) {
-	allDescs, err := catalogkv.GetAllDescriptors(ctx, txn, codec, true /* validate */)
+	allDescs, err := catalogkv.GetAllDescriptors(ctx, txn, codec)
 	if err != nil {
 		return nil, err
 	}
@@ -1289,8 +1278,10 @@ func restorePlanHook(
 		return nil, nil, nil, false, nil
 	}
 
-	if err := featureflag.CheckEnabled(featureRestoreEnabled,
-		&p.ExecCfg().Settings.SV,
+	if err := featureflag.CheckEnabled(
+		ctx,
+		p.ExecCfg(),
+		featureRestoreEnabled,
 		"RESTORE",
 	); err != nil {
 		return nil, nil, nil, false, err
@@ -1465,7 +1456,7 @@ func checkPrivilegesForRestore(
 	for i := range from {
 		for j := range from[i] {
 			uri := from[i][j]
-			hasExplicitAuth, uriScheme, err := cloudimpl.AccessIsWithExplicitAuth(uri)
+			hasExplicitAuth, uriScheme, err := cloud.AccessIsWithExplicitAuth(uri)
 			if err != nil {
 				return err
 			}
@@ -1660,13 +1651,7 @@ func doRestorePlan(
 
 	// We attempt to rewrite ID's in the collected type and table descriptors
 	// to catch errors during this process here, rather than in the job itself.
-	//
-	// TODO(ajwerner): Remove this version check in 21.1.
-	canResetModTime := p.ExecCfg().Settings.Version.IsActive(
-		ctx, clusterversion.VersionLeasedDatabaseDescriptors)
-	if err := RewriteTableDescs(
-		tables, descriptorRewrites, intoDB, canResetModTime,
-	); err != nil {
+	if err := RewriteTableDescs(tables, descriptorRewrites, intoDB); err != nil {
 		return err
 	}
 	if err := rewriteDatabaseDescs(databases, descriptorRewrites); err != nil {
@@ -1729,7 +1714,7 @@ func doRestorePlan(
 
 	var sj *jobs.StartableJob
 	if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-		sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn, resultsCh)
+		sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn)
 		if err != nil {
 			return err
 		}
@@ -1744,7 +1729,13 @@ func doRestorePlan(
 	}
 
 	collectTelemetry()
-	return sj.Run(ctx)
+	if err := sj.Start(ctx); err != nil {
+		return err
+	}
+	if err := sj.AwaitCompletion(ctx); err != nil {
+		return err
+	}
+	return sj.ReportExecutionResults(ctx, resultsCh)
 }
 
 func init() {

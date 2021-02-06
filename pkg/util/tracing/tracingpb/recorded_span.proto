@@ -30,8 +30,9 @@ message LogRecord {
   repeated Field fields = 2 [(gogoproto.nullable) = false];
 }
 
-// RecordedSpan is a span that is part of a recording. It can be transferred
-// over the wire for snowball tracing.
+// RecordedSpan is the data recorded by a trace span. It
+// needs to be able to cross RPC boundaries so that the
+// complete recording of the trace can be constructed.
 message RecordedSpan {
   option (gogoproto.goproto_stringer) = false;
 
@@ -40,23 +41,23 @@ message RecordedSpan {
   uint64 trace_id = 1 [(gogoproto.customname) = "TraceID"];
   // ID of the span.
   uint64 span_id = 2 [(gogoproto.customname) = "SpanID"];
-  // Span ID of the parent span.
+  // ID of the parent span.
   uint64 parent_span_id = 3 [(gogoproto.customname) = "ParentSpanID"];
   // Operation name.
   string operation = 4;
   // Baggage items get passed from parent to child spans (even through gRPC).
-  // Notably, snowball tracing uses a special `sb` baggage item.
+  // Notably, verbose tracing uses a special baggage item.
   map<string, string> baggage = 5;
   // Tags associated with the span.
   map<string, string> tags = 6;
   // Time when the span was started.
   google.protobuf.Timestamp start_time = 7 [(gogoproto.nullable) = false,
                                             (gogoproto.stdtime) = true];
-  // Duration is the span's duration, measured from start to Finish().
+  // The span's duration, measured from start to Finish().
   //
-  // A spans whose recording is collected before it's finished will have the
-  // duration set as the time of collection - start_time. Such a span will have
-  // an "unfinished" tag.
+  // A span whose recording is collected before it's finished will have the
+  // duration set as the "time of collection - start time". Such a span will
+  // have an "unfinished" tag.
   google.protobuf.Duration duration = 8 [(gogoproto.nullable) = false,
                                          (gogoproto.stdduration) = true];
 
@@ -64,7 +65,20 @@ message RecordedSpan {
   repeated LogRecord logs = 9 [(gogoproto.nullable) = false];
 
   // Stats collected in this span.
-  google.protobuf.Any stats = 10;
+  //
+  // TODO(tbg): remove in 21.2 cycle. Stats will use the structured field below;
+  // 21.1 nodes already know to look there.
+  google.protobuf.Any deprecated_stats = 10;
+
+  // InternalStructured are payloads attached to this Span.
+  //
+  // Do not use directly, but call Structured() instead.
+  //
+  // TODO(tbg): rename once DeprecatedStats is removed.
+  repeated google.protobuf.Any internal_structured = 11;
+
+  // The ID of the goroutine on which the span was created.
+  uint64 goroutine_id = 12 [(gogoproto.customname) = "GoroutineID"];
 }
 
 // NormalizedSpan is a representation of a RecordedSpan from a trace with all

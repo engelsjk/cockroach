@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
@@ -131,14 +132,14 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sqlDB.Exec(`INSERT INTO system.zones VALUES ($1, $2)`, tbDesc.ID, buf); err != nil {
+	if _, err := sqlDB.Exec(`INSERT INTO system.zones VALUES ($1, $2)`, tbDesc.GetID(), buf); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sqlDB.Exec(`INSERT INTO system.zones VALUES ($1, $2)`, dbDesc.GetID(), buf); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := zoneExists(sqlDB, &cfg, tbDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, &cfg, tbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 	if err := zoneExists(sqlDB, &cfg, dbDesc.GetID()); err != nil {
@@ -160,11 +161,11 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	// Data is not deleted.
 	tests.CheckKeyCount(t, kvDB, tableSpan, 6)
 
-	if err := descExists(sqlDB, true, tbDesc.ID); err != nil {
+	if err := descExists(sqlDB, true, tbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 	tbNameKey := catalogkeys.MakeNameMetadataKey(keys.SystemSQLCodec,
-		tbDesc.GetParentID(), keys.PublicSchemaID, tbDesc.Name)
+		tbDesc.GetParentID(), keys.PublicSchemaID, tbDesc.GetName())
 	if gr, err := kvDB.Get(ctx, tbNameKey); err != nil {
 		t.Fatal(err)
 	} else if gr.Exists() {
@@ -186,7 +187,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 		t.Fatalf("database descriptor key still exists after database is dropped")
 	}
 
-	if err := zoneExists(sqlDB, &cfg, tbDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, &cfg, tbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -203,7 +204,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 		Username:    security.RootUserName(),
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: descpb.IDs{
-			tbDesc.ID,
+			tbDesc.GetID(),
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -319,7 +320,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 		Username:    security.RootUserName(),
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: descpb.IDs{
-			tbDesc.ID, tb2Desc.ID,
+			tbDesc.GetID(), tb2Desc.GetID(),
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -327,16 +328,16 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 
 	// Push a new zone config for the table with TTL=0 so the data is
 	// deleted immediately.
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tbDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		if err := descExists(sqlDB, false, tbDesc.ID); err != nil {
+		if err := descExists(sqlDB, false, tbDesc.GetID()); err != nil {
 			return err
 		}
 
-		return zoneExists(sqlDB, nil, tbDesc.ID)
+		return zoneExists(sqlDB, nil, tbDesc.GetID())
 	})
 
 	// Table 1 data is deleted.
@@ -353,12 +354,12 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 			Username:    security.RootUserName(),
 			Description: "GC for DROP DATABASE t CASCADE",
 			DescriptorIDs: descpb.IDs{
-				tbDesc.ID, tb2Desc.ID,
+				tbDesc.GetID(), tb2Desc.GetID(),
 			},
 		})
 	})
 
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tb2Desc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tb2Desc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, dbDesc.GetID()); err != nil {
@@ -366,11 +367,11 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		if err := descExists(sqlDB, false, tb2Desc.ID); err != nil {
+		if err := descExists(sqlDB, false, tb2Desc.GetID()); err != nil {
 			return err
 		}
 
-		return zoneExists(sqlDB, nil, tb2Desc.ID)
+		return zoneExists(sqlDB, nil, tb2Desc.GetID())
 	})
 
 	// Table 2 data is deleted.
@@ -380,7 +381,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 		Username:    security.RootUserName(),
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: descpb.IDs{
-			tbDesc.ID, tb2Desc.ID,
+			tbDesc.GetID(), tb2Desc.GetID(),
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -425,18 +426,18 @@ func TestDropIndex(t *testing.T) {
 	}
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(keys.SystemSQLCodec), 3*numRows)
-	idx, _, err := tableDesc.FindIndexByName("foo")
+	idx, err := tableDesc.FindIndexWithName("foo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, idx.ID)
+	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, idx.GetID())
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 	if _, err := sqlDB.Exec(`DROP INDEX t.kv@foo`); err != nil {
 		t.Fatal(err)
 	}
 
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-	if _, _, err := tableDesc.FindIndexByName("foo"); err == nil {
+	if _, err := tableDesc.FindIndexWithName("foo"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
 	// Index data hasn't been deleted.
@@ -451,7 +452,7 @@ func TestDropIndex(t *testing.T) {
 		Username:    security.RootUserName(),
 		Description: `DROP INDEX t.public.kv@foo`,
 		DescriptorIDs: descpb.IDs{
-			tableDesc.ID,
+			tableDesc.GetID(),
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -462,17 +463,17 @@ func TestDropIndex(t *testing.T) {
 	}
 
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-	newIdx, _, err := tableDesc.FindIndexByName("foo")
+	newIdx, err := tableDesc.FindIndexWithName("foo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	newIdxSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, newIdx.ID)
+	newIdxSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, newIdx.GetID())
 	tests.CheckKeyCount(t, kvDB, newIdxSpan, numRows)
 	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(keys.SystemSQLCodec), 4*numRows)
 
 	clearIndexAttempt = true
 	// Add a zone config for the table.
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -481,7 +482,7 @@ func TestDropIndex(t *testing.T) {
 			Username:    security.RootUserName(),
 			Description: `DROP INDEX t.public.kv@foo`,
 			DescriptorIDs: descpb.IDs{
-				tableDesc.ID,
+				tableDesc.GetID(),
 			},
 		})
 	})
@@ -491,7 +492,7 @@ func TestDropIndex(t *testing.T) {
 			Username:    security.RootUserName(),
 			Description: `GC for DROP INDEX t.public.kv@foo`,
 			DescriptorIDs: descpb.IDs{
-				tableDesc.ID,
+				tableDesc.GetID(),
 			},
 		})
 	})
@@ -525,11 +526,11 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 		t.Fatal(err)
 	}
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-	indexDesc, _, err := tableDesc.FindIndexByName("foo")
+	index, err := tableDesc.FindIndexWithName("foo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, indexDesc.ID)
+	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, index.GetID())
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 
 	// Hack in zone configs for the primary and secondary indexes. (You need a CCL
@@ -538,15 +539,15 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 	// required" error.
 	zoneConfig := zonepb.ZoneConfig{
 		Subzones: []zonepb.Subzone{
-			{IndexID: uint32(tableDesc.PrimaryIndex.ID), Config: s.(*server.TestServer).Cfg.DefaultZoneConfig},
-			{IndexID: uint32(indexDesc.ID), Config: s.(*server.TestServer).Cfg.DefaultZoneConfig},
+			{IndexID: uint32(tableDesc.GetPrimaryIndexID()), Config: s.(*server.TestServer).Cfg.DefaultZoneConfig},
+			{IndexID: uint32(index.GetID()), Config: s.(*server.TestServer).Cfg.DefaultZoneConfig},
 		},
 	}
 	zoneConfigBytes, err := protoutil.Marshal(&zoneConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sqlDB.Exec(t, `INSERT INTO system.zones VALUES ($1, $2)`, tableDesc.ID, zoneConfigBytes)
+	sqlDB.Exec(t, `INSERT INTO system.zones VALUES ($1, $2)`, tableDesc.GetID(), zoneConfigBytes)
 	if !sqlutils.ZoneConfigExists(t, sqlDB, "INDEX t.public.kv@foo") {
 		t.Fatal("zone config for index does not exist")
 	}
@@ -564,7 +565,7 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 	// declares column families.
 
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-	if _, _, err := tableDesc.FindIndexByName("foo"); err == nil {
+	if _, err := tableDesc.FindIndexWithName("foo"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
 }
@@ -597,7 +598,7 @@ func TestDropIndexInterleaved(t *testing.T) {
 
 	// Ensure that index is not active.
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "intlv")
-	if _, _, err := tableDesc.FindIndexByName("intlv_idx"); err == nil {
+	if _, err := tableDesc.FindIndexWithName("intlv_idx"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
 }
@@ -630,12 +631,12 @@ func TestDropTable(t *testing.T) {
 	}
 
 	// Add a zone config for the table.
-	cfg, err := sqltestutils.AddDefaultZoneConfig(sqlDB, tableDesc.ID)
+	cfg, err := sqltestutils.AddDefaultZoneConfig(sqlDB, tableDesc.GetID())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := zoneExists(sqlDB, &cfg, tableDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, &cfg, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -666,7 +667,7 @@ func TestDropTable(t *testing.T) {
 		Username:    security.RootUserName(),
 		Description: `DROP TABLE t.public.kv`,
 		DescriptorIDs: descpb.IDs{
-			tableDesc.ID,
+			tableDesc.GetID(),
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -681,11 +682,11 @@ func TestDropTable(t *testing.T) {
 	// asynchronous path.
 	tests.CheckKeyCount(t, kvDB, tableSpan, 3*numRows)
 
-	if err := descExists(sqlDB, true, tableDesc.ID); err != nil {
+	if err := descExists(sqlDB, true, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := zoneExists(sqlDB, &cfg, tableDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, &cfg, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -709,7 +710,7 @@ func TestDropTableDeleteData(t *testing.T) {
 	const numRows = 2*row.TableTruncateChunkSize + 1
 	const numKeys = 3 * numRows
 	const numTables = 5
-	var descs []*tabledesc.Immutable
+	var descs []catalog.TableDescriptor
 	for i := 0; i < numTables; i++ {
 		tableName := fmt.Sprintf("test%d", i)
 		if err := tests.CreateKVTable(sqlDB, tableName, numRows); err != nil {
@@ -742,7 +743,7 @@ func TestDropTableDeleteData(t *testing.T) {
 	// Data hasn't been GC-ed.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	for i := 0; i < numTables; i++ {
-		if err := descExists(sqlDB, true, descs[i].ID); err != nil {
+		if err := descExists(sqlDB, true, descs[i].GetID()); err != nil {
 			t.Fatal(err)
 		}
 		tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
@@ -752,7 +753,7 @@ func TestDropTableDeleteData(t *testing.T) {
 			Username:    security.RootUserName(),
 			Description: fmt.Sprintf(`DROP TABLE t.public.%s`, descs[i].GetName()),
 			DescriptorIDs: descpb.IDs{
-				descs[i].ID,
+				descs[i].GetID(),
 			},
 		}); err != nil {
 			t.Fatal(err)
@@ -761,18 +762,18 @@ func TestDropTableDeleteData(t *testing.T) {
 
 	// The closure pushes a zone config reducing the TTL to 0 for descriptor i.
 	pushZoneCfg := func(i int) {
-		if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, descs[i].ID); err != nil {
+		if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, descs[i].GetID()); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	checkTableGCed := func(i int) {
 		testutils.SucceedsSoon(t, func() error {
-			if err := descExists(sqlDB, false, descs[i].ID); err != nil {
+			if err := descExists(sqlDB, false, descs[i].GetID()); err != nil {
 				return err
 			}
 
-			return zoneExists(sqlDB, nil, descs[i].ID)
+			return zoneExists(sqlDB, nil, descs[i].GetID())
 		})
 		tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
 		tests.CheckKeyCount(t, kvDB, tableSpan, 0)
@@ -782,7 +783,7 @@ func TestDropTableDeleteData(t *testing.T) {
 			Username:    security.RootUserName(),
 			Description: fmt.Sprintf(`DROP TABLE t.public.%s`, descs[i].GetName()),
 			DescriptorIDs: descpb.IDs{
-				descs[i].ID,
+				descs[i].GetID(),
 			},
 		}); err != nil {
 			t.Fatal(err)
@@ -794,7 +795,7 @@ func TestDropTableDeleteData(t *testing.T) {
 				Username:    security.RootUserName(),
 				Description: fmt.Sprintf(`GC for DROP TABLE t.public.%s`, descs[i].GetName()),
 				DescriptorIDs: descpb.IDs{
-					descs[i].ID,
+					descs[i].GetID(),
 				},
 			})
 		})
@@ -948,12 +949,12 @@ func TestDropTableInterleavedDeleteData(t *testing.T) {
 		t.Fatalf("different error than expected: %v", err)
 	}
 
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDescInterleaved.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDescInterleaved.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		return descExists(sqlDB, false, tableDescInterleaved.ID)
+		return descExists(sqlDB, false, tableDescInterleaved.GetID())
 	})
 
 	tests.CheckKeyCount(t, kvDB, tableSpan, numRows)
@@ -1038,7 +1039,7 @@ func TestDropDatabaseAfterDropTable(t *testing.T) {
 			Username:    security.RootUserName(),
 			Description: "DROP TABLE t.public.kv",
 			DescriptorIDs: descpb.IDs{
-				tableDesc.ID,
+				tableDesc.GetID(),
 			},
 		}); err != nil {
 		t.Fatal(err)
@@ -1384,4 +1385,70 @@ CREATE TABLE t.child(k INT PRIMARY KEY REFERENCES t.parent);
 	// Check that the data was cleaned up.
 	tests.CheckKeyCount(t, kvDB, parentDesc.TableSpan(keys.SystemSQLCodec), 0)
 	tests.CheckKeyCount(t, kvDB, childDesc.TableSpan(keys.SystemSQLCodec), 0)
+}
+
+// Test that non-physical table deletions like DROP VIEW are immediate instead
+// of via a GC job.
+func TestDropPhysicalTableGC(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	params, _ := tests.CreateTestServerParams()
+
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+
+	_, err := sqlDB.Exec(`CREATE DATABASE test;`)
+	require.NoError(t, err)
+	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+
+	type tableInstance struct {
+		name         string
+		sqlType      string
+		isPhysical   bool
+		createClause string
+	}
+
+	for _, table := range [4]tableInstance{
+		{name: "t", sqlType: "TABLE", isPhysical: true, createClause: `(a INT PRIMARY KEY)`},
+		{name: "mv", sqlType: "MATERIALIZED VIEW", isPhysical: true, createClause: `AS SELECT 1`},
+		{name: "s", sqlType: "SEQUENCE", isPhysical: true, createClause: `START 1`},
+		{name: "v", sqlType: "VIEW", isPhysical: false, createClause: `AS SELECT 1`},
+	} {
+		// Create table.
+		_, err := sqlDB.Exec(fmt.Sprintf(`CREATE %s test.%s %s;`, table.sqlType, table.name, table.createClause))
+		require.NoError(t, err)
+		// Fetch table descriptor ID for future system table lookups.
+		tableDescriptor := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", table.name)
+		require.NotNil(t, tableDescriptor)
+		tableDescriptorId := tableDescriptor.GetID()
+		// Create a new zone config for the table to test its proper deletion.
+		_, err = sqlDB.Exec(fmt.Sprintf(`ALTER TABLE test.%s CONFIGURE ZONE USING gc.ttlseconds = 123456;`, table.name))
+		require.NoError(t, err)
+		// Drop table.
+		_, err = sqlDB.Exec(fmt.Sprintf(`DROP %s test.%s;`, table.sqlType, table.name))
+		require.NoError(t, err)
+		// Check for GC job kickoff.
+		var actualGCJobs int
+		countSql := fmt.Sprintf(
+			`SELECT sum(CASE description WHEN 'GC for DROP %s test.public.%s' THEN 1 ELSE 0 END) FROM [SHOW JOBS]`,
+			table.sqlType,
+			table.name)
+		sqlRun.QueryRow(t, countSql).Scan(&actualGCJobs)
+		if table.isPhysical {
+			// GC job should be created.
+			require.Equalf(t, 1, actualGCJobs, "Expected one GC job for DROP %s.", table.name, actualGCJobs)
+		} else {
+			// GC job should not be created.
+			require.Zerof(t, actualGCJobs, "Expected no GC job for DROP %s.", actualGCJobs, table.name)
+			// Test deletion of non-physical table descriptor.
+			const idCountSqlFmt = `SELECT sum(CASE id WHEN %d THEN 1 ELSE 0 END) FROM system.%s`
+			var actualDescriptors int
+			sqlRun.QueryRow(t, fmt.Sprintf(idCountSqlFmt, tableDescriptorId, "descriptor")).Scan(&actualDescriptors)
+			require.Zerof(t, actualDescriptors, "Descriptor for '%s' was not deleted as expected.", table.name)
+			// Test deletion of non-physical table zone config.
+			var actualZoneConfigs int
+			sqlRun.QueryRow(t, fmt.Sprintf(idCountSqlFmt, tableDescriptorId, "zones")).Scan(&actualZoneConfigs)
+			require.Zerof(t, actualZoneConfigs, "Zone config for '%s' was not deleted as expected.", table.name)
+		}
+	}
 }

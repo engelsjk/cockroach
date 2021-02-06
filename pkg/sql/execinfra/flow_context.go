@@ -59,8 +59,14 @@ type FlowCtx struct {
 	// TraceKV is true if KV tracing was requested by the session.
 	TraceKV bool
 
+	// CollectStats is true if execution stats collection was requested.
+	CollectStats bool
+
 	// Local is true if this flow is being run as part of a local-only query.
 	Local bool
+
+	// Gateway is true if this flow is being run on the gateway node.
+	Gateway bool
 
 	// TypeResolverFactory is used to construct transaction bound TypeResolvers
 	// to resolve type references during flow setup. It is not safe for concurrent
@@ -97,4 +103,15 @@ func (ctx *FlowCtx) Stopper() *stop.Stopper {
 // Codec returns the SQL codec for this flowCtx.
 func (ctx *FlowCtx) Codec() keys.SQLCodec {
 	return ctx.EvalCtx.Codec
+}
+
+// ProcessorComponentID returns a ComponentID for the given processor in this
+// flow.
+func (ctx *FlowCtx) ProcessorComponentID(procID int32) execinfrapb.ComponentID {
+	return execinfrapb.ProcessorComponentID(ctx.ID, procID)
+}
+
+// StreamComponentID returns a ComponentID for the given stream in this flow.
+func (ctx *FlowCtx) StreamComponentID(streamID execinfrapb.StreamID) execinfrapb.ComponentID {
+	return execinfrapb.StreamComponentID(ctx.ID, streamID)
 }

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -66,6 +67,7 @@ import (
 // - `=foo` means exactly key `foo`
 // - `+foo` means `Key(foo).Next()`
 // - `-foo` means `Key(foo).PrefixEnd()`
+// - `%foo` means `append(LocalRangePrefix, "foo")`
 //
 // Additionally, the pseudo-command `with` enables sharing
 // a group of arguments between multiple commands, for example:
@@ -88,10 +90,20 @@ func TestMVCCHistories(t *testing.T) {
 		t.Run(engineImpl.name, func(t *testing.T) {
 
 			// Everything reads/writes under the same prefix.
-			key := roachpb.Key("")
-			span := roachpb.Span{Key: key, EndKey: key.PrefixEnd()}
+			span := roachpb.Span{Key: keys.LocalMax, EndKey: roachpb.KeyMax}
 
 			datadriven.Walk(t, "testdata/mvcc_histories", func(t *testing.T, path string) {
+				if strings.Contains(path, "_disallow_separated") && !DisallowSeparatedIntents {
+					return
+				}
+				if strings.Contains(path, "_allow_separated") &&
+					(DisallowSeparatedIntents || enabledSeparatedIntents) {
+					return
+				}
+				if strings.Contains(path, "_enable_separated") &&
+					(DisallowSeparatedIntents || !enabledSeparatedIntents) {
+					return
+				}
 				// We start from a clean slate in every test file.
 				engine := engineImpl.create()
 				defer engine.Close()
@@ -572,7 +584,7 @@ func cmdCheckIntent(e *evalCtx) error {
 
 func cmdClearRange(e *evalCtx) error {
 	key, endKey := e.getKeyRange()
-	return e.engine.ClearRawRange(key, endKey)
+	return e.engine.ClearMVCCRangeAndIntents(key, endKey)
 }
 
 func cmdCPut(e *evalCtx) error {
@@ -874,24 +886,10 @@ func (e *evalCtx) getTsWithName(txn *roachpb.Transaction, name string) hlc.Times
 	}
 	var tsS string
 	e.scanArg(name, &tsS)
-	parts := strings.Split(tsS, ",")
-
-	// Find the wall time part.
-	tsW, err := strconv.ParseInt(parts[0], 10, 64)
+	ts, err := hlc.ParseTimestamp(tsS)
 	if err != nil {
 		e.Fatalf("%v", err)
 	}
-	ts.WallTime = tsW
-
-	// Find the logical part, if there is one.
-	var tsL int64
-	if len(parts) > 1 {
-		tsL, err = strconv.ParseInt(parts[1], 10, 32)
-		if err != nil {
-			e.Fatalf("%v", err)
-		}
-	}
-	ts.Logical = int32(tsL)
 	return ts
 }
 
@@ -1026,6 +1024,8 @@ func toKey(s string) roachpb.Key {
 		return roachpb.Key(s[1:])
 	case len(s) > 0 && s[0] == '-':
 		return roachpb.Key(s[1:]).PrefixEnd()
+	case len(s) > 0 && s[0] == '%':
+		return append(keys.LocalRangePrefix, s[1:]...)
 	default:
 		return roachpb.Key(s)
 	}

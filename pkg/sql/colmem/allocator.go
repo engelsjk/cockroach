@@ -67,6 +67,21 @@ func getVecsMemoryFootprint(vecs []coldata.Vec) int64 {
 	return size
 }
 
+// GetBatchMemSize returns the total memory footprint of the batch.
+func GetBatchMemSize(b coldata.Batch) int64 {
+	if b == nil || b == coldata.ZeroBatch {
+		return 0
+	}
+	// We need to get the capacity of the internal selection vector, even if b
+	// currently doesn't use it, so we set selection to true and will reset
+	// below.
+	usesSel := b.Selection() != nil
+	b.SetSelection(true)
+	memUsage := selVectorSize(cap(b.Selection())) + getVecsMemoryFootprint(b.ColVecs())
+	b.SetSelection(usesSel)
+	return memUsage
+}
+
 // GetProportionalBatchMemSize returns the memory size of the batch that is
 // proportional to given 'length'. This method returns the estimated memory
 // footprint *only* of the first 'length' tuples in 'b'.
@@ -153,7 +168,7 @@ func (a *Allocator) ResetMaybeReallocate(
 	if oldBatch == nil {
 		newBatch = a.NewMemBatchWithFixedCapacity(typs, minCapacity)
 	} else if oldBatch.Capacity() < coldata.BatchSize() {
-		a.ReleaseBatch(oldBatch)
+		a.ReleaseMemory(GetBatchMemSize(oldBatch))
 		newCapacity := oldBatch.Capacity() * 2
 		if newCapacity < minCapacity {
 			newCapacity = minCapacity
@@ -168,51 +183,6 @@ func (a *Allocator) ResetMaybeReallocate(
 		newBatch = oldBatch
 	}
 	return newBatch, reallocated
-}
-
-// RetainBatch adds the size of the batch to the memory account. This shouldn't
-// need to be used regularly, since most memory accounting necessary is done
-// through PerformOperation. Use this if you want to explicitly manage the
-// memory accounted for.
-// NOTE: when calculating memory footprint, this method looks at the capacities
-// of the vectors and does *not* pay attention to the length of the batch.
-func (a *Allocator) RetainBatch(b coldata.Batch) {
-	if b == coldata.ZeroBatch {
-		// coldata.ZeroBatch takes up no space but also doesn't support the change
-		// of the selection vector, so we need to handle it separately.
-		return
-	}
-	// We need to get the capacity of the internal selection vector, even if b
-	// currently doesn't use it, so we set selection to true and will reset
-	// below.
-	usesSel := b.Selection() != nil
-	b.SetSelection(true)
-	if err := a.acc.Grow(a.ctx, selVectorSize(cap(b.Selection()))+getVecsMemoryFootprint(b.ColVecs())); err != nil {
-		colexecerror.InternalError(err)
-	}
-	b.SetSelection(usesSel)
-}
-
-// ReleaseBatch releases the size of the batch from the memory account. This
-// shouldn't need to be used regularly, since all accounts are closed by
-// Flow.Cleanup. Use this if you want to explicitly manage the memory used. An
-// example of a use case is releasing a batch before writing it to disk.
-// NOTE: when calculating memory footprint, this method looks at the capacities
-// of the vectors and does *not* pay attention to the length of the batch.
-func (a *Allocator) ReleaseBatch(b coldata.Batch) {
-	if b == coldata.ZeroBatch {
-		// coldata.ZeroBatch takes up no space but also doesn't support the change
-		// of the selection vector, so we need to handle it separately.
-		return
-	}
-	// We need to get the capacity of the internal selection vector, even if b
-	// currently doesn't use it, so we set selection to true and will reset
-	// below.
-	usesSel := b.Selection() != nil
-	b.SetSelection(true)
-	batchMemSize := selVectorSize(cap(b.Selection())) + getVecsMemoryFootprint(b.ColVecs())
-	a.ReleaseMemory(batchMemSize)
-	b.SetSelection(usesSel)
 }
 
 // NewMemColumn returns a new coldata.Vec of the desired capacity.
@@ -242,22 +212,40 @@ func (a *Allocator) MaybeAppendColumn(b coldata.Batch, t *types.T, colIdx int) {
 		colexecerror.InternalError(errors.AssertionFailedf("trying to add a column to zero length batch"))
 	}
 	width := b.Width()
+	desiredCapacity := b.Capacity()
+	if desiredCapacity == 0 {
+		// In some cases (like when we have a windowed batch), the capacity
+		// might be set to zero, yet we want to make sure that the vectors have
+		// enough space to accommodate the length of the batch.
+		desiredCapacity = b.Length()
+	}
 	if colIdx < width {
 		presentVec := b.ColVec(colIdx)
 		presentType := presentVec.Type()
+		if presentType.Family() == types.UnknownFamily {
+			// We already have an unknown vector in place. If this is expected,
+			// then it will not be accessed and we're good; if this is not
+			// expected, then an error will occur later.
+			return
+		}
 		if presentType.Identical(t) {
 			// We already have the vector of the desired type in place.
+			if presentVec.Capacity() < desiredCapacity {
+				// Unfortunately, the present vector is not of sufficient
+				// capacity, so we need to replace it.
+				oldMemUsage := getVecMemoryFootprint(presentVec)
+				newEstimatedMemoryUsage := int64(EstimateBatchSizeBytes([]*types.T{t}, desiredCapacity))
+				if err := a.acc.Grow(a.ctx, newEstimatedMemoryUsage-oldMemUsage); err != nil {
+					colexecerror.InternalError(err)
+				}
+				b.ReplaceCol(a.NewMemColumn(t, desiredCapacity), colIdx)
+				return
+			}
 			if presentVec.CanonicalTypeFamily() == types.BytesFamily {
 				// Flat bytes vector needs to be reset before the vector can be
 				// reused.
 				presentVec.Bytes().Reset()
 			}
-			return
-		}
-		if presentType.Family() == types.UnknownFamily {
-			// We already have an unknown vector in place. If this is expected,
-			// then it will not be accessed and we're good; if this is not
-			// expected, then an error will occur later.
 			return
 		}
 		// We have a vector with an unexpected type, so we panic.
@@ -273,11 +261,11 @@ func (a *Allocator) MaybeAppendColumn(b coldata.Batch, t *types.T, colIdx int) {
 			t, colIdx, width,
 		))
 	}
-	estimatedMemoryUsage := int64(EstimateBatchSizeBytes([]*types.T{t}, b.Capacity()))
+	estimatedMemoryUsage := int64(EstimateBatchSizeBytes([]*types.T{t}, desiredCapacity))
 	if err := a.acc.Grow(a.ctx, estimatedMemoryUsage); err != nil {
 		colexecerror.InternalError(err)
 	}
-	b.AppendCol(a.NewMemColumn(t, b.Capacity()))
+	b.AppendCol(a.NewMemColumn(t, desiredCapacity))
 }
 
 // PerformOperation executes 'operation' (that somehow modifies 'destVecs') and
@@ -339,8 +327,8 @@ const (
 
 func sizeOfDecimals(decimals coldata.Decimals) uintptr {
 	var size uintptr
-	for _, d := range decimals {
-		size += tree.SizeOfDecimal(d)
+	for i := range decimals {
+		size += tree.SizeOfDecimal(&decimals[i])
 	}
 	size += uintptr(cap(decimals)-len(decimals)) * sizeOfDecimal
 	return size

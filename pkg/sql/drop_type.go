@@ -24,12 +24,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
+type typeToDrop struct {
+	desc   *typedesc.Mutable
+	fqName string
+}
+
 type dropTypeNode struct {
 	n  *tree.DropType
-	td map[descpb.ID]*typedesc.Mutable
+	td map[descpb.ID]typeToDrop
 }
 
 // Use to satisfy the linter.
@@ -37,7 +43,8 @@ var _ planNode = &dropTypeNode{n: nil}
 
 func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
-		&p.ExecCfg().Settings.SV,
+		ctx,
+		p.ExecCfg(),
 		"DROP TYPE",
 	); err != nil {
 		return nil, err
@@ -45,7 +52,7 @@ func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, err
 
 	node := &dropTypeNode{
 		n:  n,
-		td: make(map[descpb.ID]*typedesc.Mutable),
+		td: make(map[descpb.ID]typeToDrop),
 	}
 	if n.DropBehavior == tree.DropCascade {
 		return nil, unimplemented.NewWithIssue(51480, "DROP TYPE CASCADE is not yet supported")
@@ -100,8 +107,21 @@ func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, err
 		}
 
 		// Record these descriptors for deletion.
-		node.td[typeDesc.ID] = typeDesc
-		node.td[mutArrayDesc.ID] = mutArrayDesc
+		node.td[typeDesc.ID] = typeToDrop{
+			desc:   typeDesc,
+			fqName: tree.AsStringWithFQNames(name, p.Ann()),
+		}
+		arrayFQName, err := getTypeNameFromTypeDescriptor(
+			oneAtATimeSchemaResolver{ctx, p},
+			mutArrayDesc,
+		)
+		if err != nil {
+			return nil, err
+		}
+		node.td[mutArrayDesc.ID] = typeToDrop{
+			desc:   mutArrayDesc,
+			fqName: arrayFQName.FQString(),
+		}
 	}
 	return node, nil
 }
@@ -113,17 +133,9 @@ func (p *planner) canDropTypeDesc(
 		return err
 	}
 	if len(desc.ReferencingDescriptorIDs) > 0 && behavior != tree.DropCascade {
-		var dependentNames []string
-		for _, id := range desc.ReferencingDescriptorIDs {
-			desc, err := p.Descriptors().GetMutableTableVersionByID(ctx, id, p.txn)
-			if err != nil {
-				return errors.Wrapf(err, "type has dependent objects")
-			}
-			fqName, err := p.getQualifiedTableName(ctx, desc)
-			if err != nil {
-				return errors.Wrapf(err, "type %q has dependent objects", desc.Name)
-			}
-			dependentNames = append(dependentNames, fqName.FQString())
+		dependentNames, err := p.getFullyQualifiedTableNamesFromIDs(ctx, desc.ReferencingDescriptorIDs)
+		if err != nil {
+			return errors.Wrapf(err, "type %q has dependent objects", desc.Name)
 		}
 		return pgerror.Newf(
 			pgcode.DependentObjectsStillExist,
@@ -136,23 +148,13 @@ func (p *planner) canDropTypeDesc(
 }
 
 func (n *dropTypeNode) startExec(params runParams) error {
-	for _, typ := range n.td {
+	for _, toDrop := range n.td {
+		typ, fqName := toDrop.desc, toDrop.fqName
 		if err := params.p.dropTypeImpl(params.ctx, typ, tree.AsStringWithFQNames(n.n, params.Ann()), true /* queueJob */); err != nil {
 			return err
 		}
 		// Log a Drop Type event.
-		if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			params.ctx,
-			params.p.txn,
-			EventLogDropType,
-			int32(typ.ID),
-			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
-			struct {
-				TypeName  string
-				Statement string
-				User      string
-			}{typ.Name, tree.AsStringWithFQNames(n.n, params.Ann()), params.p.User().Normalized()},
-		); err != nil {
+		if err := params.p.logEvent(params.ctx, typ.ID, &eventpb.DropType{TypeName: fqName}); err != nil {
 			return err
 		}
 	}

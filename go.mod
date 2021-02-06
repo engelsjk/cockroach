@@ -34,14 +34,14 @@ require (
 	github.com/cockroachdb/circuitbreaker v2.2.2-0.20190114160014-a614b14ccf63+incompatible
 	github.com/cockroachdb/cmux v0.0.0-20170110192607-30d10be49292
 	github.com/cockroachdb/cockroach-go v0.0.0-20200504194139-73ffeee90b62
-	github.com/cockroachdb/crlfmt v0.0.0-20200116191136-a78e1c207bc0
-	github.com/cockroachdb/datadriven v1.0.1-0.20201022032720-3e27adf87325
-	github.com/cockroachdb/errors v1.8.1
+	github.com/cockroachdb/crlfmt v0.0.0-20210128092314-b3eff0b87c79
+	github.com/cockroachdb/datadriven v1.0.1-0.20201212195501-e89bf9ee1861
+	github.com/cockroachdb/errors v1.8.2
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.13.0
 	github.com/cockroachdb/logtags v0.0.0-20190617123548-eb05cc24525f
-	github.com/cockroachdb/pebble v0.0.0-20201119153812-62f2e316b532
-	github.com/cockroachdb/redact v1.0.8
+	github.com/cockroachdb/pebble v0.0.0-20210201233136-12ffb4e9273f
+	github.com/cockroachdb/redact v1.0.9
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/sentry-go v0.6.1-cockroachdb.2
 	github.com/cockroachdb/stress v0.0.0-20170808184505-29b5d31b4c3a
@@ -58,13 +58,14 @@ require (
 	github.com/edsrzf/mmap-go v1.0.0
 	github.com/elastic/gosigar v0.10.0
 	github.com/elazarl/go-bindata-assetfs v1.0.0
+	github.com/emicklei/dot v0.15.0
 	github.com/facebookgo/clock v0.0.0-20150410010913-600d898af40a
 	github.com/frankban/quicktest v1.7.3 // indirect
 	github.com/ghemawat/stream v0.0.0-20171120220530-696b145b53b9
 	github.com/go-ole/go-ole v1.2.2 // indirect
 	github.com/go-sql-driver/mysql v1.5.0
 	github.com/gofrs/uuid v3.3.0+incompatible // indirect
-	github.com/gogo/protobuf v1.3.1
+	github.com/gogo/protobuf v1.3.2
 	github.com/golang-commonmark/html v0.0.0-20180910111043-7d7c804e1d46 // indirect
 	github.com/golang-commonmark/linkify v0.0.0-20180910111149-f05efb453a0e // indirect
 	github.com/golang-commonmark/markdown v0.0.0-20180910011815-a8f139058164
@@ -81,14 +82,14 @@ require (
 	github.com/google/pprof v0.0.0-20190109223431-e84dfd68c163
 	github.com/googleapis/gax-go v2.0.2+incompatible // indirect
 	github.com/gorhill/cronexpr v0.0.0-20140423231348-a557574d6c02
-	github.com/gorilla/mux v1.7.4 // indirect
+	github.com/gorilla/mux v1.8.0
 	github.com/goware/modvendor v0.3.0
 	github.com/grpc-ecosystem/grpc-gateway v1.13.0
 	github.com/grpc-ecosystem/grpc-opentracing v0.0.0-20180507213350-8e809c8a8645
 	github.com/ianlancetaylor/cgosymbolizer v0.0.0-20201002210021-dda951febc36 // indirect
 	github.com/jackc/fake v0.0.0-20150926172116-812a484cc733 // indirect
-	github.com/jackc/pgconn v1.6.1 // indirect
-	github.com/jackc/pgproto3/v2 v2.0.4
+	github.com/jackc/pgconn v1.8.0
+	github.com/jackc/pgproto3/v2 v2.0.7
 	github.com/jackc/pgx v3.6.2+incompatible
 	github.com/jackc/pgx/v4 v4.6.0
 	github.com/jaegertracing/jaeger v1.17.0
@@ -96,7 +97,7 @@ require (
 	github.com/kevinburke/go-bindata v3.13.0+incompatible
 	github.com/kisielk/errcheck v1.2.0
 	github.com/kisielk/gotool v1.0.0
-	github.com/knz/go-libedit v0.0.0-00010101000000-000000000000
+	github.com/knz/go-libedit v1.10.1
 	github.com/knz/strtime v0.0.0-20200318182718-be999391ffa9
 	github.com/kr/pretty v0.2.1
 	github.com/kr/text v0.2.0
@@ -146,17 +147,18 @@ require (
 	github.com/wadey/gocovmerge v0.0.0-20160331181800-b5bfa59ec0ad
 	github.com/zabawaba99/go-gitignore v0.0.0-20200117185801-39e6bddfb292
 	go.etcd.io/etcd/raft/v3 v3.0.0-20201109164711-01844fd28560
-	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
-	golang.org/x/exp v0.0.0-20201008143054-e3b2a7f2fdc7
+	golang.org/x/crypto v0.0.0-20201221181555-eec23a3978ad
+	golang.org/x/exp v0.0.0-20210201131500-d352d2db2ceb
 	golang.org/x/lint v0.0.0-20200130185559-910be7a94367
-	golang.org/x/net v0.0.0-20200602114024-627f9648deb9
+	golang.org/x/net v0.0.0-20201021035429-f5854403a974
 	golang.org/x/oauth2 v0.0.0-20190115181402-5dab4167f31c
 	golang.org/x/perf v0.0.0-20180704124530-6e6d33e29852
 	golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9
-	golang.org/x/sys v0.0.0-20201119102817-f84b799fce68
-	golang.org/x/text v0.3.3
+	golang.org/x/sys v0.0.0-20210124154548-22da62e12c0c
+	golang.org/x/term v0.0.0-20201117132131-f5c789dd3221
+	golang.org/x/text v0.3.5
 	golang.org/x/time v0.0.0-20190308202827-9d24e82272b4
-	golang.org/x/tools v0.0.0-20200702044944-0cc1aa72b347
+	golang.org/x/tools v0.1.0
 	google.golang.org/api v0.1.0
 	google.golang.org/genproto v0.0.0-20200218151345-dad8c97a84f5 // indirect
 	google.golang.org/grpc v1.29.1
@@ -170,7 +172,7 @@ require (
 	vitess.io/vitess v0.0.0-00010101000000-000000000000
 )
 
-replace github.com/gogo/protobuf => github.com/cockroachdb/gogoproto v1.2.1-0.20190102194534-ca10b809dba0
+replace github.com/gogo/protobuf => github.com/cockroachdb/gogoproto v1.2.1-0.20210111172841-8b6737fea948
 
 replace github.com/grpc-ecosystem/grpc-gateway => github.com/cockroachdb/grpc-gateway v1.14.6-0.20200519165156-52697fc4a249
 

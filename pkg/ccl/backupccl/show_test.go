@@ -9,7 +9,10 @@
 package backupccl
 
 import (
+	"context"
+	gosql "database/sql"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -21,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -33,9 +37,9 @@ func TestShowBackup(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 11
-	_, tc, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitNone)
+	_, tc, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	kvDB := tc.Server(0).DB()
-	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitNone, base.TestClusterArgs{})
+	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 	defer cleanupEmptyCluster()
 	sqlDB.Exec(t, `
@@ -155,8 +159,8 @@ ORDER BY object_type, object_name`, full)
 
 	details1Desc := catalogkv.TestingGetTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "data", "details1")
 	details2Desc := catalogkv.TestingGetTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "data", "details2")
-	details1Key := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, details1Desc, details1Desc.PrimaryIndex.ID))
-	details2Key := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, details2Desc, details2Desc.PrimaryIndex.ID))
+	details1Key := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, details1Desc, details1Desc.GetPrimaryIndexID()))
+	details2Key := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, details2Desc, details2Desc.GetPrimaryIndexID()))
 
 	sqlDBRestore.CheckQueryResults(t, fmt.Sprintf(`SHOW BACKUP RANGES '%s'`, details), [][]string{
 		{"/Table/61/1", "/Table/61/2", string(details1Key), string(details1Key.PrefixEnd())},
@@ -196,7 +200,7 @@ ORDER BY object_type, object_name`, full)
 		// Create tables with the same ID as data.tableA to ensure that comments
 		// from different tables in the restoring cluster don't appear.
 		tableA := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "data", "tablea")
-		for i := keys.MinUserDescID; i < int(tableA.ID); i++ {
+		for i := keys.MinUserDescID; i < int(tableA.GetID()); i++ {
 			tableName := fmt.Sprintf("foo%d", i)
 			sqlDBRestore.Exec(t, fmt.Sprintf("CREATE TABLE %s ();", tableName))
 			sqlDBRestore.Exec(t, fmt.Sprintf("COMMENT ON TABLE %s IS 'table comment'", tableName))
@@ -346,20 +350,42 @@ GRANT UPDATE ON top_secret TO agent_bond;
 
 		want := [][]string{
 			{`mi5`, `database`, `GRANT ALL ON mi5 TO admin; GRANT CREATE, DELETE, DROP, GRANT, INSERT, ` +
-				`SELECT, ZONECONFIG ON mi5 TO agents; GRANT ALL ON mi5 TO root; `},
+				`SELECT, ZONECONFIG ON mi5 TO agents; GRANT ALL ON mi5 TO root; `, `root`},
 			{`locator`, `schema`, `GRANT ALL ON locator TO admin; GRANT CREATE, GRANT ON locator TO agent_bond; GRANT ALL ON locator TO m; ` +
-				`GRANT ALL ON locator TO root; `},
-			{`continent`, `type`, `GRANT ALL ON continent TO admin; GRANT GRANT ON continent TO agent_bond; GRANT ALL ON continent TO m; GRANT ALL ON continent TO root; `},
-			{`_continent`, `type`, `GRANT ALL ON _continent TO admin; GRANT ALL ON _continent TO root; `},
+				`GRANT ALL ON locator TO root; `, `root`},
+			{`continent`, `type`, `GRANT ALL ON continent TO admin; GRANT GRANT ON continent TO agent_bond; GRANT ALL ON continent TO m; GRANT ALL ON continent TO root; `, `root`},
+			{`_continent`, `type`, `GRANT ALL ON _continent TO admin; GRANT ALL ON _continent TO root; `, `root`},
 			{`agent_locations`, `table`, `GRANT ALL ON agent_locations TO admin; ` +
 				`GRANT SELECT ON agent_locations TO agent_bond; GRANT UPDATE ON agent_locations TO agents; ` +
-				`GRANT ALL ON agent_locations TO m; GRANT ALL ON agent_locations TO root; `},
+				`GRANT ALL ON agent_locations TO m; GRANT ALL ON agent_locations TO root; `, `root`},
 			{`top_secret`, `table`, `GRANT ALL ON top_secret TO admin; ` +
 				`GRANT SELECT, UPDATE ON top_secret TO agent_bond; GRANT INSERT ON top_secret TO agents; ` +
-				`GRANT ALL ON top_secret TO m; GRANT ALL ON top_secret TO root; `},
+				`GRANT ALL ON top_secret TO m; GRANT ALL ON top_secret TO root; `, `root`},
 		}
 
-		showQuery := fmt.Sprintf(`SELECT object_name, object_type, privileges FROM [SHOW BACKUP '%s' WITH privileges]`, showPrivs)
+		showQuery := fmt.Sprintf(`SELECT object_name, object_type, privileges, owner FROM [SHOW BACKUP '%s' WITH privileges]`, showPrivs)
+		sqlDBRestore.CheckQueryResults(t, showQuery, want)
+
+		// Change the owner and expect the changes to be reflected in a new backup
+		showOwner := LocalFoo + "/show_owner"
+		sqlDB.Exec(t, `
+ALTER DATABASE mi5 OWNER TO agent_thomas;
+ALTER SCHEMA locator OWNER TO agent_thomas;
+ALTER TYPE locator.continent OWNER TO agent_bond;
+ALTER TABLE locator.agent_locations OWNER TO agent_bond;
+`)
+		sqlDB.Exec(t, `BACKUP DATABASE mi5 TO $1;`, showOwner)
+
+		want = [][]string{
+			{`agent_thomas`},
+			{`agent_thomas`},
+			{`agent_bond`},
+			{`agent_bond`},
+			{`agent_bond`},
+			{`root`},
+		}
+
+		showQuery = fmt.Sprintf(`SELECT owner FROM [SHOW BACKUP '%s' WITH privileges]`, showOwner)
 		sqlDBRestore.CheckQueryResults(t, showQuery, want)
 	}
 }
@@ -373,8 +399,8 @@ func TestShowBackups(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 11
-	_, _, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitNone)
-	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitNone, base.TestClusterArgs{})
+	_, _, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 	defer cleanupEmptyCluster()
 
@@ -411,14 +437,14 @@ func TestShowBackupTenants(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 1
-	_, tc, systemDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitNone)
+	_, tc, systemDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 	srv := tc.Server(0)
 
 	// NB: tenant certs for 10, 11, 20 are embedded. See:
 	_ = security.EmbeddedTenantIDs()
 
-	conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
+	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
 	defer conn10.Close()
 	tenant10 := sqlutils.MakeSQLRunner(conn10)
 	tenant10.Exec(t, `CREATE DATABASE foo; CREATE TABLE foo.bar(i int primary key); INSERT INTO foo.bar VALUES (110), (210)`)
@@ -450,4 +476,49 @@ func TestShowBackupTenants(t *testing.T) {
 	require.Equal(t, [][]string{
 		{"/Tenant/10", "/Tenant/11"},
 	}, res)
+}
+
+func TestShowBackupPrivileges(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	dir, cleanupDir := testutils.TempDir(t)
+	defer cleanupDir()
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{ExternalIODir: dir})
+	defer srv.Stopper().Stop(context.Background())
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, `CREATE USER testuser`)
+	sqlDB.Exec(t, `CREATE TABLE privs (a INT)`)
+
+	pgURL, cleanup := sqlutils.PGUrl(t, srv.ServingSQLAddr(),
+		"TestShowBackupPrivileges-testuser", url.User("testuser"))
+	defer cleanup()
+	testuser, err := gosql.Open("postgres", pgURL.String())
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, testuser.Close())
+	}()
+
+	// Make an initial backup.
+	const full = LocalFoo + "/full"
+	sqlDB.Exec(t, `BACKUP privs INTO $1`, full)
+	// Add an incremental backup to it.
+	sqlDB.Exec(t, `BACKUP privs INTO LATEST IN $1`, full)
+	// Make a second full backup using non into syntax.
+	sqlDB.Exec(t, `BACKUP TO $1;`, full)
+
+	_, err = testuser.Exec(`SHOW BACKUPS IN $1`, full)
+	require.True(t, testutils.IsError(err,
+		"only users with the admin role are allowed to SHOW BACKUP from the specified nodelocal URI"))
+
+	_, err = testuser.Exec(`SHOW BACKUP $1`, full)
+	require.True(t, testutils.IsError(err,
+		"only users with the admin role are allowed to SHOW BACKUP from the specified nodelocal URI"))
+
+	sqlDB.Exec(t, `GRANT admin TO testuser`)
+	_, err = testuser.Exec(`SHOW BACKUPS IN $1`, full)
+	require.NoError(t, err)
+
+	_, err = testuser.Exec(`SHOW BACKUP $1`, full)
+	require.NoError(t, err)
 }

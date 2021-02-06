@@ -30,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -353,12 +352,12 @@ func readPostgresStmt(
 			break
 		}
 		var idx tree.TableDef = &tree.IndexTableDef{
-			Name:        stmt.Name,
-			Columns:     stmt.Columns,
-			Storing:     stmt.Storing,
-			Inverted:    stmt.Inverted,
-			Interleave:  stmt.Interleave,
-			PartitionBy: stmt.PartitionBy,
+			Name:             stmt.Name,
+			Columns:          stmt.Columns,
+			Storing:          stmt.Storing,
+			Inverted:         stmt.Inverted,
+			Interleave:       stmt.Interleave,
+			PartitionByIndex: stmt.PartitionByIndex,
 		}
 		if stmt.Unique {
 			idx = &tree.UniqueConstraintTableDef{IndexTableDef: *idx.(*tree.IndexTableDef)}
@@ -425,12 +424,12 @@ func readPostgresStmt(
 				}
 			case *tree.AlterTableValidateConstraint:
 				// ignore
-			case *tree.AlterTableOwner:
-				// ignore
 			default:
 				return errors.Errorf("unsupported statement: %s", stmt)
 			}
 		}
+	case *tree.AlterTableOwner:
+		// ignore
 	case *tree.CreateSequence:
 		name, err := getTableName(&stmt.Name)
 		if err != nil {
@@ -583,6 +582,7 @@ type pgDumpReader struct {
 	opts       roachpb.PgDumpOptions
 	walltime   int64
 	colMap     map[*row.DatumRowConverter](map[string]int)
+	evalCtx    *tree.EvalContext
 }
 
 var _ inputConverter = &pgDumpReader{}
@@ -608,9 +608,10 @@ func newPgDumpReader(
 				targetCols[i] = tree.Name(colName)
 			}
 			for i, col := range tableDesc.VisibleColumns() {
-				colSubMap[col.Name] = i
+				colSubMap[col.GetName()] = i
 			}
-			conv, err := row.NewDatumRowConverter(ctx, tableDesc, targetCols, evalCtx, kvCh)
+			conv, err := row.NewDatumRowConverter(ctx, tableDesc, targetCols, evalCtx, kvCh,
+				nil /* seqChunkProvider */)
 			if err != nil {
 				return nil, err
 			}
@@ -630,6 +631,7 @@ func newPgDumpReader(
 		opts:       opts,
 		walltime:   walltime,
 		colMap:     colMap,
+		evalCtx:    evalCtx,
 	}, nil
 }
 
@@ -650,7 +652,9 @@ func (m *pgDumpReader) readFiles(
 func (m *pgDumpReader) readFile(
 	ctx context.Context, input *fileReader, inputIdx int32, resumePos int64, rejected chan string,
 ) error {
+	tableNameToRowsProcessed := make(map[string]int64)
 	var inserts, count int64
+	rowLimit := m.opts.RowLimit
 	ps := newPostgreStream(input, int(m.opts.MaxRowSize))
 	semaCtx := tree.MakeSemaContext()
 	for _, conv := range m.tables {
@@ -724,8 +728,12 @@ func (m *pgDumpReader) readFile(
 			}
 			for _, tuple := range values.Rows {
 				count++
+				tableNameToRowsProcessed[name]++
 				if count <= resumePos {
 					continue
+				}
+				if rowLimit != 0 && tableNameToRowsProcessed[name] > rowLimit {
+					break
 				}
 				if got := len(tuple); expectedColLen != got {
 					return errors.Errorf("expected %d values, got %d: %v", expectedColLen, got, tuple)
@@ -788,6 +796,7 @@ func (m *pgDumpReader) readFile(
 					break
 				}
 				count++
+				tableNameToRowsProcessed[name]++
 				if err != nil {
 					return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 				}
@@ -803,12 +812,18 @@ func (m *pgDumpReader) readFile(
 						return makeRowErr("", count, pgcode.Syntax,
 							"expected %d values, got %d", expected, got)
 					}
+					if rowLimit != 0 && tableNameToRowsProcessed[name] > rowLimit {
+						break
+					}
 					for i, s := range row {
 						idx := targetColMapIdx[i]
 						if s == nil {
 							conv.Datums[idx] = tree.DNull
 						} else {
-							conv.Datums[idx], err = rowenc.ParseDatumStringAs(conv.VisibleColTypes[idx], *s, conv.EvalCtx)
+							// We use ParseAndRequireString instead of ParseDatumStringAs
+							// because postgres dumps arrays in COPY statements using their
+							// internal string representation.
+							conv.Datums[idx], _, err = tree.ParseAndRequireString(conv.VisibleColTypes[idx], *s, conv.EvalCtx)
 							if err != nil {
 								col := conv.VisibleCols[idx]
 								return wrapRowErr(err, "", count, pgcode.Syntax,
@@ -884,7 +899,7 @@ func (m *pgDumpReader) readFile(
 				if seq == nil {
 					break
 				}
-				key, val, err := sql.MakeSequenceKeyVal(keys.TODOSQLCodec, seq, val, isCalled)
+				key, val, err := sql.MakeSequenceKeyVal(m.evalCtx.Codec, seq, val, isCalled)
 				if err != nil {
 					return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 				}
@@ -900,7 +915,7 @@ func (m *pgDumpReader) readFile(
 			}
 		case *tree.SetVar, *tree.BeginTransaction, *tree.CommitTransaction, *tree.Analyze:
 			// ignored.
-		case *tree.CreateTable, *tree.AlterTable, *tree.CreateIndex, *tree.CreateSequence, *tree.DropTable:
+		case *tree.CreateTable, *tree.AlterTable, *tree.AlterTableOwner, *tree.CreateIndex, *tree.CreateSequence, *tree.DropTable:
 			// handled during schema extraction.
 		case *tree.Delete:
 			switch stmt := i.Table.(type) {

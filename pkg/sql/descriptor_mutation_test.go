@@ -78,7 +78,7 @@ func (mt mutationTest) makeMutationsActive(ctx context.Context) {
 		if col := m.GetColumn(); col != nil {
 			mt.tableDesc.Columns = append(mt.tableDesc.Columns, *col)
 		} else if index := m.GetIndex(); index != nil {
-			mt.tableDesc.Indexes = append(mt.tableDesc.Indexes, *index)
+			mt.tableDesc.AddPublicNonPrimaryIndex(*index)
 		} else {
 			mt.Fatalf("no descriptor in mutation: %v", m)
 		}
@@ -102,19 +102,19 @@ func (mt mutationTest) makeMutationsActive(ctx context.Context) {
 func (mt mutationTest) writeColumnMutation(
 	ctx context.Context, column string, m descpb.DescriptorMutation,
 ) {
-	col, _, err := mt.tableDesc.FindColumnByName(tree.Name(column))
+	col, err := mt.tableDesc.FindColumnWithName(tree.Name(column))
 	if err != nil {
 		mt.Fatal(err)
 	}
 	for i := range mt.tableDesc.Columns {
-		if col.ID == mt.tableDesc.Columns[i].ID {
+		if col.GetID() == mt.tableDesc.Columns[i].ID {
 			// Use [:i:i] to prevent reuse of existing slice, or outstanding refs
 			// to ColumnDescriptors may unexpectedly change.
 			mt.tableDesc.Columns = append(mt.tableDesc.Columns[:i:i], mt.tableDesc.Columns[i+1:]...)
 			break
 		}
 	}
-	m.Descriptor_ = &descpb.DescriptorMutation_Column{Column: col}
+	m.Descriptor_ = &descpb.DescriptorMutation_Column{Column: col.ColumnDesc()}
 	mt.writeMutation(ctx, m)
 }
 
@@ -480,20 +480,14 @@ func (mt mutationTest) writeIndexMutation(
 	ctx context.Context, index string, m descpb.DescriptorMutation,
 ) {
 	tableDesc := mt.tableDesc
-	idx, _, err := tableDesc.FindIndexByName(index)
+	idx, err := tableDesc.FindIndexWithName(index)
 	if err != nil {
 		mt.Fatal(err)
 	}
 	// The rewrite below potentially invalidates the original object with an overwrite.
 	// Clarify what's going on.
-	idxCopy := *idx
-	for i := range tableDesc.Indexes {
-		if idxCopy.ID == tableDesc.Indexes[i].ID {
-			tableDesc.Indexes = append(tableDesc.Indexes[:i], tableDesc.Indexes[i+1:]...)
-			break
-		}
-	}
-
+	idxCopy := *idx.IndexDesc()
+	tableDesc.RemovePublicNonPrimaryIndex(idx.Ordinal())
 	m.Descriptor_ = &descpb.DescriptorMutation_Index{Index: &idxCopy}
 	mt.writeMutation(ctx, m)
 }
@@ -648,8 +642,9 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 
 	// Check that a mutation can only be inserted with an explicit mutation state.
 	tableDesc = mTest.tableDesc
-	tableDesc.Mutations = []descpb.DescriptorMutation{{Descriptor_: &descpb.DescriptorMutation_Index{Index: &tableDesc.Indexes[len(tableDesc.Indexes)-1]}}}
-	tableDesc.Indexes = tableDesc.Indexes[:len(tableDesc.Indexes)-1]
+	index := tableDesc.PublicNonPrimaryIndexes()[len(tableDesc.PublicNonPrimaryIndexes())-1]
+	tableDesc.Mutations = []descpb.DescriptorMutation{{Descriptor_: &descpb.DescriptorMutation_Index{Index: index.IndexDesc()}}}
+	tableDesc.RemovePublicNonPrimaryIndex(index.Ordinal())
 	if err := tableDesc.ValidateTable(ctx); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, index foo, id 2") {
 		t.Fatal(err)
 	}
@@ -1159,11 +1154,11 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR UNIQUE);
 		{"v", 4, descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY},
 	}
 
-	if len(tableDesc.Mutations) != len(expected) {
-		t.Fatalf("%d mutations, instead of expected %d", len(tableDesc.Mutations), len(expected))
+	if len(tableDesc.GetMutations()) != len(expected) {
+		t.Fatalf("%d mutations, instead of expected %d", len(tableDesc.GetMutations()), len(expected))
 	}
 
-	for i, m := range tableDesc.Mutations {
+	for i, m := range tableDesc.GetMutations() {
 		name := expected[i].name
 		if col := m.GetColumn(); col != nil {
 			if col.Name != name {
@@ -1228,7 +1223,7 @@ func TestAddingFKs(t *testing.T) {
 	// Client should not see the orders table.
 	if _, err := sqlDB.Exec(
 		`SELECT * FROM t.orders`,
-	); !testutils.IsError(err, `table is being added`) {
+	); !testutils.IsError(err, `table "\w+" is being added`) {
 		t.Fatal(err)
 	}
 }

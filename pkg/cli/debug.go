@@ -484,6 +484,7 @@ Decode and print a hexadecimal-encoded key-value pair.
 }
 
 var debugDecodeProtoName string
+var debugDecodeProtoEmitDefaults bool
 var debugDecodeProtoCmd = &cobra.Command{
 	Use:   "decode-proto",
 	Short: "decode-proto <proto> --name=<fully qualified proto name>",
@@ -954,7 +955,7 @@ func removeDeadReplicas(
 	err = kvserver.IterateRangeDescriptors(ctx, db, func(desc roachpb.RangeDescriptor) error {
 		hasSelf := false
 		numDeadPeers := 0
-		allReplicas := desc.Replicas().All()
+		allReplicas := desc.Replicas().Descriptors()
 		maxLivePeer := roachpb.StoreID(-1)
 		for _, rep := range allReplicas {
 			if rep.StoreID == storeIdent.StoreID {
@@ -997,7 +998,7 @@ func removeDeadReplicas(
 				StoreID:   storeIdent.StoreID,
 				ReplicaID: desc.NextReplicaID,
 			}}
-			newDesc.SetReplicas(roachpb.MakeReplicaDescriptors(replicas))
+			newDesc.SetReplicas(roachpb.MakeReplicaSet(replicas))
 			newDesc.NextReplicaID++
 			fmt.Printf("Replica %s -> %s\n", &desc, &newDesc)
 			newDescs = append(newDescs, newDesc)
@@ -1167,6 +1168,7 @@ var DebugCmdsForRocksDB = []*cobra.Command{
 // All other debug commands go here.
 var debugCmds = append(DebugCmdsForRocksDB,
 	debugBallastCmd,
+	debugCheckLogConfigCmd,
 	debugDecodeKeyCmd,
 	debugDecodeValueCmd,
 	debugDecodeProtoCmd,
@@ -1178,6 +1180,7 @@ var debugCmds = append(DebugCmdsForRocksDB,
 	debugEnvCmd,
 	debugZipCmd,
 	debugMergeLogsCommand,
+	debugResetQuorumCmd,
 )
 
 // DebugCmd is the root of all debug commands. Exported to allow modification by CCL code.
@@ -1267,4 +1270,9 @@ func init() {
 	f = debugDecodeProtoCmd.Flags()
 	f.StringVar(&debugDecodeProtoName, "schema", "cockroach.sql.sqlbase.Descriptor",
 		"fully qualified name of the proto to decode")
+	f.BoolVar(&debugDecodeProtoEmitDefaults, "emit-defaults", true,
+		"encode default values for every field")
+
+	f = debugCheckLogConfigCmd.Flags()
+	f.Var(&debugLogChanSel, "only-channels", "selection of channels to include in the output diagram.")
 }

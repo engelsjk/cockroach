@@ -18,10 +18,28 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-// ConstantWithMetamorphicTestValue should be used to initialize "magic constants" that
-// should be varied during test scenarios to check for bugs at boundary
-// conditions. When built with the test_constants build tag, the test value
-// will be used. In all other cases, the production value will be used.
+// IsMetamorphicBuild returns whether this build is metamorphic. By build being
+// "metamorphic" we mean that some magic constants in the codebase might get
+// initialized to non-default value.
+// A build will become metamorphic with metamorphicBuildProbability probability
+// if 'crdb_test' build flag is specified (this is the case for all test
+// targets).
+func IsMetamorphicBuild() bool {
+	return metamorphicBuild
+}
+
+var metamorphicBuild bool
+
+const (
+	metamorphicBuildProbability = 0.8
+	metamorphicValueProbability = 0.75
+)
+
+// ConstantWithMetamorphicTestValue should be used to initialize "magic
+// constants" that should be varied during test scenarios to check for bugs at
+// boundary conditions. When metamorphicBuild is true, the test value will be
+// used with metamorphicValueProbability probability. In all other cases, the
+// production ("default") value will be used.
 // The constant must be a "metamorphic variable": changing it cannot affect the
 // output of any SQL DMLs. It can only affect the way in which the data is
 // retrieved or processed, because otherwise the main test corpus would fail if
@@ -38,40 +56,51 @@ import (
 //
 // you should write:
 //
-// var batchSize = util.ConstantWithMetamorphicTestValue(64, 1)
+// var batchSize = util.ConstantWithMetamorphicTestValue("batch-size", 64, 1)
 //
-// This will give your code a batch size of 1 in the test_constants build
+// This will often give your code a batch size of 1 in the crdb_test build
 // configuration, increasing the amount of exercise the edge conditions get.
-func ConstantWithMetamorphicTestValue(defaultValue, metamorphicValue int) int {
-	if MetamorphicBuild {
-		logMetamorphicValue(metamorphicValue)
-		return metamorphicValue
+//
+// The given name is used for logging.
+func ConstantWithMetamorphicTestValue(name string, defaultValue, metamorphicValue int) int {
+	if metamorphicBuild {
+		if rng.Float64() < metamorphicValueProbability {
+			logMetamorphicValue(name, metamorphicValue)
+			return metamorphicValue
+		}
 	}
 	return defaultValue
 }
 
-// rng is initialized to a rand.Rand if MetamorphicBuild is enabled.
+// rng is initialized to a rand.Rand if crdbTestBuild is enabled.
 var rng *rand.Rand
 
 func init() {
-	if MetamorphicBuild {
+	if CrdbTestBuild {
 		rng, _ = randutil.NewPseudoRand()
+		metamorphicBuild = rng.Float64() < metamorphicBuildProbability
 	}
 }
 
 // ConstantWithMetamorphicTestRange is like ConstantWithMetamorphicTestValue
 // except instead of returning a single metamorphic test value, it returns a
 // random test value in a range.
-func ConstantWithMetamorphicTestRange(defaultValue, min, max int) int {
-	if MetamorphicBuild {
-		ret := int(rng.Int31())%(max-min) + min
-		logMetamorphicValue(ret)
-		return ret
+//
+// The given name is used for logging.
+func ConstantWithMetamorphicTestRange(name string, defaultValue, min, max int) int {
+	if metamorphicBuild {
+		if rng.Float64() < metamorphicValueProbability {
+			ret := min
+			if max > min {
+				ret = int(rng.Int31())%(max-min) + min
+			}
+			logMetamorphicValue(name, ret)
+			return ret
+		}
 	}
 	return defaultValue
 }
 
-func logMetamorphicValue(value int) {
-	fmt.Fprintf(os.Stderr, "initialized metamorphic constant with value %d: %s\n",
-		value, GetSmallTrace(1))
+func logMetamorphicValue(name string, value int) {
+	fmt.Fprintf(os.Stderr, "initialized metamorphic constant %q with value %d\n", name, value)
 }

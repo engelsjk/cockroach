@@ -68,11 +68,6 @@ define ExplainPrivate {
     # Options contains settings that control the output of the explain statement.
     Options ExplainOptions
 
-    # Analyze indicates if this is an EXPLAIN ANALYZE.
-    # TODO(radu): remove this onse ANALYZE Is only implemented as a top-level
-    # statement.
-    Analyze bool
-
     # ColList stores the column IDs for the explain columns.
     ColList ColList
 
@@ -277,4 +272,16 @@ define ExportPrivate {
 
     # Columns stores the column IDs for the statement result columns.
     Columns ColList
+}
+
+# CreateStatistics represents a CREATE STATISTICS or ANALYZE statement.
+[Relational]
+define CreateStatistics {
+    _ CreateStatisticsPrivate
+}
+
+[Private]
+define CreateStatisticsPrivate {
+    # Syntax is the tree.CreateStats AST node.
+    Syntax CreateStats
 }

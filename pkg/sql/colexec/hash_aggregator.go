@@ -21,9 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 )
 
@@ -112,7 +110,8 @@ type hashAggregator struct {
 		anotherIntSlice []int
 	}
 
-	output coldata.Batch
+	allInputTuples *spillingQueue
+	output         coldata.Batch
 
 	aggFnsAlloc *colexecagg.AggregateFuncsAlloc
 	hashAlloc   aggBucketAlloc
@@ -120,6 +119,8 @@ type hashAggregator struct {
 	toClose     colexecbase.Closers
 }
 
+var _ ResettableOperator = &hashAggregator{}
+var _ colexecbase.BufferingInMemoryOperator = &hashAggregator{}
 var _ closableOperator = &hashAggregator{}
 
 // hashAggregatorAllocSize determines the allocation size used by the hash
@@ -131,22 +132,16 @@ const hashAggregatorAllocSize = 128
 // NewHashAggregator creates a hash aggregator on the given grouping columns.
 // The input specifications to this function are the same as that of the
 // NewOrderedAggregator function.
-// memAccount should be the same as the one used by allocator and will be used
-// by aggregatorHelper to handle DISTINCT clause.
+// newSpillingQueueArgs - when non-nil - specifies the arguments to
+// instantiate a spillingQueue with which will be used to keep all of the
+// input tuples in case the in-memory hash aggregator needs to fallback to
+// the disk-backed operator. Pass in nil in order to not track all input
+// tuples.
 func NewHashAggregator(
-	allocator *colmem.Allocator,
-	memAccount *mon.BoundAccount,
-	input colexecbase.Operator,
-	inputTypes []*types.T,
-	spec *execinfrapb.AggregatorSpec,
-	evalCtx *tree.EvalContext,
-	constructors []execinfrapb.AggregateConstructor,
-	constArguments []tree.Datums,
-	outputTypes []*types.T,
-) (colexecbase.Operator, error) {
+	args *colexecagg.NewAggregatorArgs, newSpillingQueueArgs *NewSpillingQueueArgs,
+) (ResettableOperator, error) {
 	aggFnsAlloc, inputArgsConverter, toClose, err := colexecagg.NewAggregateFuncsAlloc(
-		allocator, inputTypes, spec, evalCtx, constructors, constArguments,
-		outputTypes, hashAggregatorAllocSize, true, /* isHashAgg */
+		args, hashAggregatorAllocSize, true, /* isHashAgg */
 	)
 	// We want this number to be coldata.MaxBatchSize, but then we would lose
 	// some test coverage due to disabling of the randomization of the batch
@@ -159,41 +154,39 @@ func NewHashAggregator(
 		maxBuffered = coldata.MaxBatchSize
 	}
 	hashAgg := &hashAggregator{
-		OneInputNode:       NewOneInputNode(input),
-		allocator:          allocator,
-		spec:               spec,
+		OneInputNode:       NewOneInputNode(args.Input),
+		allocator:          args.Allocator,
+		spec:               args.Spec,
 		state:              hashAggregatorBuffering,
-		inputTypes:         inputTypes,
-		outputTypes:        outputTypes,
+		inputTypes:         args.InputTypes,
+		outputTypes:        args.OutputTypes,
 		inputArgsConverter: inputArgsConverter,
 		maxBuffered:        maxBuffered,
 		toClose:            toClose,
 		aggFnsAlloc:        aggFnsAlloc,
-		hashAlloc:          aggBucketAlloc{allocator: allocator},
+		hashAlloc:          aggBucketAlloc{allocator: args.Allocator},
 	}
-	hashAgg.bufferingState.tuples = newAppendOnlyBufferedBatch(allocator, inputTypes, nil /* colsToStore */)
+	hashAgg.bufferingState.tuples = newAppendOnlyBufferedBatch(args.Allocator, args.InputTypes, nil /* colsToStore */)
 	hashAgg.datumAlloc.AllocSize = hashAggregatorAllocSize
-	hashAgg.aggHelper = newAggregatorHelper(allocator, memAccount, inputTypes, spec, &hashAgg.datumAlloc, true /* isHashAgg */, hashAgg.maxBuffered)
+	hashAgg.aggHelper = newAggregatorHelper(args, &hashAgg.datumAlloc, true /* isHashAgg */, hashAgg.maxBuffered)
+	if newSpillingQueueArgs != nil {
+		hashAgg.allInputTuples = newSpillingQueue(newSpillingQueueArgs)
+	}
 	return hashAgg, err
 }
 
 func (op *hashAggregator) Init() {
 	op.input.Init()
-	// The hash table only needs to store the grouping columns to be able to
-	// perform the equality check.
-	colsToStore := make([]int, len(op.spec.GroupCols))
-	for i := range colsToStore {
-		colsToStore[i] = int(op.spec.GroupCols[i])
-	}
-	// This number was chosen after running the micro-benchmarks and relevant
+	// These numbers were chosen after running the micro-benchmarks and relevant
 	// TPCH queries using tpchvec/bench.
-	const hashTableLoadFactor = 0.25
+	const hashTableLoadFactor = 0.1
+	const hashTableNumBuckets = 256
 	op.ht = newHashTable(
 		op.allocator,
 		hashTableLoadFactor,
+		hashTableNumBuckets,
 		op.inputTypes,
 		op.spec.GroupCols,
-		colsToStore,
 		true, /* allowNullEquality */
 		hashTableDistinctBuildMode,
 		hashTableDefaultProbeMode,
@@ -212,9 +205,32 @@ func (op *hashAggregator) Next(ctx context.Context) coldata.Batch {
 				})
 			}
 			op.bufferingState.pendingBatch, op.bufferingState.unprocessedIdx = op.input.Next(ctx), 0
+			if op.allInputTuples != nil {
+				if err := op.allInputTuples.enqueue(ctx, op.bufferingState.pendingBatch); err != nil {
+					colexecerror.InternalError(err)
+				}
+			}
 			n := op.bufferingState.pendingBatch.Length()
 			if n == 0 {
-				op.state = hashAggregatorAggregating
+				// This is the last input batch.
+				if op.bufferingState.tuples.Length() == 0 {
+					// There are currently no buffered tuples to perform the
+					// aggregation on.
+					if len(op.buckets) == 0 {
+						// We don't have any buckets which means that there were
+						// no input tuples whatsoever, so we can transition to
+						// finished state right away.
+						op.state = hashAggregatorDone
+					} else {
+						// There are some buckets, so we proceed to the
+						// outputting state.
+						op.state = hashAggregatorOutputting
+					}
+				} else {
+					// There are some buffered tuples on which we need to run
+					// the aggregation.
+					op.state = hashAggregatorAggregating
+				}
 				continue
 			}
 			toBuffer := n
@@ -236,8 +252,6 @@ func (op *hashAggregator) Next(ctx context.Context) coldata.Batch {
 			op.inputArgsConverter.ConvertBatch(op.bufferingState.tuples)
 			op.onlineAgg(ctx, op.bufferingState.tuples)
 			if op.bufferingState.pendingBatch.Length() == 0 {
-				// TODO(yuzefovich): we no longer need the hash table, so we
-				// could be releasing its memory here.
 				if len(op.buckets) == 0 {
 					op.state = hashAggregatorDone
 				} else {
@@ -355,6 +369,8 @@ func (op *hashAggregator) setupScratchSlices(numBuffered int) {
 //   We have fully processed the second batch.
 //
 //  We have processed the input fully, so we're ready to emit the output.
+//
+// NOTE: b *must* be non-zero length batch.
 func (op *hashAggregator) onlineAgg(ctx context.Context, b coldata.Batch) {
 	op.setupScratchSlices(b.Length())
 	inputVecs := b.ColVecs()
@@ -411,6 +427,12 @@ func (op *hashAggregator) onlineAgg(ctx context.Context, b coldata.Batch) {
 			// so we'll create a new bucket and make sure that the head of this
 			// equality chain is appended to the hash table in the
 			// corresponding position.
+			// TODO(yuzefovich): we could change the behavior so that we don't
+			// lose the references to the old buckets in the outputting stage,
+			// and then we could reset an old bucket if we still have some
+			// unused ones instead of always allocating a new bucket here. This
+			// will be beneficial for the external hash aggregator (but probably
+			// the difference won't be that big).
 			bucket := op.hashAlloc.newAggBucket()
 			op.buckets = append(op.buckets, bucket)
 			// We know that all selected tuples belong to the same single
@@ -439,6 +461,36 @@ func (op *hashAggregator) onlineAgg(ctx context.Context, b coldata.Batch) {
 	}
 }
 
+func (op *hashAggregator) ExportBuffered(
+	ctx context.Context, _ colexecbase.Operator,
+) coldata.Batch {
+	batch, err := op.allInputTuples.dequeue(ctx)
+	if err != nil {
+		colexecerror.InternalError(err)
+	}
+	return batch
+}
+
+func (op *hashAggregator) reset(ctx context.Context) {
+	if r, ok := op.input.(resetter); ok {
+		r.reset(ctx)
+	}
+	op.bufferingState.tuples.ResetInternalBatch()
+	op.bufferingState.tuples.SetLength(0)
+	op.bufferingState.pendingBatch = nil
+	op.bufferingState.unprocessedIdx = 0
+	op.buckets = op.buckets[:0]
+	op.ht.reset(ctx)
+	op.state = hashAggregatorBuffering
+}
+
 func (op *hashAggregator) Close(ctx context.Context) error {
-	return op.toClose.Close(ctx)
+	var retErr error
+	if op.allInputTuples != nil {
+		retErr = op.allInputTuples.close(ctx)
+	}
+	if err := op.toClose.Close(ctx); err != nil {
+		retErr = err
+	}
+	return retErr
 }

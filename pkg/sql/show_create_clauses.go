@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -89,11 +90,12 @@ func ShowCreateView(
 	f.WriteString("VIEW ")
 	f.FormatNode(tn)
 	f.WriteString(" (")
-	for i := range desc.GetPublicColumns() {
+	for i, col := range desc.PublicColumns() {
 		if i > 0 {
 			f.WriteString(", ")
 		}
-		f.FormatNameP(&desc.GetColumnAtIdx(i).Name)
+		name := col.GetName()
+		f.FormatNameP(&name)
 	}
 	f.WriteString(") AS ")
 	f.WriteString(desc.GetViewQuery())
@@ -119,7 +121,7 @@ func showComments(
 	}
 
 	for _, columnComment := range tc.columns {
-		col, err := table.FindColumnByID(descpb.ColumnID(columnComment.subID))
+		col, err := table.FindColumnWithID(descpb.ColumnID(columnComment.subID))
 		if err != nil {
 			return err
 		}
@@ -128,14 +130,14 @@ func showComments(
 		f.FormatNode(&tree.CommentOnColumn{
 			ColumnItem: &tree.ColumnItem{
 				TableName:  tn.ToUnresolvedObjectName(),
-				ColumnName: tree.Name(col.Name),
+				ColumnName: tree.Name(col.GetName()),
 			},
 			Comment: &columnComment.comment,
 		})
 	}
 
 	for _, indexComment := range tc.indexes {
-		idx, err := table.FindIndexByID(descpb.IndexID(indexComment.subID))
+		idx, err := table.FindIndexWithID(descpb.IndexID(indexComment.subID))
 		if err != nil {
 			return err
 		}
@@ -144,7 +146,7 @@ func showComments(
 		f.FormatNode(&tree.CommentOnIndex{
 			Index: tree.TableIndexName{
 				Table: *tn,
-				Index: tree.UnrestrictedName(idx.Name),
+				Index: tree.UnrestrictedName(idx.GetName()),
 			},
 			Comment: &indexComment.comment,
 		})
@@ -249,7 +251,7 @@ func showFamilyClause(desc catalog.TableDescriptor, f *tree.FmtCtx) {
 	for _, fam := range desc.GetFamilies() {
 		activeColumnNames := make([]string, 0, len(fam.ColumnNames))
 		for i, colID := range fam.ColumnIDs {
-			if _, err := desc.FindActiveColumnByID(colID); err == nil {
+			if col, _ := desc.FindColumnWithID(colID); col != nil && col.Public() {
 				activeColumnNames = append(activeColumnNames, fam.ColumnNames[i])
 			}
 		}
@@ -263,6 +265,16 @@ func showFamilyClause(desc catalog.TableDescriptor, f *tree.FmtCtx) {
 		formatQuoteNames(&f.Buffer, activeColumnNames...)
 		f.WriteString(")")
 	}
+}
+
+// showCreateLocality creates the LOCALITY clauses for a CREATE statement, writing them
+// to tree.FmtCtx f.
+func showCreateLocality(desc catalog.TableDescriptor, f *tree.FmtCtx) error {
+	if c := desc.GetLocalityConfig(); c != nil {
+		f.WriteString(" LOCALITY ")
+		return tabledesc.FormatTableLocalityConfig(c, f)
+	}
+	return nil
 }
 
 // showCreateInterleave returns an INTERLEAVE IN PARENT clause for the specified
@@ -317,8 +329,23 @@ func ShowCreatePartitioning(
 	indent int,
 	colOffset int,
 ) error {
-	if partDesc.NumColumns == 0 {
+	isPrimaryKeyOfPartitionAllByTable :=
+		tableDesc.IsPartitionAllBy() && tableDesc.GetPrimaryIndexID() == idxDesc.ID && colOffset == 0
+
+	if partDesc.NumColumns == 0 && !isPrimaryKeyOfPartitionAllByTable {
 		return nil
+	}
+	// Do not print PARTITION BY clauses of non-primary indexes belonging to a table
+	// that is PARTITION BY ALL. The ALL will be printed for the PRIMARY INDEX clause.
+	if tableDesc.IsPartitionAllBy() && tableDesc.GetPrimaryIndexID() != idxDesc.ID {
+		return nil
+	}
+	// Do not print PARTITION ALL BY if we are a REGIONAL BY ROW table.
+	if c := tableDesc.GetLocalityConfig(); c != nil {
+		switch c.Locality.(type) {
+		case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
+			return nil
+		}
 	}
 
 	// We don't need real prefixes in the DecodePartitionTuple calls because we
@@ -329,11 +356,18 @@ func ShowCreatePartitioning(
 	}
 
 	indentStr := strings.Repeat("\t", indent)
-	buf.WriteString(` PARTITION BY `)
+	buf.WriteString(` PARTITION `)
+	if isPrimaryKeyOfPartitionAllByTable {
+		buf.WriteString(`ALL `)
+	}
+	buf.WriteString(`BY `)
 	if len(partDesc.List) > 0 {
 		buf.WriteString(`LIST`)
 	} else if len(partDesc.Range) > 0 {
 		buf.WriteString(`RANGE`)
+	} else if isPrimaryKeyOfPartitionAllByTable {
+		buf.WriteString(`NOTHING`)
+		return nil
 	} else {
 		return errors.Errorf(`invalid partition descriptor: %v`, partDesc)
 	}
@@ -428,6 +462,24 @@ func showConstraintClause(
 		f.WriteString(expr)
 		f.WriteString(")")
 		if e.Validity != descpb.ConstraintValidity_Validated {
+			f.WriteString(" NOT VALID")
+		}
+	}
+	for _, c := range desc.AllActiveAndInactiveUniqueWithoutIndexConstraints() {
+		f.WriteString(",\n\t")
+		if len(c.Name) > 0 {
+			f.WriteString("CONSTRAINT ")
+			formatQuoteNames(&f.Buffer, c.Name)
+			f.WriteString(" ")
+		}
+		f.WriteString("UNIQUE WITHOUT INDEX (")
+		colNames, err := desc.NamesForColumnIDs(c.ColumnIDs)
+		if err != nil {
+			return err
+		}
+		f.WriteString(strings.Join(colNames, ", "))
+		f.WriteString(")")
+		if c.Validity != descpb.ConstraintValidity_Validated {
 			f.WriteString(" NOT VALID")
 		}
 	}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -39,12 +40,6 @@ type StoreTestingKnobs struct {
 	// blocking in the filter will not block interfering requests. If it
 	// returns an error, the command will not be evaluated.
 	TestingRequestFilter kvserverbase.ReplicaRequestFilter
-
-	// TestingLatchFilter is called before evaluating each command on a replica
-	// but after acquiring latches for the command. Blocking in the filter will
-	// block interfering requests. If it returns an error, the command will not
-	// be evaluated.
-	TestingLatchFilter kvserverbase.ReplicaRequestFilter
 
 	// TestingConcurrencyRetryFilter is called before a concurrency retry error is
 	// handled and the batch is retried.
@@ -74,10 +69,6 @@ type StoreTestingKnobs struct {
 	// or data.
 	TestingRangefeedFilter kvserverbase.ReplicaRangefeedFilter
 
-	// A hack to manipulate the clock before sending a batch request to a replica.
-	// TODO(kaneda): This hook is not encouraged to use. Get rid of it once
-	// we make TestServer take a ManualClock.
-	ClockBeforeSend func(*hlc.Clock, roachpb.BatchRequest)
 	// MaxOffset, if set, overrides the server clock's MaxOffset at server
 	// creation time.
 	// See also DisableMaxOffsetCheck.
@@ -89,11 +80,6 @@ type StoreTestingKnobs struct {
 	// should get rid of such practices once we make TestServer take a
 	// ManualClock.
 	DisableMaxOffsetCheck bool
-	// DontPreventUseOfOldLeaseOnStart disables the initialization of
-	// replica.mu.minLeaseProposedTS on replica.Init(). This has the effect of
-	// allowing the replica to use the lease that it had in a previous life (in
-	// case the tests persisted the engine used in said previous life).
-	DontPreventUseOfOldLeaseOnStart bool
 	// DisableAutomaticLeaseRenewal enables turning off the background worker
 	// that attempts to automatically renew expiration-based leases.
 	DisableAutomaticLeaseRenewal bool
@@ -131,8 +117,6 @@ type StoreTestingKnobs struct {
 	DisableConsistencyQueue bool
 	// DisableScanner disables the replica scanner.
 	DisableScanner bool
-	// DisablePeriodicGossips disables periodic gossiping.
-	DisablePeriodicGossips bool
 	// DisableLeaderFollowsLeaseholder disables attempts to transfer raft
 	// leadership when it diverges from the range's leaseholder.
 	DisableLeaderFollowsLeaseholder bool
@@ -255,6 +239,24 @@ type StoreTestingKnobs struct {
 	// heartbeats and then expect other replicas to take the lease without
 	// worrying about Raft).
 	AllowLeaseRequestProposalsWhenNotLeader bool
+	// AllowDangerousReplicationChanges disables safeguards
+	// in execChangeReplicasTxn that prevent moving
+	// to a configuration that cannot make progress.
+	AllowDangerousReplicationChanges bool
+	// AllowUnsynchronizedReplicationChanges allows calls to ChangeReplicas
+	// even when the replicate queue is enabled. This often results in flaky
+	// tests, so by default, it is prevented.
+	AllowUnsynchronizedReplicationChanges bool
+	// PurgeOutdatedReplicasInterceptor intercepts attempts to purge outdated
+	// replicas in the store.
+	PurgeOutdatedReplicasInterceptor func()
+	// If set, use the given truncated state type when bootstrapping ranges.
+	// This is used for testing the truncated state migration.
+	TruncatedStateTypeOverride *stateloader.TruncatedStateType
+	// GossipWhenCapacityDeltaExceedsFraction specifies the fraction from the last
+	// gossiped store capacity values which need be exceeded before the store will
+	// gossip immediately without waiting for the periodic gossip interval.
+	GossipWhenCapacityDeltaExceedsFraction float64
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

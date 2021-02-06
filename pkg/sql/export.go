@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
@@ -82,10 +83,11 @@ const exportFilePatternDefault = exportFilePatternPart + ".csv"
 const exportCompressionCodec = "gzip"
 
 // featureExportEnabled is used to enable and disable the EXPORT feature.
-var featureExportEnabled = settings.RegisterPublicBoolSetting(
+var featureExportEnabled = settings.RegisterBoolSetting(
 	"feature.export.enabled",
 	"set to true to enable exports, false to disable; default is true",
-	featureflag.FeatureFlagEnabledDefault)
+	featureflag.FeatureFlagEnabledDefault,
+).WithPublic()
 
 // ConstructExport is part of the exec.Factory interface.
 func (ef *execFactory) ConstructExport(
@@ -98,8 +100,10 @@ func (ef *execFactory) ConstructExport(
 		)
 	}
 
-	if err := featureflag.CheckEnabled(featureExportEnabled,
-		&ef.planner.ExecCfg().Settings.SV,
+	if err := featureflag.CheckEnabled(
+		ef.planner.EvalContext().Context,
+		ef.planner.execCfg,
+		featureExportEnabled,
 		"EXPORT",
 	); err != nil {
 		return nil, err
@@ -121,6 +125,21 @@ func (ef *execFactory) ConstructExport(
 	destination, ok := destinationDatum.(*tree.DString)
 	if !ok {
 		return nil, errors.Errorf("expected string value for the file location")
+	}
+	admin, err := ef.planner.HasAdminRole(ef.planner.EvalContext().Context)
+	if err != nil {
+		panic(err)
+	}
+	if !admin {
+		hasExplicitAuth, _, err := cloud.AccessIsWithExplicitAuth(string(*destination))
+		if err != nil {
+			panic(err)
+		}
+		if !hasExplicitAuth {
+			panic(pgerror.Newf(
+				pgcode.InsufficientPrivilege,
+				"only users with the admin role are allowed to EXPORT to the specified URI"))
+		}
 	}
 
 	optVals, err := evalStringOptions(ef.planner.EvalContext(), options, exportOptionExpectValues)

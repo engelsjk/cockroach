@@ -25,7 +25,7 @@ import "sql/catalog/descpb/locking.proto";
 import "sql/types/types.proto";
 import "sql/execinfrapb/data.proto";
 import "sql/execinfrapb/processors_base.proto";
-import "sql/opt/invertedexpr/span_expression.proto";
+import "sql/inverted/span_expression.proto";
 import "gogoproto/gogo.proto";
 
 // ValuesCoreSpec is the core of a processor that has no inputs and generates
@@ -143,6 +143,20 @@ message TableReaderSpec {
   // post-processing stage and, therefore, are to be populated. It is ignored
   // if is_check is true.
   repeated uint32 needed_columns = 15;
+
+  // Indicates a virtual column which may have a different type than the column
+  // stored in the table descriptor. For example, the inverted column in an
+  // inverted index has a different type than the column it indexes in the base
+  // table.
+  optional sqlbase.ColumnDescriptor virtual_column = 16;
+}
+
+// FiltererSpec is the specification for a processor that filters input rows
+// according to a boolean expression.
+message FiltererSpec {
+  // A filtering expression which references the internal columns of the
+  // processor via ordinal references (@1, @2, etc).
+  optional Expression filter = 1 [(gogoproto.nullable) = false];
 }
 
 // IndexSkipTableReaderSpec is the specification for a table reader that
@@ -382,6 +396,10 @@ message DistinctSpec {
   // UPSERT and INSERT..ON CONFLICT statements, both of which prohibit the same
   // row from being changed twice.
   optional string error_on_dup = 4 [(gogoproto.nullable) = false];
+  // OutputOrdering specifies the required ordering of the output produced by
+  // the distinct. The input to the processor *must* already be ordered
+  // according to it.
+  optional Ordering output_ordering = 5 [(gogoproto.nullable) = false];
 }
 
 // The specification for a WITH ORDINALITY processor. It adds a new column to
@@ -572,6 +590,19 @@ message HashJoinerSpec {
 // where d, e are not populated.
 // Internal columns for LEFT_SEMI and LEFT_ANTI: | a | b |
 //
+// Multi-column inverted index example:
+// Input stream columns: | a | b | c |
+// Table columns: | d | e | f | g |
+// The InvertedExpr involves columns b, e. The non-inverted prefix key columns
+// equate c to f. The primary key for the right input is d.
+// The inverted index has columns: | f | e' | d |
+// where e' is derived from e and f is a non-inverted prefix column.
+// The OnExpr can use columns a, b, c, d, f.
+//
+// Internal columns for INNER and LEFT_OUTER: | a | b | c | d | e | f | g |
+// where e, g are not populated.
+// Internal columns for LEFT_SEMI and LEFT_ANTI: | a | b | c |
+//
 // For INNER/LEFT_OUTER with OutputGroupContinuationForLeftRow = true, the
 // internal columns include an additional bool column as the last column.
 message InvertedJoinerSpec {
@@ -626,6 +657,13 @@ message InvertedJoinerSpec {
   // indicates whether a row is a continuation of a group corresponding to a
   // left row.
   optional bool output_group_continuation_for_left_row = 8 [(gogoproto.nullable) = false];
+
+  // Column indexes in the input stream specifying the columns which match with
+  // the non-inverted prefix columns of the index, if the index is multi-column.
+  // These are the equality columns of the join. The length of
+  // prefix_equality_columns should be equal to the number of non-inverted
+  // prefix columns in the index.
+  repeated uint32 prefix_equality_columns = 9 [packed = true];
 }
 
 // InvertedFiltererSpec is the specification of a processor that does filtering
@@ -657,7 +695,7 @@ message InvertedFiltererSpec {
 
   // The expression to evaluate. The SpansToRead are ignored since they
   // have already been used to setup the input.
-  optional opt.invertedexpr.SpanExpressionProto inverted_expr = 2 [(gogoproto.nullable) = false];
+  optional inverted.SpanExpressionProto inverted_expr = 2 [(gogoproto.nullable) = false];
 
   // Optional pre-filtering expression.
   message PreFiltererSpec {
@@ -725,6 +763,8 @@ message AggregatorSpec {
     REGR_SYY = 41;
     REGR_SXY = 42;
     REGR_COUNT = 43;
+    REGR_AVGX = 44;
+    REGR_AVGY = 45;
   }
 
   enum Type {

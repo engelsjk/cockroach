@@ -41,7 +41,7 @@ var (
 // last distinct operator in that chain as well as its output column.
 func OrderedDistinctColsToOperators(
 	input colexecbase.Operator, distinctCols []uint32, typs []*types.T,
-) (colexecbase.Operator, []bool, error) {
+) (ResettableOperator, []bool, error) {
 	distinctCol := make([]bool, coldata.BatchSize())
 	// zero the boolean column on every iteration.
 	input = fnOp{
@@ -78,7 +78,7 @@ var _ ResettableOperator = &distinctChainOps{}
 // input columns with the given types.
 func NewOrderedDistinct(
 	input colexecbase.Operator, distinctCols []uint32, typs []*types.T,
-) (colexecbase.Operator, error) {
+) (ResettableOperator, error) {
 	op, outputCol, err := OrderedDistinctColsToOperators(input, distinctCols, typs)
 	if err != nil {
 		return nil, err
@@ -336,7 +336,6 @@ func (p *distinctBoolOp) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
@@ -392,10 +391,6 @@ func (p *distinctBoolOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				{
 					var __retval_0 bool
@@ -432,6 +427,11 @@ func (p *distinctBoolOp) Next(ctx context.Context) coldata.Batch {
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				{
@@ -486,10 +486,6 @@ func (p *distinctBoolOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				{
 					var __retval_0 bool
@@ -550,15 +546,14 @@ func (p partitionerBool) partitionWithOrder(
 	}
 
 	col := colVec.Bool()
-	col = col[0:n]
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var (
 					__retval_lastVal     bool
@@ -607,7 +602,8 @@ func (p partitionerBool) partitionWithOrder(
 			}
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var __retval_0 bool
 				{
@@ -653,6 +649,7 @@ func (p partitionerBool) partition(colVec coldata.Vec, outputCol []bool, n int) 
 	col := colVec.Bool()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {
@@ -816,7 +813,6 @@ func (p *distinctBytesOp) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
@@ -864,10 +860,6 @@ func (p *distinctBytesOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				{
 					var __retval_0 []byte
@@ -896,6 +888,11 @@ func (p *distinctBytesOp) Next(ctx context.Context) coldata.Batch {
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				{
@@ -942,10 +939,6 @@ func (p *distinctBytesOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				{
 					var __retval_0 []byte
@@ -998,17 +991,14 @@ func (p partitionerBytes) partitionWithOrder(
 	}
 
 	col := colVec.Bytes()
-	col = col
-	_ = 0
-	_ = n
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var (
 					__retval_lastVal     []byte
@@ -1049,7 +1039,8 @@ func (p partitionerBytes) partitionWithOrder(
 			}
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var __retval_0 []byte
 				{
@@ -1087,6 +1078,7 @@ func (p partitionerBytes) partition(colVec coldata.Vec, outputCol []bool, n int)
 	col := colVec.Bytes()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {
@@ -1234,7 +1226,6 @@ func (p *distinctDecimalOp) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
@@ -1282,10 +1273,6 @@ func (p *distinctDecimalOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				{
 					var __retval_0 apd.Decimal
@@ -1314,6 +1301,11 @@ func (p *distinctDecimalOp) Next(ctx context.Context) coldata.Batch {
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				{
@@ -1360,10 +1352,6 @@ func (p *distinctDecimalOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				{
 					var __retval_0 apd.Decimal
@@ -1416,15 +1404,14 @@ func (p partitionerDecimal) partitionWithOrder(
 	}
 
 	col := colVec.Decimal()
-	col = col[0:n]
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var (
 					__retval_lastVal     apd.Decimal
@@ -1465,7 +1452,8 @@ func (p partitionerDecimal) partitionWithOrder(
 			}
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var __retval_0 apd.Decimal
 				{
@@ -1503,6 +1491,7 @@ func (p partitionerDecimal) partition(colVec coldata.Vec, outputCol []bool, n in
 	col := colVec.Decimal()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {
@@ -1650,7 +1639,6 @@ func (p *distinctInt16Op) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
@@ -1709,10 +1697,6 @@ func (p *distinctInt16Op) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				{
 					var __retval_0 int16
@@ -1752,6 +1736,11 @@ func (p *distinctInt16Op) Next(ctx context.Context) coldata.Batch {
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				{
@@ -1809,10 +1798,6 @@ func (p *distinctInt16Op) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				{
 					var __retval_0 int16
@@ -1876,15 +1861,14 @@ func (p partitionerInt16) partitionWithOrder(
 	}
 
 	col := colVec.Int16()
-	col = col[0:n]
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var (
 					__retval_lastVal     int16
@@ -1936,7 +1920,8 @@ func (p partitionerInt16) partitionWithOrder(
 			}
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var __retval_0 int16
 				{
@@ -1985,6 +1970,7 @@ func (p partitionerInt16) partition(colVec coldata.Vec, outputCol []bool, n int)
 	col := colVec.Int16()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {
@@ -2154,7 +2140,6 @@ func (p *distinctInt32Op) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
@@ -2213,10 +2198,6 @@ func (p *distinctInt32Op) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				{
 					var __retval_0 int32
@@ -2256,6 +2237,11 @@ func (p *distinctInt32Op) Next(ctx context.Context) coldata.Batch {
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				{
@@ -2313,10 +2299,6 @@ func (p *distinctInt32Op) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				{
 					var __retval_0 int32
@@ -2380,15 +2362,14 @@ func (p partitionerInt32) partitionWithOrder(
 	}
 
 	col := colVec.Int32()
-	col = col[0:n]
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var (
 					__retval_lastVal     int32
@@ -2440,7 +2421,8 @@ func (p partitionerInt32) partitionWithOrder(
 			}
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var __retval_0 int32
 				{
@@ -2489,6 +2471,7 @@ func (p partitionerInt32) partition(colVec coldata.Vec, outputCol []bool, n int)
 	col := colVec.Int32()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {
@@ -2658,7 +2641,6 @@ func (p *distinctInt64Op) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
@@ -2717,10 +2699,6 @@ func (p *distinctInt64Op) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				{
 					var __retval_0 int64
@@ -2760,6 +2738,11 @@ func (p *distinctInt64Op) Next(ctx context.Context) coldata.Batch {
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				{
@@ -2817,10 +2800,6 @@ func (p *distinctInt64Op) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				{
 					var __retval_0 int64
@@ -2884,15 +2863,14 @@ func (p partitionerInt64) partitionWithOrder(
 	}
 
 	col := colVec.Int64()
-	col = col[0:n]
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var (
 					__retval_lastVal     int64
@@ -2944,7 +2922,8 @@ func (p partitionerInt64) partitionWithOrder(
 			}
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var __retval_0 int64
 				{
@@ -2993,6 +2972,7 @@ func (p partitionerInt64) partition(colVec coldata.Vec, outputCol []bool, n int)
 	col := colVec.Int64()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {
@@ -3162,7 +3142,6 @@ func (p *distinctFloat64Op) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
@@ -3229,10 +3208,6 @@ func (p *distinctFloat64Op) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				{
 					var __retval_0 float64
@@ -3280,6 +3255,11 @@ func (p *distinctFloat64Op) Next(ctx context.Context) coldata.Batch {
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				{
@@ -3345,10 +3325,6 @@ func (p *distinctFloat64Op) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				{
 					var __retval_0 float64
@@ -3420,15 +3396,14 @@ func (p partitionerFloat64) partitionWithOrder(
 	}
 
 	col := colVec.Float64()
-	col = col[0:n]
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var (
 					__retval_lastVal     float64
@@ -3488,7 +3463,8 @@ func (p partitionerFloat64) partitionWithOrder(
 			}
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var __retval_0 float64
 				{
@@ -3545,6 +3521,7 @@ func (p partitionerFloat64) partition(colVec coldata.Vec, outputCol []bool, n in
 	col := colVec.Float64()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {
@@ -3730,7 +3707,6 @@ func (p *distinctTimestampOp) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
@@ -3785,10 +3761,6 @@ func (p *distinctTimestampOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				{
 					var __retval_0 time.Time
@@ -3824,6 +3796,11 @@ func (p *distinctTimestampOp) Next(ctx context.Context) coldata.Batch {
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				{
@@ -3877,10 +3854,6 @@ func (p *distinctTimestampOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				{
 					var __retval_0 time.Time
@@ -3940,15 +3913,14 @@ func (p partitionerTimestamp) partitionWithOrder(
 	}
 
 	col := colVec.Timestamp()
-	col = col[0:n]
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var (
 					__retval_lastVal     time.Time
@@ -3996,7 +3968,8 @@ func (p partitionerTimestamp) partitionWithOrder(
 			}
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var __retval_0 time.Time
 				{
@@ -4041,6 +4014,7 @@ func (p partitionerTimestamp) partition(colVec coldata.Vec, outputCol []bool, n 
 	col := colVec.Timestamp()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {
@@ -4202,7 +4176,6 @@ func (p *distinctIntervalOp) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
@@ -4250,10 +4223,6 @@ func (p *distinctIntervalOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				{
 					var __retval_0 duration.Duration
@@ -4282,6 +4251,11 @@ func (p *distinctIntervalOp) Next(ctx context.Context) coldata.Batch {
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				{
@@ -4328,10 +4302,6 @@ func (p *distinctIntervalOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				{
 					var __retval_0 duration.Duration
@@ -4384,15 +4354,14 @@ func (p partitionerInterval) partitionWithOrder(
 	}
 
 	col := colVec.Interval()
-	col = col[0:n]
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var (
 					__retval_lastVal     duration.Duration
@@ -4433,7 +4402,8 @@ func (p partitionerInterval) partitionWithOrder(
 			}
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var __retval_0 duration.Duration
 				{
@@ -4471,6 +4441,7 @@ func (p partitionerInterval) partition(colVec coldata.Vec, outputCol []bool, n i
 	col := colVec.Interval()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {
@@ -4618,7 +4589,6 @@ func (p *distinctDatumOp) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
 			for _, idx := range sel {
@@ -4668,10 +4638,6 @@ func (p *distinctDatumOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for _, idx := range sel {
 				{
 					var __retval_0 interface{}
@@ -4702,6 +4668,11 @@ func (p *distinctDatumOp) Next(ctx context.Context) coldata.Batch {
 			}
 		}
 	} else {
+		// Eliminate bounds checks for outputCol[idx].
+		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
 			for idx := 0; idx < n; idx++ {
 				{
@@ -4750,10 +4721,6 @@ func (p *distinctDatumOp) Next(ctx context.Context) coldata.Batch {
 				}
 			}
 		} else {
-			// Eliminate bounds checks for outputCol[idx].
-			_ = outputCol[n-1]
-			// Eliminate bounds checks for col[idx].
-			_ = col.Get(n - 1)
 			for idx := 0; idx < n; idx++ {
 				{
 					var __retval_0 interface{}
@@ -4808,15 +4775,14 @@ func (p partitionerDatum) partitionWithOrder(
 	}
 
 	col := colVec.Datum()
-	col = col.Slice(0, n)
-	outputCol = outputCol[:n]
-	// Eliminate bounds checks for outputcol[outputIdx].
-	_ = outputCol[len(order)-1]
-	// Eliminate bounds checks for col[outputIdx].
-	_ = col.Get(len(order) - 1)
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var (
 					__retval_lastVal     interface{}
@@ -4859,7 +4825,8 @@ func (p partitionerDatum) partitionWithOrder(
 			}
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
 			{
 				var __retval_0 interface{}
 				{
@@ -4899,6 +4866,7 @@ func (p partitionerDatum) partition(colVec coldata.Vec, outputCol []bool, n int)
 	col := colVec.Datum()
 	_ = col.Get(n - 1)
 	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
 		for idx := 0; idx < n; idx++ {

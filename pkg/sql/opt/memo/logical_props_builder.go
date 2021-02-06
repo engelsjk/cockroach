@@ -49,8 +49,12 @@ type logicalPropsBuilder struct {
 }
 
 func (b *logicalPropsBuilder) init(evalCtx *tree.EvalContext, mem *Memo) {
-	b.evalCtx = evalCtx
-	b.mem = mem
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*b = logicalPropsBuilder{
+		evalCtx: evalCtx,
+		mem:     mem,
+	}
 	b.sb.init(evalCtx, mem.Metadata())
 }
 
@@ -63,12 +67,7 @@ func (b *logicalPropsBuilder) clear() {
 func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relational) {
 	md := scan.Memo().Metadata()
 	hardLimit := scan.HardLimit.RowCount()
-
-	isPartialIndexScan := scan.UsesPartialIndex(md)
-	var pred FiltersExpr
-	if isPartialIndexScan {
-		pred = scan.PartialIndexPredicate(md)
-	}
+	pred := scan.PartialIndexPredicate(md)
 
 	// Side Effects
 	// ------------
@@ -92,7 +91,7 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 	}
 	// Union not-NULL columns with not-NULL columns in the partial index
 	// predicate.
-	if isPartialIndexScan {
+	if pred != nil {
 		rel.NotNullCols.UnionWith(b.rejectNullCols(pred))
 	}
 	rel.NotNullCols.IntersectionWith(rel.OutputCols)
@@ -118,7 +117,7 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 		if tabMeta := md.TableMeta(scan.Table); tabMeta.Constraints != nil {
 			b.addFiltersToFuncDep(*tabMeta.Constraints.(*FiltersExpr), &rel.FuncDeps)
 		}
-		if isPartialIndexScan {
+		if pred != nil {
 			b.addFiltersToFuncDep(pred, &rel.FuncDeps)
 
 			// Partial index keys are not added to the functional dependencies in
@@ -161,7 +160,7 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 		if scan.Constraint != nil {
 			b.updateCardinalityFromConstraint(scan.Constraint, rel)
 		}
-		if isPartialIndexScan {
+		if pred != nil {
 			b.updateCardinalityFromFilters(pred, rel)
 		}
 	}
@@ -993,6 +992,12 @@ func (b *logicalPropsBuilder) buildCancelSessionsProps(
 	cancel *CancelSessionsExpr, rel *props.Relational,
 ) {
 	b.buildBasicProps(cancel, opt.ColList{}, rel)
+}
+
+func (b *logicalPropsBuilder) buildCreateStatisticsProps(
+	ctl *CreateStatisticsExpr, rel *props.Relational,
+) {
+	b.buildBasicProps(ctl, opt.ColList{}, rel)
 }
 
 func (b *logicalPropsBuilder) buildExportProps(export *ExportExpr, rel *props.Relational) {
@@ -1947,7 +1952,9 @@ type joinPropsHelper struct {
 }
 
 func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
-	h.join = joinExpr
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*h = joinPropsHelper{join: joinExpr}
 
 	switch join := joinExpr.(type) {
 	case *LookupJoinExpr:
@@ -1985,6 +1992,20 @@ func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
 		h.filters = join.On
 		b.addFiltersToFuncDep(h.filters, &h.filtersFD)
 		h.filterNotNullCols = b.rejectNullCols(h.filters)
+
+		// Apply the prefix column equalities.
+		md := join.Memo().Metadata()
+		index := md.Table(join.Table).Index(join.Index)
+		for i, colID := range join.PrefixKeyCols {
+			indexColID := join.Table.ColumnID(index.Column(i).Ordinal())
+			h.filterNotNullCols.Add(colID)
+			h.filterNotNullCols.Add(indexColID)
+			h.filtersFD.AddEquivalency(colID, indexColID)
+			if colID == indexColID {
+				// This can happen if an index join was converted into a lookup join.
+				h.selfJoinCols.Add(colID)
+			}
+		}
 
 		// Inverted join always has a filter condition on the index keys.
 		h.filterIsTrue = false
@@ -2307,8 +2328,10 @@ func deriveWithUses(r opt.Expr) props.WithUsesMap {
 
 	default:
 		if opt.IsMutationOp(e) {
-			// Note: this can still be 0.
-			excludedID = e.Private().(*MutationPrivate).WithID
+			if p, ok := e.Private().(*MutationPrivate); ok {
+				// Note: this can still be 0.
+				excludedID = p.WithID
+			}
 		}
 	}
 

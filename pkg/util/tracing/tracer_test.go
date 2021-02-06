@@ -11,8 +11,10 @@
 package tracing
 
 import (
+	"sort"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/logtags"
 	lightstep "github.com/lightstep/lightstep-tracer-go"
 	opentracing "github.com/opentracing/opentracing-go"
@@ -42,7 +44,7 @@ func TestTracerRecording(t *testing.T) {
 	if !noop1.isNoop() {
 		t.Error("expected noop Span")
 	}
-	noop1.LogKV("hello", "void")
+	noop1.Record("hello")
 
 	noop2 := tr.StartSpan("noop2", WithParentAndManualCollection(noop1.Meta()))
 	if !noop2.isNoop() {
@@ -66,78 +68,80 @@ func TestTracerRecording(t *testing.T) {
 	}
 	noop3.Finish()
 
-	s1.LogKV("x", 1)
-	s1.StartRecording(SingleNodeRecording)
-	s1.LogKV("x", 2)
+	s1.Recordf("x=%d", 1)
+	s1.SetVerbose(true)
+	s1.Recordf("x=%d", 2)
 	s2 := tr.StartSpan("b", WithParentAndAutoCollection(s1))
 	if s2.IsBlackHole() {
 		t.Error("recording Span should not be black hole")
 	}
-	s2.LogKV("x", 3)
+	s2.Recordf("x=%d", 3)
 
 	if err := TestingCheckRecordedSpans(s1.GetRecording(), `
 		Span a:
-			tags: unfinished=
-			x: 2
+			tags: _unfinished=1 _verbose=1
+			event: x=2
 		Span b:
-			tags: unfinished=
-			x: 3
+			tags: _unfinished=1 _verbose=1
+			event: x=3
 	`); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := TestingCheckRecordedSpans(s2.GetRecording(), `
 		Span b:
-			tags: unfinished=
-			x: 3
+			tags: _unfinished=1 _verbose=1
+			event: x=3
 	`); err != nil {
 		t.Fatal(err)
 	}
 
 	s3 := tr.StartSpan("c", WithParentAndAutoCollection(s2))
-	s3.LogKV("x", 4)
+	s3.Recordf("x=%d", 4)
 	s3.SetTag("tag", "val")
 
 	s2.Finish()
 
 	if err := TestingCheckRecordedSpans(s1.GetRecording(), `
 		Span a:
-			tags: unfinished=
-			x: 2
+			tags: _unfinished=1 _verbose=1
+			event: x=2
 		Span b:
-			x: 3
+			tags: _verbose=1
+			event: x=3
 		Span c:
-			tags: tag=val unfinished=
-			x: 4
+			tags: _unfinished=1 _verbose=1 tag=val
+			event: x=4
 	`); err != nil {
 		t.Fatal(err)
 	}
 	s3.Finish()
 	if err := TestingCheckRecordedSpans(s1.GetRecording(), `
 		Span a:
-      tags: unfinished=
-			x: 2
+      tags: _unfinished=1 _verbose=1
+			event: x=2
 		Span b:
-			x: 3
+      tags: _verbose=1
+			event: x=3
 		Span c:
-			tags: tag=val
-			x: 4
+			tags: _verbose=1 tag=val
+			event: x=4
 	`); err != nil {
 		t.Fatal(err)
 	}
-	s1.StopRecording()
-	s1.LogKV("x", 100)
+	s1.SetVerbose(false)
+	s1.Recordf("x=%d", 100)
 	if err := TestingCheckRecordedSpans(s1.GetRecording(), ``); err != nil {
 		t.Fatal(err)
 	}
 
 	// The child Span is still recording.
-	s3.LogKV("x", 5)
+	s3.Recordf("x=%d", 5)
 	if err := TestingCheckRecordedSpans(s3.GetRecording(), `
 		Span c:
-			tags: tag=val
-			x: 4
-			x: 5
+			tags: _verbose=1 tag=val
+			event: x=4
+			event: x=5
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -147,43 +151,51 @@ func TestTracerRecording(t *testing.T) {
 func TestStartChildSpan(t *testing.T) {
 	tr := NewTracer()
 	sp1 := tr.StartSpan("parent", WithForceRealSpan())
-	sp1.StartRecording(SingleNodeRecording)
+	sp1.SetVerbose(true)
 	sp2 := tr.StartSpan("child", WithParentAndAutoCollection(sp1))
 	sp2.Finish()
 	sp1.Finish()
-	if err := TestingCheckRecordedSpans(sp1.GetRecording(), `
-		Span parent:
-			Span child:
-	`); err != nil {
+
+	var exp = `
+Span parent:
+      tags: _verbose=1
+    Span child:
+      tags: _verbose=1
+`
+
+	if err := TestingCheckRecordedSpans(sp1.GetRecording(), exp); err != nil {
 		t.Fatal(err)
 	}
 
 	sp1 = tr.StartSpan("parent", WithForceRealSpan())
-	sp1.StartRecording(SingleNodeRecording)
+	sp1.SetVerbose(true)
 	sp2 = tr.StartSpan("child", WithParentAndManualCollection(sp1.Meta()))
 	sp2.Finish()
 	sp1.Finish()
 	if err := TestingCheckRecordedSpans(sp1.GetRecording(), `
 		Span parent:
+			tags: _verbose=1
 	`); err != nil {
 		t.Fatal(err)
 	}
 	if err := TestingCheckRecordedSpans(sp2.GetRecording(), `
 		Span child:
+			tags: _verbose=1
 	`); err != nil {
 		t.Fatal(err)
 	}
 
 	sp1 = tr.StartSpan("parent", WithForceRealSpan())
-	sp1.StartRecording(SingleNodeRecording)
+	sp1.SetVerbose(true)
 	sp2 = tr.StartSpan("child", WithParentAndAutoCollection(sp1),
 		WithLogTags(logtags.SingleTagBuffer("key", "val")))
 	sp2.Finish()
 	sp1.Finish()
 	if err := TestingCheckRecordedSpans(sp1.GetRecording(), `
 		Span parent:
+			tags: _verbose=1
 			Span child:
-				tags: key=val
+				tags: _verbose=1 key=val
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -221,11 +233,11 @@ func TestTracerInjectExtract(t *testing.T) {
 	noop1.Finish()
 	noop2.Finish()
 
-	// Verify that snowball tracing is propagated and triggers recording on the
+	// Verify that verbose tracing is propagated and triggers verbosity on the
 	// remote side.
 
 	s1 := tr.StartSpan("a", WithForceRealSpan())
-	s1.StartRecording(SnowballRecording)
+	s1.SetVerbose(true)
 
 	carrier = make(opentracing.HTTPHeadersCarrier)
 	if err := tr.Inject(s1.Meta(), opentracing.HTTPHeaders, carrier); err != nil {
@@ -244,22 +256,22 @@ func TestTracerInjectExtract(t *testing.T) {
 	if trace1 != trace2 {
 		t.Errorf("traceID doesn't match: parent %d child %d", trace1, trace2)
 	}
-	s2.LogKV("x", 1)
+	s2.Recordf("x=%d", 1)
 	s2.Finish()
 
 	// Verify that recording was started automatically.
 	rec := s2.GetRecording()
 	if err := TestingCheckRecordedSpans(rec, `
 		Span remote op:
-			tags: sb=1
-			x: 1
+			tags: _verbose=1
+			event: x=1
 	`); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := TestingCheckRecordedSpans(s1.GetRecording(), `
 		Span a:
-			tags: sb=1 unfinished=
+			tags: _unfinished=1 _verbose=1
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -271,10 +283,10 @@ func TestTracerInjectExtract(t *testing.T) {
 
 	if err := TestingCheckRecordedSpans(s1.GetRecording(), `
 		Span a:
-			tags: sb=1
+			tags: _verbose=1
 		Span remote op:
-			tags: sb=1
-			x: 1
+			tags: _verbose=1
+			event: x=1
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -325,4 +337,80 @@ func TestLightstepContext(t *testing.T) {
 	}
 	require.Equal(t, exp, s2.Meta().Baggage)
 	require.Equal(t, exp, shadowBaggage)
+}
+
+func getSortedActiveSpanOps(t *testing.T, tr *Tracer) []string {
+	t.Helper()
+	var sl []string
+
+	require.NoError(t, tr.VisitSpans(func(sp *Span) error {
+		for _, rec := range sp.GetRecording() {
+			sl = append(sl, rec.Operation)
+		}
+		return nil
+	}))
+
+	sort.Strings(sl)
+	return sl
+}
+
+// TestTracer_VisitSpans verifies that in-flight local root Spans
+// are tracked by the Tracer, and that Finish'ed Spans are not.
+func TestTracer_VisitSpans(t *testing.T) {
+	tr1 := NewTracer()
+	tr2 := NewTracer()
+
+	root := tr1.StartSpan("root", WithForceRealSpan())
+	root.SetVerbose(true)
+	child := tr1.StartSpan("root.child", WithParentAndAutoCollection(root))
+	require.Len(t, tr1.activeSpans.m, 1)
+
+	childChild := tr2.StartSpan("root.child.remotechild", WithParentAndManualCollection(child.Meta()))
+	childChildFinished := tr2.StartSpan("root.child.remotechilddone", WithParentAndManualCollection(child.Meta()))
+	require.Len(t, tr2.activeSpans.m, 2)
+
+	require.NoError(t, child.ImportRemoteSpans(childChildFinished.GetRecording()))
+
+	childChildFinished.Finish()
+	require.Len(t, tr2.activeSpans.m, 1)
+
+	// Even though only `root` is tracked by tr1, we also reach
+	// root.child and (via ImportRemoteSpans) the remote child.
+	require.Equal(t, []string{"root", "root.child", "root.child.remotechilddone"}, getSortedActiveSpanOps(t, tr1))
+	require.Equal(t, []string{"root.child.remotechild"}, getSortedActiveSpanOps(t, tr2))
+
+	childChild.Finish()
+	child.Finish()
+	root.Finish()
+
+	// Nothing is tracked any more.
+	require.Len(t, getSortedActiveSpanOps(t, tr1), 0)
+	require.Len(t, getSortedActiveSpanOps(t, tr2), 0)
+	require.Len(t, tr1.activeSpans.m, 0)
+	require.Len(t, tr2.activeSpans.m, 0)
+}
+
+// TestActiveSpanVisitorErrors confirms that the visitor of the Tracer's
+// activeSpans registry gracefully exits upon receiving a sentinel error from
+// `iterutil.StopIteration()`.
+func TestActiveSpanVisitorErrors(t *testing.T) {
+	tr := NewTracer()
+	root := tr.StartSpan("root", WithForceRealSpan())
+	defer root.Finish()
+
+	child := tr.StartSpan("root.child", WithParentAndAutoCollection(root))
+	defer child.Finish()
+
+	remoteChild := tr.StartSpan("root.remotechild", WithParentAndManualCollection(child.Meta()))
+	defer remoteChild.Finish()
+
+	var numVisited int
+
+	visitor := func(*Span) error {
+		numVisited++
+		return iterutil.StopIteration()
+	}
+
+	require.NoError(t, tr.VisitSpans(visitor))
+	require.Equal(t, 1, numVisited)
 }
