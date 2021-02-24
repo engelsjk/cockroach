@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
@@ -34,7 +35,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/migration"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -284,6 +287,18 @@ var optUseMultiColStatsClusterMode = settings.RegisterBoolSetting(
 	true,
 )
 
+// localityOptimizedSearchMode controls the cluster default for the use of
+// locality optimized search. If enabled, the optimizer will try to plan scans
+// and lookup joins in which local nodes (i.e., nodes in the gateway region) are
+// searched for matching rows before remote nodes, in the hope that the
+// execution engine can avoid visiting remote nodes.
+var localityOptimizedSearchMode = settings.RegisterBoolSetting(
+	"sql.defaults.locality_optimized_partitioned_index_scan.enabled",
+	"default value for locality_optimized_partitioned_index_scan session setting; "+
+		"enables searching for rows in the current region before searching remote regions",
+	false,
+)
+
 var implicitSelectForUpdateClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.implicit_select_for_update.enabled",
 	"default value for enable_implicit_select_for_update session setting; enables FOR UPDATE locking during the row-fetch phase of mutation statements",
@@ -332,6 +347,13 @@ var experimentalUseNewSchemaChanger = settings.RegisterEnumSetting(
 		int64(sessiondata.UseNewSchemaChangerOn):           "on",
 		int64(sessiondata.UseNewSchemaChangerUnsafeAlways): "unsafe_always",
 	},
+)
+
+var experimentalStreamReplicationEnabled = settings.RegisterBoolSetting(
+	"sql.defaults.experimental_stream_replication.enabled",
+	"default value for experimental_stream_replication session setting;"+
+		"enables the ability to setup a replication stream",
+	false,
 )
 
 // ExperimentalDistSQLPlanningClusterSettingName is the name for the cluster
@@ -402,9 +424,10 @@ var SerialNormalizationMode = settings.RegisterEnumSetting(
 	"default handling of SERIAL in table definitions",
 	"rowid",
 	map[int64]string{
-		int64(sessiondata.SerialUsesRowID):            "rowid",
-		int64(sessiondata.SerialUsesVirtualSequences): "virtual_sequence",
-		int64(sessiondata.SerialUsesSQLSequences):     "sql_sequence",
+		int64(sessiondata.SerialUsesRowID):              "rowid",
+		int64(sessiondata.SerialUsesVirtualSequences):   "virtual_sequence",
+		int64(sessiondata.SerialUsesSQLSequences):       "sql_sequence",
+		int64(sessiondata.SerialUsesCachedSQLSequences): "sql_sequence_cached",
 	},
 ).WithPublic()
 
@@ -793,10 +816,20 @@ type ExecutorConfig struct {
 
 	GCJobNotifier *gcjobnotifier.Notifier
 
+	RangeFeedFactory *rangefeed.Factory
+
 	// VersionUpgradeHook is called after validating a `SET CLUSTER SETTING
 	// version` but before executing it. It can carry out arbitrary migrations
-	// that allow us to eventually remove legacy code.
-	VersionUpgradeHook func(ctx context.Context, from, to clusterversion.ClusterVersion) error
+	// that allow us to eventually remove legacy code. It will only be populated
+	// on the system tenant.
+	//
+	// TODO(tbg,irfansharif,ajwerner): Hook up for secondary tenants.
+	VersionUpgradeHook func(ctx context.Context, user security.SQLUsername, from, to clusterversion.ClusterVersion) error
+
+	// MigrationJobDeps is used to drive migrations.
+	//
+	// TODO(tbg,irfansharif,ajwerner): Hook up for secondary tenants.
+	MigrationJobDeps migration.JobDeps
 
 	// IndexBackfiller is used to backfill indexes. It is another rather circular
 	// object which mostly just holds on to an ExecConfig.
@@ -910,6 +943,12 @@ type ExecutorTestingKnobs struct {
 	// DeterministicExplainAnalyze, if set, will result in overriding fields in
 	// EXPLAIN ANALYZE (PLAN) that can vary between runs (like elapsed times).
 	DeterministicExplainAnalyze bool
+
+	// Pretend59315IsFixed pretends that this issue is fixed:
+	// https://github.com/cockroachdb/cockroach/issues/59315
+	// which means that we don't need the WithBypassRegistry option
+	// in resetForNewSQLTxn.
+	Pretend59315IsFixed bool
 }
 
 // PGWireTestingKnobs contains knobs for the pgwire module.
@@ -939,18 +978,17 @@ type TenantTestingKnobs struct {
 	// TenantIDCodecOverride overrides the tenant ID used to construct the SQL
 	// server's codec, but nothing else (e.g. its certs). Used for testing.
 	TenantIDCodecOverride roachpb.TenantID
+
+	// IdleExitCountdownDuration is set will overwrite the default countdown
+	// duration of the countdown timer that leads to shutdown in case of no SQL
+	// connections.
+	IdleExitCountdownDuration time.Duration
 }
 
 var _ base.ModuleTestingKnobs = &TenantTestingKnobs{}
 
 // ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
 func (*TenantTestingKnobs) ModuleTestingKnobs() {}
-
-// CanSetClusterSettings is a helper method that returns whether the tenant can
-// set in-memory cluster settings.
-func (k *TenantTestingKnobs) CanSetClusterSettings() bool {
-	return k != nil && k.ClusterSettingsUpdater != nil
-}
 
 // BackupRestoreTestingKnobs contains knobs for backup and restore behavior.
 type BackupRestoreTestingKnobs struct {
@@ -976,6 +1014,16 @@ var _ base.ModuleTestingKnobs = &BackupRestoreTestingKnobs{}
 
 // ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
 func (*BackupRestoreTestingKnobs) ModuleTestingKnobs() {}
+
+// StreamIngestionTestingKnobs contains knobs for stream ingestion behavior.
+type StreamIngestionTestingKnobs struct {
+	Interceptors []func(event streamingccl.Event, pa streamingccl.PartitionAddress)
+}
+
+var _ base.ModuleTestingKnobs = &StreamIngestionTestingKnobs{}
+
+// ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
+func (*StreamIngestionTestingKnobs) ModuleTestingKnobs() {}
 
 func shouldDistributeGivenRecAndMode(
 	rec distRecommendation, mode sessiondata.DistSQLExecMode,
@@ -1456,14 +1504,44 @@ func truncateStatementStringForTelemetry(stmt string) string {
 	return stmt
 }
 
-func anonymizeStmtAndConstants(stmt tree.Statement) string {
-	return tree.AsStringWithFlags(stmt, tree.FmtAnonymize|tree.FmtHideConstants)
+// hideNonVirtualTableNameFunc returns a function that can be used with
+// FmtCtx.SetReformatTableNames. It hides all table names that are not virtual
+// tables.
+func hideNonVirtualTableNameFunc(vt VirtualTabler) func(ctx *tree.FmtCtx, name *tree.TableName) {
+	reformatFn := func(ctx *tree.FmtCtx, tn *tree.TableName) {
+		virtual, err := vt.getVirtualTableEntry(tn)
+		if err != nil || virtual == nil {
+			ctx.WriteByte('_')
+			return
+		}
+		// Virtual table: we want to keep the name; however
+		// we need to scrub the database name prefix.
+		newTn := *tn
+		newTn.CatalogName = "_"
+
+		ctx.WithFlags(tree.FmtParsable, func() {
+			ctx.WithReformatTableNames(nil, func() {
+				ctx.FormatNode(&newTn)
+			})
+		})
+	}
+	return reformatFn
+}
+
+func anonymizeStmtAndConstants(stmt tree.Statement, vt VirtualTabler) string {
+	// Re-format to remove most names.
+	f := tree.NewFmtCtx(tree.FmtAnonymize | tree.FmtHideConstants)
+	if vt != nil {
+		f.SetReformatTableNames(hideNonVirtualTableNameFunc(vt))
+	}
+	f.FormatNode(stmt)
+	return f.CloseAndGetString()
 }
 
 // WithAnonymizedStatement attaches the anonymized form of a statement
 // to an error object.
-func WithAnonymizedStatement(err error, stmt tree.Statement) error {
-	anonStmtStr := anonymizeStmtAndConstants(stmt)
+func WithAnonymizedStatement(err error, stmt tree.Statement, vt VirtualTabler) error {
+	anonStmtStr := anonymizeStmtAndConstants(stmt, vt)
 	anonStmtStr = truncateStatementStringForTelemetry(anonStmtStr)
 	return errors.WithSafeDetails(err,
 		"while executing: %s", errors.Safe(anonStmtStr))
@@ -1585,6 +1663,9 @@ func (st *SessionTracing) StartTracing(
 		if sp == nil {
 			return errors.Errorf("no txn span for SessionTracing")
 		}
+		// We want to clear out any existing recordings so they don't show up in
+		// future traces.
+		sp.ResetRecording()
 		sp.SetVerbose(true)
 		st.firstTxnSpan = sp
 	}
@@ -2166,6 +2247,10 @@ func (m *sessionDataMutator) SetOptimizerUseMultiColStats(val bool) {
 	m.data.OptimizerUseMultiColStats = val
 }
 
+func (m *sessionDataMutator) SetLocalityOptimizedSearch(val bool) {
+	m.data.LocalityOptimizedSearch = val
+}
+
 func (m *sessionDataMutator) SetImplicitSelectForUpdate(val bool) {
 	m.data.ImplicitSelectForUpdate = val
 }
@@ -2247,11 +2332,6 @@ func (m *sessionDataMutator) SetAlterColumnTypeGeneral(val bool) {
 	m.data.AlterColumnTypeGeneralEnabled = val
 }
 
-// TODO(radu): remove this once the feature is stable.
-func (m *sessionDataMutator) SetVirtualColumnsEnabled(val bool) {
-	m.data.VirtualColumnsEnabled = val
-}
-
 // TODO(rytaft): remove this once unique without index constraints are fully
 // supported.
 func (m *sessionDataMutator) SetUniqueWithoutIndexConstraints(val bool) {
@@ -2260,6 +2340,10 @@ func (m *sessionDataMutator) SetUniqueWithoutIndexConstraints(val bool) {
 
 func (m *sessionDataMutator) SetUseNewSchemaChanger(val sessiondata.NewSchemaChangerMode) {
 	m.data.NewSchemaChangerMode = val
+}
+
+func (m *sessionDataMutator) SetStreamReplicationEnabled(val bool) {
+	m.data.EnableStreamReplication = val
 }
 
 // RecordLatestSequenceValue records that value to which the session incremented
@@ -2271,6 +2355,11 @@ func (m *sessionDataMutator) RecordLatestSequenceVal(seqID uint32, val int64) {
 // SetNoticeDisplaySeverity sets the NoticeDisplaySeverity for the given session.
 func (m *sessionDataMutator) SetNoticeDisplaySeverity(severity pgnotice.DisplaySeverity) {
 	m.data.NoticeDisplaySeverity = severity
+}
+
+// initSequenceCache creates an empty sequence cache instance for the session.
+func (m *sessionDataMutator) initSequenceCache() {
+	m.data.SequenceCache = sessiondata.SequenceCache{}
 }
 
 type sqlStatsCollector struct {

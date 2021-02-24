@@ -186,20 +186,23 @@ func (p *planner) createDescriptorWithID(
 		}
 	case *tabledesc.Mutable:
 		isTable = true
-		if err := desc.ValidateTable(ctx); err != nil {
+		if err := desc.ValidateSelf(ctx); err != nil {
 			return err
 		}
 		if err := p.Descriptors().AddUncommittedDescriptor(mutDesc); err != nil {
 			return err
 		}
 	case *dbdesc.Mutable:
-		if err := desc.Validate(); err != nil {
+		if err := desc.ValidateSelf(ctx); err != nil {
 			return err
 		}
 		if err := p.Descriptors().AddUncommittedDescriptor(mutDesc); err != nil {
 			return err
 		}
 	case *schemadesc.Mutable:
+		if err := desc.ValidateSelf(ctx); err != nil {
+			return err
+		}
 		if err := p.Descriptors().AddUncommittedDescriptor(mutDesc); err != nil {
 			return err
 		}
@@ -223,9 +226,9 @@ func (p *planner) createDescriptorWithID(
 	return nil
 }
 
-// translateSurvivalGoal translates a tree.SurvivalGoal into a
+// TranslateSurvivalGoal translates a tree.SurvivalGoal into a
 // descpb.SurvivalGoal.
-func translateSurvivalGoal(g tree.SurvivalGoal) (descpb.SurvivalGoal, error) {
+func TranslateSurvivalGoal(g tree.SurvivalGoal) (descpb.SurvivalGoal, error) {
 	switch g {
 	case tree.SurvivalGoalDefault:
 		return descpb.SurvivalGoal_ZONE_FAILURE, nil
@@ -258,23 +261,26 @@ func validateDatabaseRegionConfig(regionConfig descpb.DatabaseDescriptor_RegionC
 	return nil
 }
 
-// addRegionToRegionConfig adds the supplied region to the RegionConfig in the
-// supplied database descriptor.
-func (p *planner) addRegionToRegionConfig(
-	desc *dbdesc.Mutable, regionToAdd *tree.AlterDatabaseAddRegion,
+// addActiveRegionToRegionConfig adds the supplied region to the RegionConfig in
+// the supplied database descriptor if the region is currently active.
+func (p *planner) addActiveRegionToRegionConfig(
+	ctx context.Context, desc *dbdesc.Mutable, regionToAdd *tree.AlterDatabaseAddRegion,
 ) error {
-	liveRegions, err := p.getLiveClusterRegions()
+	liveRegions, err := p.getLiveClusterRegions(ctx)
 	if err != nil {
 		return err
 	}
 
-	regionConfig := desc.RegionConfig
-
 	// Ensure that the region we're adding is currently active.
 	region := descpb.RegionName(regionToAdd.Region)
-	if err := checkLiveClusterRegion(liveRegions, region); err != nil {
+	if err := CheckLiveClusterRegion(liveRegions, region); err != nil {
 		return err
 	}
+	return addRegionToRegionConfig(desc, region)
+}
+
+func addRegionToRegionConfig(desc *dbdesc.Mutable, region descpb.RegionName) error {
+	regionConfig := desc.RegionConfig
 
 	// Ensure that the region doesn't already exist in the database.
 	for _, r := range regionConfig.Regions {
@@ -305,6 +311,23 @@ func (p *planner) addRegionToRegionConfig(
 	}
 
 	return nil
+
+}
+
+// CreateRegionConfigCCL is the public hook point for the CCL-licensed
+// multi-region RegionConfig code.
+var CreateRegionConfigCCL = func(
+	ctx context.Context,
+	evalCtx *tree.EvalContext,
+	execCfg *ExecutorConfig,
+	liveClusterRegions LiveClusterRegions,
+	survivalGoal tree.SurvivalGoal,
+	primaryRegion tree.Name,
+	regions []tree.Name,
+) (descpb.DatabaseDescriptor_RegionConfig, error) {
+	return descpb.DatabaseDescriptor_RegionConfig{}, sqlerrors.NewCCLRequiredError(
+		errors.New("creating multi-region databases requires a CCL binary"),
+	)
 }
 
 // createRegionConfig creates a new region config from the given parameters.
@@ -314,77 +337,23 @@ func (p *planner) createRegionConfig(
 	if primaryRegion == "" && len(regions) == 0 {
 		return nil, nil
 	}
-	var regionConfig descpb.DatabaseDescriptor_RegionConfig
-	var err error
-	regionConfig.SurvivalGoal, err = translateSurvivalGoal(survivalGoal)
+	liveRegions, err := p.getLiveClusterRegions(ctx)
 	if err != nil {
 		return nil, err
-	}
-	liveRegions, err := p.getLiveClusterRegions()
-	if err != nil {
-		return nil, err
-	}
-	regionConfig.PrimaryRegion = descpb.RegionName(primaryRegion)
-	if regionConfig.PrimaryRegion != "" {
-		if err := checkLiveClusterRegion(liveRegions, regionConfig.PrimaryRegion); err != nil {
-			return nil, err
-		}
-	}
-	if len(regions) > 0 {
-		if regionConfig.PrimaryRegion == "" {
-			return nil, pgerror.Newf(
-				pgcode.InvalidDatabaseDefinition,
-				"PRIMARY REGION must be specified if REGIONS are specified",
-			)
-		}
-		regionConfig.Regions = make([]descpb.DatabaseDescriptor_RegionConfig_Region, 0, len(regions)+1)
-		seenRegions := make(map[descpb.RegionName]struct{}, len(regions)+1)
-		for _, r := range regions {
-			region := descpb.RegionName(r)
-			if err := checkLiveClusterRegion(liveRegions, region); err != nil {
-				return nil, err
-			}
-
-			if _, ok := seenRegions[region]; ok {
-				return nil, pgerror.Newf(
-					pgcode.InvalidName,
-					"region %q defined multiple times",
-					region,
-				)
-			}
-			seenRegions[region] = struct{}{}
-			regionConfig.Regions = append(
-				regionConfig.Regions,
-				descpb.DatabaseDescriptor_RegionConfig_Region{
-					Name: region,
-				},
-			)
-		}
-		// If PRIMARY REGION is not in REGIONS, add it implicitly.
-		if _, ok := seenRegions[regionConfig.PrimaryRegion]; !ok {
-			regionConfig.Regions = append(
-				regionConfig.Regions,
-				descpb.DatabaseDescriptor_RegionConfig_Region{
-					Name: regionConfig.PrimaryRegion,
-				},
-			)
-		}
-		sort.SliceStable(regionConfig.Regions, func(i, j int) bool {
-			return regionConfig.Regions[i].Name < regionConfig.Regions[j].Name
-		})
-	} else {
-		regionConfig.Regions = []descpb.DatabaseDescriptor_RegionConfig_Region{
-			{Name: regionConfig.PrimaryRegion},
-		}
 	}
 
-	// Generate a unique ID for the multi-region enum type descriptor here as
-	// well.
-	id, err := catalogkv.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+	regionConfig, err := CreateRegionConfigCCL(
+		ctx,
+		p.EvalContext(),
+		p.ExecCfg(),
+		liveRegions,
+		survivalGoal,
+		primaryRegion,
+		regions,
+	)
 	if err != nil {
 		return nil, err
 	}
-	regionConfig.RegionEnumID = id
 
 	if err := validateDatabaseRegionConfig(regionConfig); err != nil {
 		return nil, err

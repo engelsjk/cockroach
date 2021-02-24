@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -205,8 +206,19 @@ func (r *Replica) tryReproposeWithNewLeaseIndex(
 
 	minTS, untrack := r.store.cfg.ClosedTimestamp.Tracker.Track(ctx)
 	defer untrack(ctx, 0, 0, 0) // covers all error paths below
+
+	// We need to track the request again in order to protect its timestamp until
+	// it gets reproposed.
+	// TODO(andrei): Only track if the request consults the ts cache. Some
+	// requests (e.g. EndTxn) don't care about closed timestamps.
+	minTS2, tok := r.mu.proposalBuf.TrackEvaluatingRequest(ctx, p.Request.WriteTimestamp())
+	defer tok.DoneIfNotMoved(ctx)
+	minTS.Forward(minTS2)
+
 	// NB: p.Request.Timestamp reflects the action of ba.SetActiveTimestamp.
-	if p.Request.Timestamp.Less(minTS) {
+	// The IsIntentWrite condition matches the similar logic for caring
+	// about the closed timestamp cache in applyTimestampCache().
+	if p.Request.IsIntentWrite() && p.Request.WriteTimestamp().LessEq(minTS) {
 		// The tracker wants us to forward the request timestamp, but we can't
 		// do that without re-evaluating, so give up. The error returned here
 		// will go to back to DistSender, so send something it can digest.
@@ -221,7 +233,7 @@ func (r *Replica) tryReproposeWithNewLeaseIndex(
 	// Some tests check for this log message in the trace.
 	log.VEventf(ctx, 2, "retry: proposalIllegalLeaseIndex")
 
-	maxLeaseIndex, pErr := r.propose(ctx, p)
+	maxLeaseIndex, pErr := r.propose(ctx, p, tok.Move(ctx))
 	if pErr != nil {
 		return pErr
 	}
@@ -245,7 +257,13 @@ func (r *Replica) handleSplitResult(ctx context.Context, split *kvserverpb.Split
 
 func (r *Replica) handleMergeResult(ctx context.Context, merge *kvserverpb.Merge) {
 	if err := r.store.MergeRange(
-		ctx, r, merge.LeftDesc, merge.RightDesc, merge.FreezeStart,
+		ctx,
+		r,
+		merge.LeftDesc,
+		merge.RightDesc,
+		merge.FreezeStart,
+		merge.RightClosedTimestamp,
+		merge.RightReadSummary,
 	); err != nil {
 		// Our in-memory state has diverged from the on-disk state.
 		log.Fatalf(ctx, "failed to update store after merging range: %s", err)
@@ -256,10 +274,16 @@ func (r *Replica) handleDescResult(ctx context.Context, desc *roachpb.RangeDescr
 	r.setDescRaftMuLocked(ctx, desc)
 }
 
-func (r *Replica) handleLeaseResult(ctx context.Context, lease *roachpb.Lease) {
+func (r *Replica) handleLeaseResult(
+	ctx context.Context, lease *roachpb.Lease, priorReadSum *rspb.ReadSummary,
+) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.leasePostApplyLocked(ctx, *lease, false /* permitJump */)
+	r.leasePostApplyLocked(ctx,
+		r.mu.state.Lease, /* prevLease */
+		lease,            /* newLease */
+		priorReadSum,
+		assertNoLeaseJump)
 }
 
 func (r *Replica) handleTruncatedStateResult(

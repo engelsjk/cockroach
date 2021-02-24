@@ -59,14 +59,14 @@ func (p *planner) writeSchemaDescChange(
 	job, jobExists := p.extendedEvalCtx.SchemaChangeJobCache[desc.ID]
 	if jobExists {
 		// Update it.
-		if err := job.WithTxn(p.txn).SetDescription(ctx,
+		if err := job.SetDescription(ctx, p.txn,
 			func(ctx context.Context, desc string) (string, error) {
 				return desc + "; " + jobDesc, nil
 			},
 		); err != nil {
 			return err
 		}
-		log.Infof(ctx, "job %d: updated with for change on schema %d", *job.ID(), desc.ID)
+		log.Infof(ctx, "job %d: updated with for change on schema %d", job.ID(), desc.ID)
 	} else {
 		// Or, create a new job.
 		jobRecord := jobs.Record{
@@ -85,7 +85,7 @@ func (p *planner) writeSchemaDescChange(
 		if err != nil {
 			return err
 		}
-		log.Infof(ctx, "queued new schema change job %d for schema %d", *newJob.ID(), desc.ID)
+		log.Infof(ctx, "queued new schema change job %d for schema %d", newJob.ID(), desc.ID)
 	}
 
 	return p.writeSchemaDesc(ctx, desc)

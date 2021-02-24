@@ -33,19 +33,37 @@ var FollowerReadsEnabled = settings.RegisterBoolSetting(
 	true,
 ).WithPublic()
 
+// BatchCanBeEvaluatedOnFollower determines if a batch consists exclusively of
+// requests that can be evaluated on a follower replica, given a sufficiently
+// advanced closed timestamp.
+func BatchCanBeEvaluatedOnFollower(ba roachpb.BatchRequest) bool {
+	// Explanation of conditions:
+	// 1. the batch needs to be part of a transaction, because non-transactional
+	//    batches often rely on the server setting their timestamp. If a follower
+	//    with a lagging clock sets their timestamp then they might miss past
+	//    writes served at higher timestamps.
+	// 2. each request in the batch needs to be "transactional", because those are
+	//    the only ones that have clearly defined semantics when served under the
+	//    closed timestamp.
+	// 3. the batch needs to be read-only, because a follower replica cannot
+	//    propose writes to Raft.
+	// 4. the batch needs to be non-locking, because unreplicated locks are only
+	//    held on the leaseholder.
+	return ba.Txn != nil && ba.IsAllTransactional() && ba.IsReadOnly() && !ba.IsLocking()
+}
+
 // canServeFollowerReadRLocked tests, when a range lease could not be acquired,
 // whether the batch can be served as a follower read despite the error. Only
 // non-locking, read-only requests can be served as follower reads. The batch
-// must be composed exclusively only this kind of request to be accepted as a
-// follower read.
+// must be transactional and composed exclusively of this kind of request to be
+// accepted as a follower read.
 func (r *Replica) canServeFollowerReadRLocked(
 	ctx context.Context, ba *roachpb.BatchRequest, err error,
 ) bool {
 	var lErr *roachpb.NotLeaseHolderError
 	eligible := errors.As(err, &lErr) &&
 		lErr.LeaseHolder != nil && lErr.Lease.Type() == roachpb.LeaseEpoch &&
-		(!ba.IsLocking() && ba.IsAllTransactional()) && // followerreadsccl.batchCanBeEvaluatedOnFollower
-		(ba.Txn == nil || !ba.Txn.IsLocking()) && // followerreadsccl.txnCanPerformFollowerRead
+		BatchCanBeEvaluatedOnFollower(*ba) &&
 		FollowerReadsEnabled.Get(&r.store.cfg.Settings.SV)
 
 	if !eligible {
@@ -65,25 +83,21 @@ func (r *Replica) canServeFollowerReadRLocked(
 		return false
 	}
 
-	ts := ba.Timestamp
-	if ba.Txn != nil {
-		ts.Forward(ba.Txn.MaxTimestamp)
-	}
-
+	requiredFrontier := ba.Txn.RequiredFrontier()
 	maxClosed, _ := r.maxClosedRLocked(ctx)
-	canServeFollowerRead := ts.LessEq(maxClosed)
-	tsDiff := ts.GoTime().Sub(maxClosed.GoTime())
+	canServeFollowerRead := requiredFrontier.LessEq(maxClosed)
+	tsDiff := requiredFrontier.GoTime().Sub(maxClosed.GoTime())
 	if !canServeFollowerRead {
-		maxTsStr := "n/a"
+		uncertaintyLimitStr := "n/a"
 		if ba.Txn != nil {
-			maxTsStr = ba.Txn.MaxTimestamp.String()
+			uncertaintyLimitStr = ba.Txn.GlobalUncertaintyLimit.String()
 		}
 
 		// We can't actually serve the read based on the closed timestamp.
 		// Signal the clients that we want an update so that future requests can succeed.
 		r.store.cfg.ClosedTimestamp.Clients.Request(lErr.LeaseHolder.NodeID, r.RangeID)
-		log.Eventf(ctx, "can't serve follower read; closed timestamp too low by: %s; maxClosed: %s ts: %s maxTS: %s",
-			tsDiff, maxClosed, ba.Timestamp, maxTsStr)
+		log.Eventf(ctx, "can't serve follower read; closed timestamp too low by: %s; maxClosed: %s ts: %s uncertaintyLimit: %s",
+			tsDiff, maxClosed, ba.Timestamp, uncertaintyLimitStr)
 
 		if false {
 			// NB: this can't go behind V(x) because the log message created by the
@@ -127,13 +141,34 @@ func (r *Replica) maxClosedRLocked(ctx context.Context) (_ hlc.Timestamp, ok boo
 	lai := r.mu.state.LeaseAppliedIndex
 	lease := *r.mu.state.Lease
 	initialMaxClosed := r.mu.initialMaxClosed
+	replicaStateClosed := r.mu.state.ClosedTimestamp
 
 	if lease.Expiration != nil {
 		return hlc.Timestamp{}, false
 	}
+	// Look at the legacy closed timestamp propagation mechanism.
 	maxClosed := r.store.cfg.ClosedTimestamp.Provider.MaxClosed(
 		lease.Replica.NodeID, r.RangeID, ctpb.Epoch(lease.Epoch), ctpb.LAI(lai))
 	maxClosed.Forward(lease.Start.ToTimestamp())
 	maxClosed.Forward(initialMaxClosed)
+
+	// Look at the "new" closed timestamp propagation mechanism.
+	maxClosed.Forward(replicaStateClosed)
+
 	return maxClosed, true
+}
+
+// GetFrozenClosedTimestamp returns the closed timestamp. Unlike
+// MaxClosedTimestamp, it only looks at the "new" closed timestamp mechanism,
+// ignoring the old one. It returns an empty result if the new mechanism is not
+// enabled yet. The new mechanism has better properties than the old one -
+// namely the closing of timestamps is synchronized with subsumption requests
+// (through latches). Callers who need that property should be prepared to get
+// an empty result back, meaning that the closed timestamp cannot be known.
+func (r *Replica) GetFrozenClosedTimestamp() hlc.Timestamp {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	// TODO(andrei): Make sure that this synchronizes with the closed timestamps
+	// side-transport once the side-transport is written.
+	return r.mu.state.ClosedTimestamp
 }

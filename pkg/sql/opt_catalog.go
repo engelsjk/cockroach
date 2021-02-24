@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -625,8 +624,8 @@ func newOptTable(
 	}
 
 	// First, determine how many columns we will potentially need.
-	cols := ot.desc.AllColumns()
-	numCols := len(cols) + len(colinfo.AllSystemColumnDescs)
+	cols := ot.desc.DeletableColumns()
+	numCols := len(ot.desc.AllColumns())
 	// One for each inverted index virtual column.
 	secondaryIndexes := ot.desc.DeletableNonPrimaryIndexes()
 	for _, index := range secondaryIndexes {
@@ -687,24 +686,23 @@ func newOptTable(
 	}
 
 	// Set up any registered system columns. However, we won't add the column
-	// in case a column with the same name already exists in the table.
-	// Note that the column does not exist when err != nil. This check is done
-	// for migration purposes. We need to avoid adding the system column if the
-	// table has a column with this name for some reason.
-	for i := range colinfo.AllSystemColumnDescs {
-		sysCol := &colinfo.AllSystemColumnDescs[i]
-		if c, _ := desc.FindColumnWithName(tree.Name(sysCol.Name)); c == nil {
+	// in case a non-system column with the same name already exists in the table.
+	// This check is done for migration purposes. We need to avoid adding the
+	// system column if the table has a column with this name for some reason.
+	for _, sysCol := range ot.desc.SystemColumns() {
+		found, _ := desc.FindColumnWithName(sysCol.ColName())
+		if found == nil || found.IsSystemColumn() {
 			col, ord := newColumn()
 			col.InitNonVirtual(
 				ord,
-				cat.StableID(sysCol.ID),
-				tree.Name(sysCol.Name),
+				cat.StableID(sysCol.GetID()),
+				sysCol.ColName(),
 				cat.System,
-				sysCol.Type,
-				sysCol.Nullable,
-				cat.MaybeHidden(sysCol.Hidden),
-				sysCol.DefaultExpr,
-				sysCol.ComputeExpr,
+				sysCol.GetType(),
+				sysCol.IsNullable(),
+				cat.MaybeHidden(sysCol.IsHidden()),
+				sysCol.ColumnDesc().DefaultExpr,
+				sysCol.ColumnDesc().ComputeExpr,
 			)
 		}
 	}
@@ -723,6 +721,7 @@ func newOptTable(
 			name:         u.Name,
 			table:        ot.ID(),
 			columns:      u.ColumnIDs,
+			predicate:    u.Predicate,
 			withoutIndex: true,
 			validity:     u.Validity,
 		})
@@ -739,16 +738,25 @@ func newOptTable(
 			idxDesc = secondaryIndexes[i-1].IndexDesc()
 		}
 
-		// If there is a subzone that applies to the entire index, use that,
-		// else use the table zone. Skip subzones that apply to partitions,
-		// since they apply only to a subset of the index.
+		// If there is a subzone that applies to the entire index, use that, else
+		// use the table zone. Save subzones that apply to partitions, since we will
+		// use those later when initializing partitions in the index.
 		idxZone := tblZone
+		partZones := make(map[string]*zonepb.ZoneConfig)
 		for j := range tblZone.Subzones {
 			subzone := &tblZone.Subzones[j]
-			if subzone.IndexID == uint32(idxDesc.ID) && subzone.PartitionName == "" {
-				copyZone := subzone.Config
-				copyZone.InheritFromParent(tblZone)
-				idxZone = &copyZone
+			if subzone.IndexID == uint32(idxDesc.ID) {
+				if subzone.PartitionName == "" {
+					// Subzone applies to the whole index.
+					copyZone := subzone.Config
+					copyZone.InheritFromParent(tblZone)
+					idxZone = &copyZone
+				} else {
+					// Subzone applies to a partition.
+					copyZone := subzone.Config
+					copyZone.InheritFromParent(tblZone)
+					partZones[subzone.PartitionName] = &copyZone
+				}
 			}
 		}
 		if idxDesc.Type == descpb.IndexDescriptor_INVERTED {
@@ -771,9 +779,9 @@ func newOptTable(
 				false, /* nullable */
 				invertedSourceColOrdinal,
 			)
-			ot.indexes[i].init(ot, i, idxDesc, idxZone, virtualColOrd)
+			ot.indexes[i].init(ot, i, idxDesc, idxZone, partZones, virtualColOrd)
 		} else {
-			ot.indexes[i].init(ot, i, idxDesc, idxZone, -1 /* virtualColOrd */)
+			ot.indexes[i].init(ot, i, idxDesc, idxZone, partZones, -1 /* virtualColOrd */)
 		}
 
 		// Add unique constraints for implicitly partitioned unique indexes.
@@ -783,6 +791,7 @@ func newOptTable(
 				table:        ot.ID(),
 				columns:      idxDesc.ColumnIDs[idxDesc.Partitioning.NumImplicitColumns:],
 				withoutIndex: true,
+				predicate:    idxDesc.Predicate,
 				// TODO(rytaft): will we ever support an unvalidated unique constraint
 				// here?
 				validity: descpb.ConstraintValidity_Validated,
@@ -987,17 +996,10 @@ func (ot *optTable) Column(i int) *cat.Column {
 	return &ot.columns[i]
 }
 
-// getColDesc is part of optCatalogTableInterface.
-func (ot *optTable) getColDesc(i int) *descpb.ColumnDescriptor {
+// getCol is part of optCatalogTableInterface.
+func (ot *optTable) getCol(i int) catalog.Column {
 	if i < len(ot.desc.AllColumns()) {
-		return ot.desc.AllColumns()[i].ColumnDesc()
-	}
-	// Check if the column matches any registered system columns.
-	for j := range colinfo.AllSystemColumnDescs {
-		colDesc := &colinfo.AllSystemColumnDescs[j]
-		if descpb.ColumnID(ot.columns[i].ColID()) == colDesc.ID {
-			return colDesc
-		}
+		return ot.desc.AllColumns()[i]
 	}
 	return nil
 }
@@ -1115,6 +1117,10 @@ type optIndex struct {
 	numKeyCols    int
 	numLaxKeyCols int
 
+	// partitions stores zone information and datums for PARTITION BY LIST
+	// partitions.
+	partitions []optPartition
+
 	// invertedVirtualColOrd is used if this is an inverted index; it stores the
 	// ordinal of the virtual column created to refer to the key of this index.
 	// It is -1 if this is not an inverted index.
@@ -1130,6 +1136,7 @@ func (oi *optIndex) init(
 	indexOrdinal int,
 	desc *descpb.IndexDescriptor,
 	zone *zonepb.ZoneConfig,
+	partZones map[string]*zonepb.ZoneConfig,
 	invertedVirtualColOrd int,
 ) {
 	oi.tab = tab
@@ -1157,6 +1164,38 @@ func (oi *optIndex) init(
 	} else {
 		oi.storedCols = desc.StoreColumnIDs
 		oi.numCols = len(desc.ColumnIDs) + len(desc.ExtraColumnIDs) + len(desc.StoreColumnIDs)
+	}
+
+	// Collect information about the partitions.
+	oi.partitions = make([]optPartition, len(desc.Partitioning.List))
+	for i := range desc.Partitioning.List {
+		p := &desc.Partitioning.List[i]
+		oi.partitions[i] = optPartition{
+			name:   p.Name,
+			zone:   &zonepb.ZoneConfig{},
+			datums: make([]tree.Datums, 0, len(p.Values)),
+		}
+
+		// Get the zone.
+		if zone, ok := partZones[p.Name]; ok {
+			oi.partitions[i].zone = zone
+		}
+
+		// Get the partition values.
+		var a rowenc.DatumAlloc
+		for _, valueEncBuf := range p.Values {
+			t, _, err := rowenc.DecodePartitionTuple(
+				&a, oi.tab.codec, oi.tab.desc, oi.desc, &oi.desc.Partitioning,
+				valueEncBuf, nil, /* prefixDatums */
+			)
+			if err != nil {
+				panic(errors.NewAssertionErrorWithWrappedErrf(err, "while decoding partition tuple"))
+			}
+			oi.partitions[i].datums = append(oi.partitions[i].datums, t.Datums)
+			// TODO(radu): split into multiple prefixes if Subpartition is also by list.
+			// Note that this functionality should be kept in sync with the test catalog
+			// implementation (test_catalog.go).
+		}
 	}
 
 	if desc.Unique {
@@ -1303,35 +1342,6 @@ func (oi *optIndex) Ordinal() int {
 	return oi.indexOrdinal
 }
 
-// PartitionByListPrefixes is part of the cat.Index interface.
-func (oi *optIndex) PartitionByListPrefixes() []tree.Datums {
-	list := oi.desc.Partitioning.List
-	if len(list) == 0 {
-		return nil
-	}
-	res := make([]tree.Datums, 0, len(list))
-	var a rowenc.DatumAlloc
-	for i := range list {
-		for _, valueEncBuf := range list[i].Values {
-			t, _, err := rowenc.DecodePartitionTuple(
-				&a, oi.tab.codec, oi.tab.desc, oi.desc, &oi.desc.Partitioning,
-				valueEncBuf, nil, /* prefixDatums */
-			)
-			if err != nil {
-				panic(errors.NewAssertionErrorWithWrappedErrf(err, "while decoding partition tuple"))
-			}
-			// Ignore the DEFAULT case, where there is nothing to return.
-			if len(t.Datums) > 0 {
-				res = append(res, t.Datums)
-			}
-			// TODO(radu): split into multiple prefixes if Subpartition is also by list.
-			// Note that this functionality should be kept in sync with the test catalog
-			// implementation (test_catalog.go).
-		}
-	}
-	return res
-}
-
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
 func (oi *optIndex) ImplicitPartitioningColumnCount() int {
 	return int(oi.desc.Partitioning.NumImplicitColumns)
@@ -1367,6 +1377,41 @@ func (oi *optIndex) GeoConfig() *geoindex.Config {
 // Version is part of the cat.Index interface.
 func (oi *optIndex) Version() descpb.IndexDescriptorVersion {
 	return oi.desc.Version
+}
+
+// PartitionCount is part of the cat.Index interface.
+func (oi *optIndex) PartitionCount() int {
+	return len(oi.partitions)
+}
+
+// Partition is part of the cat.Index interface.
+func (oi *optIndex) Partition(i int) cat.Partition {
+	return &oi.partitions[i]
+}
+
+// optPartition implements cat.Partition and represents a PARTITION BY LIST
+// partition of an index.
+type optPartition struct {
+	name   string
+	zone   *zonepb.ZoneConfig
+	datums []tree.Datums
+}
+
+var _ cat.Partition = &optPartition{}
+
+// Name is part of the cat.Partition interface.
+func (op *optPartition) Name() string {
+	return op.name
+}
+
+// Zone is part of the cat.Partition interface.
+func (op *optPartition) Zone() cat.Zone {
+	return op.zone
+}
+
+// PartitionByListPrefixes is part of the cat.Partition interface.
+func (op *optPartition) PartitionByListPrefixes() []tree.Datums {
+	return op.datums
 }
 
 type optTableStat struct {
@@ -1488,8 +1533,9 @@ func (oi *optFamily) Table() cat.Table {
 type optUniqueConstraint struct {
 	name string
 
-	table   cat.StableID
-	columns []descpb.ColumnID
+	table     cat.StableID
+	columns   []descpb.ColumnID
+	predicate string
 
 	withoutIndex bool
 	validity     descpb.ConstraintValidity
@@ -1523,6 +1569,11 @@ func (u *optUniqueConstraint) ColumnOrdinal(tab cat.Table, i int) int {
 	optTab := tab.(*optTable)
 	ord, _ := optTab.lookupColumnOrdinal(u.columns[i])
 	return ord
+}
+
+// Predicate is part of the cat.UniqueConstraint interface.
+func (u *optUniqueConstraint) Predicate() (string, bool) {
+	return u.predicate, u.predicate != ""
 }
 
 // WithoutIndex is part of the cat.UniqueConstraint interface.
@@ -1820,10 +1871,10 @@ func (ot *optVirtualTable) Column(i int) *cat.Column {
 	return &ot.columns[i]
 }
 
-// getColDesc is part of optCatalogTableInterface.
-func (ot *optVirtualTable) getColDesc(i int) *descpb.ColumnDescriptor {
+// getCol is part of optCatalogTableInterface.
+func (ot *optVirtualTable) getCol(i int) catalog.Column {
 	if i > 0 && i <= len(ot.desc.PublicColumns()) {
-		return ot.desc.PublicColumns()[i-1].ColumnDesc()
+		return ot.desc.PublicColumns()[i-1]
 	}
 	return nil
 }
@@ -2043,11 +2094,6 @@ func (oi *optVirtualIndex) Ordinal() int {
 	return oi.indexOrdinal
 }
 
-// PartitionByListPrefixes is part of the cat.Index interface.
-func (oi *optVirtualIndex) PartitionByListPrefixes() []tree.Datums {
-	return nil
-}
-
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
 func (oi *optVirtualIndex) ImplicitPartitioningColumnCount() int {
 	return 0
@@ -2081,6 +2127,16 @@ func (oi *optVirtualIndex) GeoConfig() *geoindex.Config {
 // Version is part of the cat.Index interface.
 func (oi *optVirtualIndex) Version() descpb.IndexDescriptorVersion {
 	return 0
+}
+
+// PartitionCount is part of the cat.Index interface.
+func (oi *optVirtualIndex) PartitionCount() int {
+	return 0
+}
+
+// Partition is part of the cat.Index interface.
+func (oi *optVirtualIndex) Partition(i int) cat.Partition {
+	return nil
 }
 
 // optVirtualFamily is a dummy implementation of cat.Family for the only family
@@ -2121,9 +2177,9 @@ func (oi *optVirtualFamily) Table() cat.Table {
 }
 
 type optCatalogTableInterface interface {
-	// getColDesc returns the column descriptor that is backing a given column,
+	// getCol returns the catalog.Column interface backing a given column,
 	// (or nil if it is a virtual column).
-	getColDesc(i int) *descpb.ColumnDescriptor
+	getCol(i int) catalog.Column
 }
 
 var _ optCatalogTableInterface = &optTable{}

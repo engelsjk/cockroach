@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
@@ -29,8 +30,8 @@ import (
 // crdbSpan is a span for internal crdb usage. This is used to power SQL session
 // tracing.
 type crdbSpan struct {
-	traceID      uint64 // probabilistically unique.
-	spanID       uint64 // probabilistically unique.
+	traceID      uint64 // probabilistically unique
+	spanID       uint64 // probabilistically unique
 	parentSpanID uint64
 	goroutineID  uint64
 
@@ -65,7 +66,8 @@ type crdbSpanMu struct {
 		// children contains the list of child spans started after this Span
 		// started recording.
 		children []*crdbSpan
-		// remoteSpan contains the list of remote child spans manually imported.
+		// remoteSpan contains the list of remote child span recordings that
+		// were manually imported.
 		remoteSpans []tracingpb.RecordedSpan
 	}
 
@@ -78,7 +80,7 @@ type crdbSpanMu struct {
 	tags opentracing.Tags
 
 	stats      SpanStats
-	structured []Structured
+	structured ring.Buffer // of Structured events
 
 	// The Span's associated baggage.
 	baggage map[string]string
@@ -95,9 +97,7 @@ func (s *crdbSpan) recordingType() RecordingType {
 // child spans will be stored.
 //
 // If parent != nil, the Span will be registered as a child of the respective
-// parent.
-// If separate recording is specified, the child is not registered with the
-// parent. Thus, the parent's recording will not include this child.
+// parent. If nil, the parent's recording will not include this child.
 func (s *crdbSpan) enableRecording(parent *crdbSpan, recType RecordingType) {
 	if parent != nil {
 		parent.addChild(s)
@@ -112,9 +112,17 @@ func (s *crdbSpan) enableRecording(parent *crdbSpan, recType RecordingType) {
 	if recType == RecordingVerbose {
 		s.setBaggageItemLocked(verboseTracingBaggageKey, "1")
 	}
-	// Clear any previously recorded info. This is needed by SQL SessionTracing,
-	// who likes to start and stop recording repeatedly on the same Span, and
-	// collect the (separate) recordings every time.
+}
+
+// resetRecording clears any previously recorded info.
+//
+// NB: This is needed by SQL SessionTracing, who likes to start and stop
+// recording repeatedly on the same Span, and collect the (separate) recordings
+// every time.
+func (s *crdbSpan) resetRecording() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.mu.recording.recordedLogs = nil
 	s.mu.recording.children = nil
 	s.mu.recording.remoteSpans = nil
@@ -134,19 +142,27 @@ func (s *crdbSpan) disableRecording() {
 	}
 }
 
-func (s *crdbSpan) getRecording(m mode) Recording {
+func (s *crdbSpan) getRecording(m mode, everyoneIsV211 bool) Recording {
 	if s == nil {
-		return nil
+		return nil // noop span
 	}
-	if m == modeLegacy && s.recordingType() == RecordingOff {
-		// In legacy tracing (pre always-on), we avoid allocations when the
-		// Span is not actively recording.
-		//
-		// TODO(tbg): we could consider doing the same when background tracing
-		// is on but the current span contains "nothing of interest".
-		return nil
-	}
+
 	s.mu.Lock()
+
+	if !everyoneIsV211 {
+		// The cluster may contain nodes that are running v20.2. Unfortunately that
+		// version can easily crash when a peer returns a recording that that node
+		// did not expect would get created. To circumvent this, retain the v20.2
+		// behavior of eliding recordings when verbosity is off until we're sure
+		// that v20.2 is not around any longer.
+		//
+		// TODO(tbg): remove this in the v21.2 cycle.
+		if m == modeLegacy && s.recordingType() == RecordingOff {
+			s.mu.Unlock()
+			return nil
+		}
+	}
+
 	// The capacity here is approximate since we don't know how many grandchildren
 	// there are.
 	result := make(Recording, 0, 1+len(s.mu.recording.children)+len(s.mu.recording.remoteSpans))
@@ -157,7 +173,7 @@ func (s *crdbSpan) getRecording(m mode) Recording {
 	s.mu.Unlock()
 
 	for _, child := range children {
-		result = append(result, child.getRecording(m)...)
+		result = append(result, child.getRecording(m, everyoneIsV211)...)
 	}
 
 	// Sort the spans by StartTime, except the first Span (the root of this
@@ -206,10 +222,14 @@ func (s *crdbSpan) record(msg string) {
 	}
 }
 
-func (s *crdbSpan) logStructured(item Structured) {
+func (s *crdbSpan) recordStructured(item Structured) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.mu.structured = append(s.mu.structured, item)
+
+	if s.mu.structured.Len() == maxStructuredEventsPerSpan {
+		s.mu.structured.RemoveLast()
+	}
+	s.mu.structured.AddFirst(item)
 }
 
 func (s *crdbSpan) setBaggageItemAndTag(restrictedKey, value string) {
@@ -253,6 +273,9 @@ func (s *crdbSpan) getRecordingLocked(m mode) tracingpb.RecordedSpan {
 		// duration in it, otherwise tools get confused. For example, we export
 		// recordings to Jaeger, and spans with a zero duration don't look nice.
 		rs.Duration = timeutil.Now().Sub(rs.StartTime)
+		rs.Finished = false
+	} else {
+		rs.Finished = true
 	}
 
 	addTag := func(k, v string) {
@@ -282,10 +305,11 @@ func (s *crdbSpan) getRecordingLocked(m mode) tracingpb.RecordedSpan {
 		rs.DeprecatedStats = stats
 	}
 
-	if s.mu.structured != nil {
-		rs.InternalStructured = make([]*types.Any, 0, len(s.mu.structured))
-		for i := range s.mu.structured {
-			item, err := types.MarshalAny(s.mu.structured[i])
+	if numEvents := s.mu.structured.Len(); numEvents != 0 {
+		rs.InternalStructured = make([]*types.Any, 0, numEvents)
+		for i := 0; i < numEvents; i++ {
+			event := s.mu.structured.Get(i).(Structured)
+			item, err := types.MarshalAny(event)
 			if err != nil {
 				// An error here is an error from Marshal; these
 				// are unlikely to happen.

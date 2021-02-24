@@ -78,8 +78,9 @@ func TestSampledStatsCollection(t *testing.T) {
 		stats.mu.Lock()
 		defer stats.mu.Unlock()
 		require.Equal(t, int64(2), stats.mu.data.Count, "expected to have collected two sets of general stats")
-		require.Equal(t, int64(1), stats.mu.data.ExecStatCollectionCount, "expected to have collected exactly one set of execution stats")
+		require.Equal(t, int64(1), stats.mu.data.ExecStats.Count, "expected to have collected exactly one set of execution stats")
 		require.Greater(t, stats.mu.data.RowsRead.Mean, float64(0), "expected statement to have read at least one row")
+		require.Greater(t, stats.mu.data.ExecStats.MaxMemUsage.Mean, float64(0), "expected statement to have used RAM")
 	})
 
 	t.Run("ExplicitTxn", func(t *testing.T) {
@@ -105,14 +106,16 @@ func TestSampledStatsCollection(t *testing.T) {
 		aggStats.mu.Lock()
 		defer aggStats.mu.Unlock()
 		require.Equal(t, int64(2), aggStats.mu.data.Count, "expected to have collected two sets of general stats")
-		require.Equal(t, int64(1), aggStats.mu.data.ExecStatCollectionCount, "expected to have collected exactly one set of execution stats")
+		require.Equal(t, int64(1), aggStats.mu.data.ExecStats.Count, "expected to have collected exactly one set of execution stats")
 		require.Greater(t, aggStats.mu.data.RowsRead.Mean, float64(0), "expected statement to have read at least one row")
+		require.Greater(t, aggStats.mu.data.ExecStats.MaxMemUsage.Mean, float64(0), "expected statement to have used RAM")
 
 		selectStats.mu.Lock()
 		defer selectStats.mu.Unlock()
 		require.Equal(t, int64(2), selectStats.mu.data.Count, "expected to have collected two sets of general stats")
-		require.Equal(t, int64(1), selectStats.mu.data.ExecStatCollectionCount, "expected to have collected exactly one set of execution stats")
+		require.Equal(t, int64(1), selectStats.mu.data.ExecStats.Count, "expected to have collected exactly one set of execution stats")
 		require.Greater(t, selectStats.mu.data.RowsRead.Mean, float64(0), "expected statement to have read at least one row")
+		require.Greater(t, selectStats.mu.data.ExecStats.MaxMemUsage.Mean, float64(0), "expected statement to have used RAM")
 
 		key := util.MakeFNV64()
 		key.Add(uint64(aggID))
@@ -134,5 +137,6 @@ func TestSampledStatsCollection(t *testing.T) {
 			txStats.mu.data.RowsRead.Mean,
 			"expected txn to report having read the sum of rows read in both its statements",
 		)
+		require.Greater(t, txStats.mu.data.ExecStats.MaxMemUsage.Mean, float64(0), "expected MaxMemUsage to be set on the txn")
 	})
 }

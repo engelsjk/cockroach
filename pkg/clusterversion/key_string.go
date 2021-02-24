@@ -34,14 +34,27 @@ func _() {
 	_ = x[VirtualComputedColumns-23]
 	_ = x[CPutInline-24]
 	_ = x[ReplicaVersions-25]
-	_ = x[TruncatedAndRangeAppliedStateMigration-26]
-	_ = x[PostTruncatedAndRangeAppliedStateMigration-27]
+	_ = x[replacedTruncatedAndRangeAppliedStateMigration-26]
+	_ = x[replacedPostTruncatedAndRangeAppliedStateMigration-27]
 	_ = x[NewSchemaChanger-28]
+	_ = x[LongRunningMigrations-29]
+	_ = x[TruncatedAndRangeAppliedStateMigration-30]
+	_ = x[PostTruncatedAndRangeAppliedStateMigration-31]
+	_ = x[SeparatedIntents-32]
+	_ = x[TracingVerbosityIndependentSemantics-33]
+	_ = x[SequencesRegclass-34]
+	_ = x[ImplicitColumnPartitioning-35]
+	_ = x[MultiRegionFeatures-36]
+	_ = x[ClosedTimestampsRaftTransport-37]
+	_ = x[ChangefeedsSupportPrimaryIndexChanges-38]
+	_ = x[NamespaceTableWithSchemasMigration-39]
+	_ = x[ForeignKeyRepresentationMigration-40]
+	_ = x[PriorReadSummaries-41]
 }
 
-const _Key_name = "NamespaceTableWithSchemasStart20_2GeospatialTypeEnumsRangefeedLeasesAlterColumnTypeGeneralAlterSystemJobsAddCreatedByColumnsAddScheduledJobsTableUserDefinedSchemasNoOriginFKIndexesNodeMembershipStatusMinPasswordLengthAbortSpanBytesAlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTableMaterializedViewsBox2DTypeUpdateScheduledJobsSchemaCreateLoginPrivilegeHBAForNonTLSV20_2Start21_1EmptyArraysInInvertedIndexesUniqueWithoutIndexConstraintsVirtualComputedColumnsCPutInlineReplicaVersionsTruncatedAndRangeAppliedStateMigrationPostTruncatedAndRangeAppliedStateMigrationNewSchemaChanger"
+const _Key_name = "NamespaceTableWithSchemasStart20_2GeospatialTypeEnumsRangefeedLeasesAlterColumnTypeGeneralAlterSystemJobsAddCreatedByColumnsAddScheduledJobsTableUserDefinedSchemasNoOriginFKIndexesNodeMembershipStatusMinPasswordLengthAbortSpanBytesAlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTableMaterializedViewsBox2DTypeUpdateScheduledJobsSchemaCreateLoginPrivilegeHBAForNonTLSV20_2Start21_1EmptyArraysInInvertedIndexesUniqueWithoutIndexConstraintsVirtualComputedColumnsCPutInlineReplicaVersionsreplacedTruncatedAndRangeAppliedStateMigrationreplacedPostTruncatedAndRangeAppliedStateMigrationNewSchemaChangerLongRunningMigrationsTruncatedAndRangeAppliedStateMigrationPostTruncatedAndRangeAppliedStateMigrationSeparatedIntentsTracingVerbosityIndependentSemanticsSequencesRegclassImplicitColumnPartitioningMultiRegionFeaturesClosedTimestampsRaftTransportChangefeedsSupportPrimaryIndexChangesNamespaceTableWithSchemasMigrationForeignKeyRepresentationMigrationPriorReadSummaries"
 
-var _Key_index = [...]uint16{0, 25, 34, 48, 53, 68, 90, 124, 145, 163, 180, 200, 217, 231, 295, 312, 321, 346, 366, 378, 383, 392, 420, 449, 471, 481, 496, 534, 576, 592}
+var _Key_index = [...]uint16{0, 25, 34, 48, 53, 68, 90, 124, 145, 163, 180, 200, 217, 231, 295, 312, 321, 346, 366, 378, 383, 392, 420, 449, 471, 481, 496, 542, 592, 608, 629, 667, 709, 725, 761, 778, 804, 823, 852, 889, 923, 956, 974}
 
 func (i Key) String() string {
 	if i < 0 || i >= Key(len(_Key_index)-1) {

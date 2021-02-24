@@ -23,7 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colbuilder"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -128,10 +129,12 @@ func TestEval(t *testing.T) {
 
 	t.Run("vectorized", func(t *testing.T) {
 		walk(t, func(t *testing.T, d *datadriven.TestData) string {
+			st := cluster.MakeTestingClusterSettings()
 			flowCtx := &execinfra.FlowCtx{
+				Cfg:     &execinfra.ServerConfig{Settings: st},
 				EvalCtx: evalCtx,
 			}
-			memMonitor := execinfra.NewTestMemMonitor(ctx, cluster.MakeTestingClusterSettings())
+			memMonitor := execinfra.NewTestMemMonitor(ctx, st)
 			defer memMonitor.Stop(ctx)
 			acc := memMonitor.MakeBoundAccount()
 			defer acc.Close(ctx)
@@ -151,7 +154,7 @@ func TestEval(t *testing.T) {
 			}
 
 			batchesReturned := 0
-			args := &colexec.NewColOperatorArgs{
+			args := &colexecargs.NewColOperatorArgs{
 				Spec: &execinfrapb.ProcessorSpec{
 					Input: []execinfrapb.InputSyncSpec{{}},
 					Core: execinfrapb.ProcessorCoreUnion{
@@ -162,8 +165,8 @@ func TestEval(t *testing.T) {
 					},
 					ResultTypes: []*types.T{typedExpr.ResolvedType()},
 				},
-				Inputs: []colexecbase.Operator{
-					&colexecbase.CallbackOperator{
+				Inputs: []colexecop.Operator{
+					&colexecop.CallbackOperator{
 						NextCb: func(_ context.Context) coldata.Batch {
 							if batchesReturned > 0 {
 								return coldata.ZeroBatch
@@ -202,7 +205,7 @@ func TestEval(t *testing.T) {
 				row  rowenc.EncDatumRow
 				meta *execinfrapb.ProducerMetadata
 			)
-			ctx = mat.Start(ctx)
+			mat.Start(ctx)
 			row, meta = mat.Next()
 			if meta != nil {
 				if meta.Err != nil {

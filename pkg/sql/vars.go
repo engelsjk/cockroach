@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -79,6 +80,11 @@ type sessionVar struct {
 	// that are already running (i.e. not during session
 	// initialization).  Currently only used for transaction_isolation.
 	RuntimeSet func(_ context.Context, evalCtx *extendedEvalContext, s string) error
+
+	// SetWithPlanner is like Set except it can only be used in sessions
+	// that are already running and the planner is passed in.
+	// The planner can be used to check privileges before setting.
+	SetWithPlanner func(_ context.Context, p *planner, s string) error
 
 	// GlobalDefault is the string value to use as default for RESET or
 	// during session initialization when no default value was provided
@@ -227,10 +233,34 @@ var varGen = map[string]sessionVar{
 			}
 			return dbName, nil
 		},
-		Set: func(
-			ctx context.Context, m *sessionDataMutator, dbName string,
-		) error {
+		Set: func(_ context.Context, m *sessionDataMutator, dbName string) error {
 			m.SetDatabase(dbName)
+			return nil
+		},
+		SetWithPlanner: func(
+			_ context.Context, p *planner, dbName string) error {
+			// Check if the user has connect privilege on the database.
+			// If the dbName is empty string, skip the privilege check.
+			if dbName != "" {
+				_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(
+					p.EvalContext().Context, p.Txn(), dbName, tree.DatabaseLookupFlags{Required: true},
+				)
+				if err != nil {
+					return err
+				}
+				// Give a warning if the user does not have CONNECT privilege on the database.
+				connectPrivilegeMissingWarning := errors.WithIssueLink(
+					pgnotice.Newf("CONNECT privilege will be required to connect to databases in a future release"),
+					errors.IssueLink{IssueURL: build.MakeIssueURL(59875)},
+				)
+				if err := p.CheckPrivilege(p.EvalContext().Context, dbDesc, privilege.CONNECT); err != nil {
+					p.BufferClientNotice(
+						p.EvalContext().Context,
+						connectPrivilegeMissingWarning,
+					)
+				}
+			}
+			p.sessionDataMutator.SetDatabase(dbName)
 			return nil
 		},
 		Get: func(evalCtx *extendedEvalContext) string { return evalCtx.SessionData.Database },
@@ -640,6 +670,25 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(optUseMultiColStatsClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`locality_optimized_partitioned_index_scan`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`locality_optimized_partitioned_index_scan`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar(`locality_optimized_partitioned_index_scan`, s)
+			if err != nil {
+				return err
+			}
+			m.SetLocalityOptimizedSearch(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.LocalityOptimizedSearch)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(localityOptimizedSearchMode.Get(sv))
 		},
 	},
 
@@ -1170,23 +1219,6 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
-	// CockroachDB extension.
-	`experimental_enable_virtual_columns`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_virtual_columns`),
-		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar(`experimental_enable_virtual_columns`, s)
-			if err != nil {
-				return err
-			}
-			m.SetVirtualColumnsEnabled(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) string {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData.VirtualColumnsEnabled)
-		},
-		GlobalDefault: globalFalse,
-	},
-
 	// TODO(rytaft): remove this once unique without index constraints are fully
 	// supported.
 	`experimental_enable_unique_without_index_constraints`: {
@@ -1212,7 +1244,7 @@ var varGen = map[string]sessionVar{
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
 			mode, ok := sessiondata.NewSchemaChangerModeFromString(s)
 			if !ok {
-				return newVarValueError(`experimental_user_new_schema_changer`, s,
+				return newVarValueError(`experimental_use_new_schema_changer`, s,
 					"off", "on", "unsafe_always")
 			}
 			m.SetUseNewSchemaChanger(mode)
@@ -1223,6 +1255,24 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return sessiondata.NewSchemaChangerMode(experimentalUseNewSchemaChanger.Get(sv)).String()
+		},
+	},
+
+	`enable_experimental_stream_replication`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_experimental_stream_replication`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar(`enable_experimental_stream_replication`, s)
+			if err != nil {
+				return err
+			}
+			m.SetStreamReplicationEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.EnableStreamReplication)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(experimentalStreamReplicationEnabled.Get(sv))
 		},
 	},
 }
@@ -1426,11 +1476,14 @@ func (p *planner) SetSessionVar(ctx context.Context, varName, newVal string) err
 		return err
 	}
 
-	if v.Set == nil && v.RuntimeSet == nil {
+	if v.Set == nil && v.RuntimeSet == nil && v.SetWithPlanner == nil {
 		return newCannotChangeParameterError(name)
 	}
 	if v.RuntimeSet != nil {
 		return v.RuntimeSet(ctx, &p.extendedEvalCtx, newVal)
+	}
+	if v.SetWithPlanner != nil {
+		return v.SetWithPlanner(ctx, p, newVal)
 	}
 	return v.Set(ctx, p.sessionDataMutator, newVal)
 }

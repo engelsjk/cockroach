@@ -17,7 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -81,7 +81,10 @@ func TestColumnarizerDrainsAndClosesInput(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 
 	rb := distsqlutils.NewRowBuffer([]*types.T{types.Int}, nil /* rows */, distsqlutils.RowBufferArgs{})
-	flowCtx := &execinfra.FlowCtx{EvalCtx: &evalCtx}
+	flowCtx := &execinfra.FlowCtx{
+		Cfg:     &execinfra.ServerConfig{Settings: st},
+		EvalCtx: &evalCtx,
+	}
 
 	const errMsg = "artificial error"
 	rb.Push(nil, &execinfrapb.ProducerMetadata{Err: errors.New(errMsg)})

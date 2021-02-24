@@ -17,9 +17,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
 
@@ -77,7 +79,7 @@ func Subsume(
 	desc := cArgs.EvalCtx.Desc()
 	if !bytes.Equal(desc.StartKey, args.RightDesc.StartKey) ||
 		!bytes.Equal(desc.EndKey, args.RightDesc.EndKey) {
-		return result.Result{}, errors.Errorf("RHS range bounds do not match: %s != %s",
+		return result.Result{}, errors.AssertionFailedf("RHS range bounds do not match: %s != %s",
 			args.RightDesc, desc)
 	}
 
@@ -85,25 +87,27 @@ func Subsume(
 	// of operations in the AdminMerge transaction should make it impossible for
 	// these ranges to be nonadjacent, but double check.
 	if !bytes.Equal(args.LeftDesc.EndKey, desc.StartKey) {
-		return result.Result{}, errors.Errorf("ranges are not adjacent: %s != %s",
+		return result.Result{}, errors.AssertionFailedf("ranges are not adjacent: %s != %s",
 			args.LeftDesc.EndKey, desc.StartKey)
 	}
 
 	// Sanity check the caller has initiated a merge transaction by checking for
-	// a deletion intent on the local range descriptor.
+	// a deletion intent on the local range descriptor. Read inconsistently at
+	// the maximum timestamp to ensure that we see an intent if one exists,
+	// regardless of what timestamp it is written at.
 	descKey := keys.RangeDescriptorKey(desc.StartKey)
-	_, intent, err := storage.MVCCGet(ctx, readWriter, descKey, cArgs.Header.Timestamp,
+	_, intent, err := storage.MVCCGet(ctx, readWriter, descKey, hlc.MaxTimestamp,
 		storage.MVCCGetOptions{Inconsistent: true})
 	if err != nil {
 		return result.Result{}, errors.Errorf("fetching local range descriptor: %s", err)
 	} else if intent == nil {
-		return result.Result{}, errors.New("range missing intent on its local descriptor")
+		return result.Result{}, errors.AssertionFailedf("range missing intent on its local descriptor")
 	}
-	val, _, err := storage.MVCCGetAsTxn(ctx, readWriter, descKey, cArgs.Header.Timestamp, intent.Txn)
+	val, _, err := storage.MVCCGetAsTxn(ctx, readWriter, descKey, intent.Txn.WriteTimestamp, intent.Txn)
 	if err != nil {
 		return result.Result{}, errors.Errorf("fetching local range descriptor as txn: %s", err)
 	} else if val != nil {
-		return result.Result{}, errors.New("non-deletion intent on local range descriptor")
+		return result.Result{}, errors.AssertionFailedf("non-deletion intent on local range descriptor")
 	}
 
 	// We prevent followers of the RHS from being able to serve follower reads on
@@ -151,6 +155,32 @@ func Subsume(
 	reply.MVCCStats = cArgs.EvalCtx.GetMVCCStats()
 	reply.LeaseAppliedIndex = lai
 	reply.FreezeStart = cArgs.EvalCtx.Clock().NowAsClockTimestamp()
+	// FrozenClosedTimestamp might return an empty timestamp if the Raft-based
+	// closed timestamp transport hasn't been enabled yet. That's OK because, if
+	// the new transport is not enabled, then ranges with leading closed
+	// timestamps can't exist yet, and so the closed timestamp must be below the
+	// FreezeStart. The FreezeStart is used by Store.MergeRange to bump the RHS'
+	// ts cache if LHS/RHS leases are not collocated. The case when the leases are
+	// collocated also works out because then the closed timestamp (according to
+	// the old mechanism) is the same for both ranges being merged.
+	reply.ClosedTimestamp = cArgs.EvalCtx.GetFrozenClosedTimestamp()
+	// Collect a read summary from the RHS leaseholder to ship to the LHS
+	// leaseholder. This is used to instruct the LHS on how to update its
+	// timestamp cache to ensure that no future writes are allowed to invalidate
+	// prior reads performed to this point on the RHS range.
+	priorReadSum := cArgs.EvalCtx.GetCurrentReadSummary()
+	// For now, forward this summary to the freeze time. This may appear to
+	// undermine the benefit of the read summary, but it doesn't entirely. Until
+	// we ship higher-resolution read summaries, the read summary doesn't
+	// provide much value in avoiding transaction retries, but it is necessary
+	// for correctness if the RHS has served reads at future times above the
+	// freeze time.
+	//
+	// We can remove this in the future when we increase the resolution of read
+	// summaries and have a per-range closed timestamp system that is easier to
+	// think about.
+	priorReadSum.Merge(rspb.FromTimestamp(reply.FreezeStart.ToTimestamp()))
+	reply.ReadSummary = &priorReadSum
 
 	return result.Result{
 		Local: result.LocalResult{FreezeStart: reply.FreezeStart.ToTimestamp()},

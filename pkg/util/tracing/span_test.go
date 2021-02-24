@@ -12,6 +12,7 @@ package tracing
 
 import (
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -19,8 +20,9 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/types"
-	"github.com/opentracing/opentracing-go"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/trace"
+	"google.golang.org/grpc/metadata"
 )
 
 func TestRecordingString(t *testing.T) {
@@ -31,24 +33,24 @@ func TestRecordingString(t *testing.T) {
 	root.SetVerbose(true)
 	root.Record("root 1")
 	// Hackily fix the timing on the first log message, so that we can check it later.
-	root.crdb.mu.recording.recordedLogs[0].Timestamp = root.crdb.startTime.Add(time.Millisecond)
+	root.i.crdb.mu.recording.recordedLogs[0].Timestamp = root.i.crdb.startTime.Add(time.Millisecond)
 	// Sleep a bit so that everything that comes afterwards has higher timestamps
 	// than the one we just assigned. Otherwise the sorting will be screwed up.
 	time.Sleep(10 * time.Millisecond)
 
-	carrier := make(opentracing.HTTPHeadersCarrier)
-	err := tr.Inject(root.Meta(), opentracing.HTTPHeaders, carrier)
+	carrier := metadataCarrier{MD: metadata.MD{}}
+	require.NoError(t, tr.InjectMetaInto(root.Meta(), carrier))
+
+	wireSpanMeta, err := tr2.ExtractMetaFrom(carrier)
 	require.NoError(t, err)
-	wireContext, err := tr2.Extract(opentracing.HTTPHeaders, carrier)
-	remoteChild := tr2.StartSpan("remote child", WithParentAndManualCollection(wireContext))
+
+	remoteChild := tr2.StartSpan("remote child", WithParentAndManualCollection(wireSpanMeta))
 	root.Record("root 2")
 	remoteChild.Record("remote child 1")
-	require.NoError(t, err)
 	remoteChild.Finish()
+
 	remoteRec := remoteChild.GetRecording()
-	err = root.ImportRemoteSpans(remoteRec)
-	require.NoError(t, err)
-	root.Finish()
+	require.NoError(t, root.ImportRemoteSpans(remoteRec))
 
 	root.Record("root 3")
 
@@ -62,37 +64,35 @@ func TestRecordingString(t *testing.T) {
 
 	rec := root.GetRecording()
 	// Sanity check that the recording looks like we want. Note that this is not
-	// its String() representation; this just list all the spans in order.
-	err = TestingCheckRecordedSpans(rec, `
-Span root:
-	tags: _verbose=1
-	event: root 1
-	event: root 2
-	event: root 3
-	event: root 4
-	event: root 5
-Span remote child:
-	tags: _verbose=1
-	event: remote child 1
-Span local child:
-	tags: _verbose=1
-	event: local child 1
-`)
-	require.NoError(t, err)
+	// its String() representation; this just lists all the spans in order.
+	require.NoError(t, TestingCheckRecordedSpans(rec, `
+		span: root
+			tags: _verbose=1
+			event: root 1
+			event: root 2
+			event: root 3
+			event: root 4
+			event: root 5
+			span: remote child
+				tags: _verbose=1
+				event: remote child 1
+			span: local child
+				tags: _verbose=1
+				event: local child 1
+		`))
 
-	exp := `=== operation:root _verbose:1
-event:root 1
-    === operation:remote child _verbose:1
-    event:remote child 1
-event:root 2
-event:root 3
-    === operation:local child _verbose:1
-    event:local child 1
-event:root 4
-event:root 5
-`
-	require.Equal(t, exp, recToStrippedString(rec))
-
+	require.NoError(t, TestingCheckRecording(rec, `
+		=== operation:root _verbose:1
+		event:root 1
+			=== operation:remote child _verbose:1
+			event:remote child 1
+		event:root 2
+		event:root 3
+			=== operation:local child _verbose:1
+			event:local child 1
+		event:root 4
+		event:root 5
+		`))
 	// Check the timing info on the first two lines.
 	lines := strings.Split(rec.String(), "\n")
 	l, err := parseLine(lines[0])
@@ -131,17 +131,6 @@ func parseLine(s string) (traceLine, error) {
 	}, nil
 }
 
-func recToStrippedString(r Recording) string {
-	s := r.String()
-	// Strip the timing info, converting rows like:
-	//      0.007ms      0.007ms    event:root 1
-	// into:
-	//    event:root 1
-	re := regexp.MustCompile(`.*s.*s\s{4}`)
-	stripped := string(re.ReplaceAll([]byte(s), nil))
-	return stripped
-}
-
 func TestRecordingInRecording(t *testing.T) {
 	tr := NewTracer()
 
@@ -160,35 +149,54 @@ func TestRecordingInRecording(t *testing.T) {
 
 	rootRec := root.GetRecording()
 	require.NoError(t, TestingCheckRecordedSpans(rootRec, `
-Span root:
-	tags: _verbose=1
-Span child:
-	tags: _verbose=1
-Span grandchild:
-	tags: _verbose=1
-`))
+		span: root
+			tags: _verbose=1
+			span: child
+				tags: _verbose=1
+				span: grandchild
+					tags: _verbose=1
+		`))
 
 	childRec := child.GetRecording()
 	require.NoError(t, TestingCheckRecordedSpans(childRec, `
-Span child:
-	tags: _verbose=1
-Span grandchild:
-	tags: _verbose=1
-`))
+		span: child
+			tags: _verbose=1
+			span: grandchild
+				tags: _verbose=1
+		`))
 
-	exp := `=== operation:child _verbose:1
-    === operation:grandchild _verbose:1
-`
-	require.Equal(t, exp, recToStrippedString(childRec))
+	require.NoError(t, TestingCheckRecording(childRec, `
+		=== operation:child _verbose:1
+			=== operation:grandchild _verbose:1
+		`))
 }
 
-func TestSpan_LogStructured(t *testing.T) {
+func TestSpan_ImportRemoteSpans(t *testing.T) {
+	// Verify that GetRecording propagates the recording even when the
+	// receiving Span isn't verbose.
 	tr := NewTracer()
-	tr._mode = int32(modeBackground)
+	sp := tr.StartSpan("root", WithForceRealSpan())
+	ch := tr.StartSpan("child", WithParentAndManualCollection(sp.Meta()))
+	ch.SetVerbose(true)
+	ch.Record("foo")
+	ch.SetVerbose(false)
+	ch.Finish()
+	require.NoError(t, sp.ImportRemoteSpans(ch.GetRecording()))
+	sp.Finish()
+
+	require.NoError(t, TestingCheckRecordedSpans(sp.GetRecording(), `
+		span: root
+			span: child
+				event: foo
+		`))
+}
+
+func TestSpanRecordStructured(t *testing.T) {
+	tr := NewTracer()
 	sp := tr.StartSpan("root", WithForceRealSpan())
 	defer sp.Finish()
 
-	sp.LogStructured(&types.Int32Value{Value: 4})
+	sp.RecordStructured(&types.Int32Value{Value: 4})
 	rec := sp.GetRecording()
 	require.Len(t, rec, 1)
 	require.Len(t, rec[0].InternalStructured, 1)
@@ -196,6 +204,41 @@ func TestSpan_LogStructured(t *testing.T) {
 	var d1 types.DynamicAny
 	require.NoError(t, types.UnmarshalAny(item, &d1))
 	require.IsType(t, (*types.Int32Value)(nil), d1.Message)
+	require.NoError(t, TestingCheckRecordedSpans(rec, `
+		span: root
+			tags: _unfinished=1
+		`))
+	require.NoError(t, TestingCheckRecording(rec, `
+		=== operation:root _unfinished:1
+	`))
+}
+
+func TestSpanRecordStructuredLimit(t *testing.T) {
+	tr := NewTracer()
+	tr._mode = int32(modeBackground)
+	sp := tr.StartSpan("root", WithForceRealSpan())
+	defer sp.Finish()
+
+	const extra = 10
+	for i := int32(1); i <= maxStructuredEventsPerSpan+extra; i++ {
+		sp.RecordStructured(&types.Int32Value{Value: i})
+	}
+	rec := sp.GetRecording()
+	require.Len(t, rec, 1)
+	require.Len(t, rec[0].InternalStructured, maxStructuredEventsPerSpan)
+
+	first := rec[0].InternalStructured[0]
+	last := rec[0].InternalStructured[len(rec[0].InternalStructured)-1]
+	var d1 types.DynamicAny
+	require.NoError(t, types.UnmarshalAny(first, &d1))
+	require.IsType(t, (*types.Int32Value)(nil), d1.Message)
+
+	var res int32
+	require.NoError(t, types.StdInt32Unmarshal(&res, first.Value))
+	require.Equal(t, res, int32(maxStructuredEventsPerSpan+extra))
+
+	require.NoError(t, types.StdInt32Unmarshal(&res, last.Value))
+	require.Equal(t, res, int32(extra+1))
 }
 
 func TestNonVerboseChildSpanRegisteredWithParent(t *testing.T) {
@@ -205,9 +248,9 @@ func TestNonVerboseChildSpanRegisteredWithParent(t *testing.T) {
 	defer sp.Finish()
 	ch := tr.StartSpan("child", WithParentAndAutoCollection(sp), WithForceRealSpan())
 	defer ch.Finish()
-	require.Len(t, sp.crdb.mu.recording.children, 1)
-	require.Equal(t, ch.crdb, sp.crdb.mu.recording.children[0])
-	ch.LogStructured(&types.Int32Value{Value: 5})
+	require.Len(t, sp.i.crdb.mu.recording.children, 1)
+	require.Equal(t, ch.i.crdb, sp.i.crdb.mu.recording.children[0])
+	ch.RecordStructured(&types.Int32Value{Value: 5})
 	// Check that the child span (incl its payload) is in the recording.
 	rec := sp.GetRecording()
 	require.Len(t, rec, 2)
@@ -227,6 +270,66 @@ func TestSpanMaxChildren(t *testing.T) {
 		if exp > maxChildrenPerSpan {
 			exp = maxChildrenPerSpan
 		}
-		require.Len(t, sp.crdb.mu.recording.children, exp)
+		require.Len(t, sp.i.crdb.mu.recording.children, exp)
+	}
+}
+
+type explodyNetTr struct {
+	trace.Trace
+}
+
+func (tr *explodyNetTr) Finish() {
+	if tr.Trace == nil {
+		panic("(*trace.Trace).Finish called twice")
+	}
+	tr.Trace.Finish()
+	tr.Trace = nil
+}
+
+// TestSpan_UseAfterFinish finishes a Span multiple times and
+// calls all of its methods multiple times as well. This is
+// to check that `Span.done` is called in the right places,
+// and serves as a regression test for issues such as:
+//
+// https://github.com/cockroachdb/cockroach/issues/58489#issuecomment-781263005
+func TestSpan_UseAfterFinish(t *testing.T) {
+	tr := NewTracer()
+	tr._useNetTrace = 1
+	sp := tr.StartSpan("foo", WithForceRealSpan())
+	require.NotNil(t, sp.i.netTr)
+	// Set up netTr to reliably explode if Finish'ed twice. We
+	// expect `sp.Finish` to not let it come to that.
+	sp.i.netTr = &explodyNetTr{Trace: sp.i.netTr}
+	sp.Finish()
+	require.True(t, sp.done())
+	sp.Finish()
+	require.EqualValues(t, 2, sp.numFinishCalled)
+
+	netTrT := reflect.TypeOf(sp)
+	for i := 0; i < netTrT.NumMethod(); i++ {
+		f := netTrT.Method(i)
+		t.Run(f.Name, func(t *testing.T) {
+			// The receiver is the first argument.
+			args := []reflect.Value{reflect.ValueOf(sp)}
+			for i := 1; i < f.Type.NumIn(); i++ {
+				// Zeroes for the rest. It would be nice to do something
+				// like `quick.Check` here (or even just call quick.Check!)
+				// but that's for another day. It should be doable!
+				args = append(args, reflect.Zero(f.Type.In(i)))
+			}
+			// NB: on an impl of Span that calls through to `trace.Trace.Finish`, and
+			// on my machine, and at the time of writing, `tr.Finish` would reliably
+			// deadlock on exactly the 10th call. This motivates the choice of 20
+			// below.
+			for i := 0; i < 20; i++ {
+				t.Run("invoke", func(t *testing.T) {
+					if i == 9 {
+						f.Func.Call(args)
+					} else {
+						f.Func.Call(args)
+					}
+				})
+			}
+		})
 	}
 }

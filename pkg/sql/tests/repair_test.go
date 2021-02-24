@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -67,14 +68,15 @@ func TestDescriptorRepairOrphanedDescriptors(t *testing.T) {
 		descID    = 53
 		tableName = "foo"
 	)
-	// This test will inject the table an demonstrate
+	// This test will inject the table and demonstrate
 	// that there are problems. It will then repair it by just dropping the
 	// descriptor and namespace entry. This would normally be unsafe because
 	// it would leave table data around.
 	t.Run("orphaned view - 51782", func(t *testing.T) {
-		_, db, cleanup := setup(t)
+		s, db, cleanup := setup(t)
 		defer cleanup()
 
+		descs.ValidateOnWriteEnabled.Override(&s.ClusterSettings().SV, false)
 		require.NoError(t, crdb.ExecuteTx(ctx, db, nil, func(tx *gosql.Tx) error {
 			if _, err := tx.Exec(
 				"SELECT crdb_internal.unsafe_upsert_descriptor($1, decode($2, 'hex'));",
@@ -85,6 +87,7 @@ func TestDescriptorRepairOrphanedDescriptors(t *testing.T) {
 				parentID, schemaID, tableName, descID)
 			return err
 		}))
+		descs.ValidateOnWriteEnabled.Override(&s.ClusterSettings().SV, true)
 
 		// Ideally we should be able to query `crdb_internal.invalid_object` but it
 		// does not do enough validation. Instead we'll just observe the issue that
@@ -121,9 +124,10 @@ func TestDescriptorRepairOrphanedDescriptors(t *testing.T) {
 	// will then repair it by injecting a new database descriptor and namespace
 	// entry and then demonstrate the problem is resolved.
 	t.Run("orphaned table with data - 51782", func(t *testing.T) {
-		_, db, cleanup := setup(t)
+		s, db, cleanup := setup(t)
 		defer cleanup()
 
+		descs.ValidateOnWriteEnabled.Override(&s.ClusterSettings().SV, false)
 		require.NoError(t, crdb.ExecuteTx(ctx, db, nil, func(tx *gosql.Tx) error {
 			if _, err := tx.Exec(
 				"SELECT crdb_internal.unsafe_upsert_descriptor($1, decode($2, 'hex'));",
@@ -134,6 +138,7 @@ func TestDescriptorRepairOrphanedDescriptors(t *testing.T) {
 				parentID, schemaID, tableName, descID)
 			return err
 		}))
+		descs.ValidateOnWriteEnabled.Override(&s.ClusterSettings().SV, true)
 
 		// Ideally we should be able to query `crdb_internal.invalid_objects` but it
 		// does not do enough validation. Instead we'll just observe the issue that
@@ -258,6 +263,9 @@ func TestDescriptorRepair(t *testing.T) {
 		after              []string
 	}{
 		{
+			before: []string{
+				`CREATE DATABASE test`,
+			},
 			op: upsertRepair,
 			expEventLogEntries: []eventLogPattern{
 				{
@@ -276,10 +284,19 @@ func TestDescriptorRepair(t *testing.T) {
 					typ:  "change_table_privilege",
 					info: `"DescriptorID":59,"Grantee":"admin","GrantedPrivileges":\["ALL"\]`,
 				},
+				{
+					typ:  "change_table_privilege",
+					info: `"DescriptorID":59,"Grantee":"newuser1","GrantedPrivileges":\["ALL"\]`,
+				},
+				{
+					typ:  "change_table_privilege",
+					info: `"DescriptorID":59,"Grantee":"newuser2","GrantedPrivileges":\["ALL"\]`,
+				},
 			},
 		},
 		{
 			before: []string{
+				`CREATE DATABASE test`,
 				upsertRepair,
 			},
 			op: upsertUpdatePrivileges,
@@ -290,15 +307,11 @@ func TestDescriptorRepair(t *testing.T) {
 				},
 				{
 					typ:  "change_table_privilege",
-					info: `"DescriptorID":59,"Grantee":"root","GrantedPrivileges":\["DROP"\],"RevokedPrivileges":\["ALL"\]`,
+					info: `"DescriptorID":59,"Grantee":"newuser1","GrantedPrivileges":\["DROP"\],"RevokedPrivileges":\["ALL"\]`,
 				},
 				{
 					typ:  "change_table_privilege",
-					info: `"DescriptorID":59,"Grantee":"newuser","GrantedPrivileges":\["CREATE"\]`,
-				},
-				{
-					typ:  "change_table_privilege",
-					info: `"DescriptorID":59,"Grantee":"admin","RevokedPrivileges":\["ALL"\]`,
+					info: `"DescriptorID":59,"Grantee":"newuser2","RevokedPrivileges":\["ALL"\]`,
 				},
 			},
 		},
@@ -420,9 +433,11 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 			now := s.Clock().Now().GoTime()
 			defer cleanup()
 			tdb := sqlutils.MakeSQLRunner(db)
+			descs.ValidateOnWriteEnabled.Override(&s.ClusterSettings().SV, false)
 			for _, op := range tc.before {
 				tdb.Exec(t, op)
 			}
+			descs.ValidateOnWriteEnabled.Override(&s.ClusterSettings().SV, true)
 			_, err := db.Exec(tc.op)
 			if tc.expErrRE == "" {
 				require.NoError(t, err)
@@ -586,7 +601,7 @@ SELECT crdb_internal.unsafe_upsert_descriptor(52, descriptor, true)
 SELECT crdb_internal.unsafe_upsert_descriptor(59, crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', 
 '{
   "table": {
-    "columns": [ { "id": 1, "name": "i" } ],
+    "columns": [ { "id": 1, "name": "i", "type": { "family": "IntFamily", "oid": 20, "width": 64 } } ],
     "families": [
       {
         "columnIds": [ 1 ],
@@ -616,7 +631,12 @@ SELECT crdb_internal.unsafe_upsert_descriptor(59, crdb_internal.json_to_pb('cock
     },
     "privileges": {
       "owner_proto": "root",
-      "users": [ { "privileges": 2, "user_proto": "admin" }, { "privileges": 2, "user_proto": "root" } ],
+      "users": [
+        { "privileges": 2, "user_proto": "admin" },
+        { "privileges": 2, "user_proto": "root" },
+        { "privileges": 2, "user_proto": "newuser1" },
+        { "privileges": 2, "user_proto": "newuser2" }
+      ],
       "version": 1
     },
     "state": "PUBLIC",
@@ -634,7 +654,7 @@ SELECT crdb_internal.unsafe_upsert_descriptor(59, crdb_internal.json_to_pb('cock
 SELECT crdb_internal.unsafe_upsert_descriptor(59, crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', 
 '{
   "table": {
-    "columns": [ { "id": 1, "name": "i" } ],
+    "columns": [ { "id": 1, "name": "i", "type": { "family": "IntFamily", "oid": 20, "width": 64 } } ],
     "families": [
       {
         "columnIds": [ 1 ],
@@ -664,7 +684,11 @@ SELECT crdb_internal.unsafe_upsert_descriptor(59, crdb_internal.json_to_pb('cock
     },
     "privileges": {
       "owner_proto": "admin",
-      "users": [ { "privileges": 5, "user_proto": "newuser" }, { "privileges": 8, "user_proto": "root" } ],
+      "users": [
+        { "privileges": 2, "user_proto": "admin" },
+        { "privileges": 2, "user_proto": "root" },
+        { "privileges": 8, "user_proto": "newuser1" }
+      ],
       "version": 1
     },
     "state": "PUBLIC",

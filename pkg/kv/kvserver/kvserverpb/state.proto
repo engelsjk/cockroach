@@ -48,9 +48,9 @@ message ReplicaState {
   // The latest range lease.
   //
   // Note that this message is both sent over the network and used to model
-  // replica state in memory. In memory (storage.Replica.mu.state), the lease
-  // is never nil (and never zero-valued), but it may be nil when sent over
-  // the network as part of ReplicatedEvalResult.
+  // replica state in memory. In memory (Replica.mu.state), the lease is never
+  // nil (and never zero-valued), but it may be nil when sent over the network
+  // as part of ReplicatedEvalResult.
   roachpb.Lease lease = 4;
   // The truncation state of the Raft log.
   roachpb.RaftTruncatedState truncated_state = 5;
@@ -99,6 +99,14 @@ message ReplicaState {
   // [1]: migration.Manager
   // [2]: PurgeOutdatedReplicas
   roachpb.Version version = 12;
+
+  // closed_timestamp is the largest timestamp that is known to have been
+  // closed. This means that the current leaseholder (if any) and any future
+  // leaseholder will not evaluate writes at or below this timestamp, and also
+  // that any in-flight commands that can still apply are writing at higher
+  // timestamps. Non-leaseholder replicas are free to serve "follower reads" at
+  // or below this timestamp.
+  util.hlc.Timestamp closed_timestamp = 13 [(gogoproto.nullable) = false];
 
   reserved 8, 9, 10;
 }

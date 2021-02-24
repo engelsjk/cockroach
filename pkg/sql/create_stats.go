@@ -136,8 +136,19 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 		telemetry.Inc(sqltelemetry.CreateStatisticsUseCounter)
 	}
 
-	job, err := n.p.ExecCfg().JobRegistry.CreateAndStartJob(ctx, resultsCh, *record)
-	if err != nil {
+	var job *jobs.StartableJob
+	jobID := n.p.ExecCfg().JobRegistry.MakeJobID()
+	if err := n.p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+		return n.p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &job, jobID, txn, *record)
+	}); err != nil {
+		if job != nil {
+			if cleanupErr := job.CleanupOnRollback(ctx); cleanupErr != nil {
+				log.Warningf(ctx, "failed to cleanup StartableJob: %v", cleanupErr)
+			}
+		}
+		return err
+	}
+	if err := job.Start(ctx); err != nil {
 		return err
 	}
 
@@ -146,7 +157,7 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 			// Delete the job so users don't see it and get confused by the error.
 			const stmt = `DELETE FROM system.jobs WHERE id = $1`
 			if _ /* cols */, delErr := n.p.ExecCfg().InternalExecutor.Exec(
-				ctx, "delete-job", nil /* txn */, stmt, *job.ID(),
+				ctx, "delete-job", nil /* txn */, stmt, jobID,
 			); delErr != nil {
 				log.Warningf(ctx, "failed to delete job: %v", delErr)
 			}
@@ -531,8 +542,9 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 			// job progress to coerce out the correct error type. If the update succeeds
 			// then return the original error, otherwise return this error instead so
 			// it can be cleaned up at a higher level.
+			// TODO: This job update should possibly use the txn (#60690).
 			if jobErr := r.job.FractionProgressed(
-				ctx,
+				ctx, nil, /* txn */
 				func(ctx context.Context, _ jobspb.ProgressDetails) float32 {
 					// The job failed so the progress value here doesn't really matter.
 					return 0
@@ -590,7 +602,7 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 func checkRunningJobs(ctx context.Context, job *jobs.Job, p JobExecContext) error {
 	var jobID int64
 	if job != nil {
-		jobID = *job.ID()
+		jobID = job.ID()
 	}
 	const stmt = `SELECT id, payload FROM system.jobs WHERE status IN ($1, $2, $3) ORDER BY created`
 

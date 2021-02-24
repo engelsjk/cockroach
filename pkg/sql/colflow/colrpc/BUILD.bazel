@@ -12,9 +12,9 @@ go_library(
         "//pkg/col/coldata",
         "//pkg/col/colserde",
         "//pkg/roachpb",
-        "//pkg/sql/colexec",
-        "//pkg/sql/colexecbase",
-        "//pkg/sql/colexecbase/colexecerror",
+        "//pkg/sql/colexec/colexecutils",
+        "//pkg/sql/colexecerror",
+        "//pkg/sql/colexecop",
         "//pkg/sql/colmem",
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",
@@ -30,6 +30,7 @@ go_library(
 
 go_test(
     name = "colrpc_test",
+    size = "small",
     srcs = [
         "colrpc_test.go",
         "inbox_test.go",
@@ -43,9 +44,9 @@ go_test(
         "//pkg/col/colserde",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
-        "//pkg/sql/colexec",
-        "//pkg/sql/colexecbase",
-        "//pkg/sql/colexecbase/colexecerror",
+        "//pkg/sql/colexec/colexecutils",
+        "//pkg/sql/colexecerror",
+        "//pkg/sql/colexecop",
         "//pkg/sql/colmem",
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",

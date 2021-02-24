@@ -136,7 +136,15 @@ type JSON interface {
 	// AsText returns the JSON document as a string, with quotes around strings removed, and null as nil.
 	AsText() (*string, error)
 
-	// Exists implements the `?` operator.
+	// AsDecimal returns the JSON document as a apd.Decimal if it is a numeric
+	// type, and a boolean inidicating if this JSON document is a numeric type.
+	AsDecimal() (*apd.Decimal, bool)
+
+	// Exists implements the `?` operator: does the string exist as a top-level
+	// key within the JSON value?
+	//
+	// If the object is a JSON array, returns true when the key is a top-level
+	// element of the array.
 	Exists(string) (bool, error)
 
 	// StripNulls returns the JSON document with all object fields that have null values omitted
@@ -411,6 +419,17 @@ func (j jsonNumber) MaybeDecode() JSON { return j }
 func (j jsonString) MaybeDecode() JSON { return j }
 func (j jsonArray) MaybeDecode() JSON  { return j }
 func (j jsonObject) MaybeDecode() JSON { return j }
+
+func (j jsonNull) AsDecimal() (*apd.Decimal, bool)   { return nil, false }
+func (j jsonFalse) AsDecimal() (*apd.Decimal, bool)  { return nil, false }
+func (j jsonTrue) AsDecimal() (*apd.Decimal, bool)   { return nil, false }
+func (j jsonString) AsDecimal() (*apd.Decimal, bool) { return nil, false }
+func (j jsonArray) AsDecimal() (*apd.Decimal, bool)  { return nil, false }
+func (j jsonObject) AsDecimal() (*apd.Decimal, bool) { return nil, false }
+func (j jsonNumber) AsDecimal() (*apd.Decimal, bool) {
+	d := apd.Decimal(j)
+	return &d, true
+}
 
 func (j jsonNull) tryDecode() (JSON, error)   { return j, nil }
 func (j jsonFalse) tryDecode() (JSON, error)  { return j, nil }

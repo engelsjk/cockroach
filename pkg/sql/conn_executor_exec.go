@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -749,7 +748,7 @@ func (ex *connExecutor) commitSQLTransactionInternal(
 		}
 	}
 
-	if err := validatePrimaryKeys(&ex.extraTxnState.descCollection); err != nil {
+	if err := ex.extraTxnState.descCollection.ValidateUncommittedDescriptors(ctx, ex.state.mu.txn); err != nil {
 		return err
 	}
 
@@ -766,22 +765,6 @@ func (ex *connExecutor) commitSQLTransactionInternal(
 	// we don't block the client.
 	if descs := ex.extraTxnState.descCollection.GetDescriptorsWithNewVersion(); descs != nil {
 		ex.extraTxnState.descCollection.ReleaseLeases(ctx)
-	}
-	return nil
-}
-
-// validatePrimaryKeys verifies that all tables modified in the transaction have
-// an enabled primary key after potentially undergoing DROP PRIMARY KEY, which
-// is required to be followed by ADD PRIMARY KEY.
-func validatePrimaryKeys(tc *descs.Collection) error {
-	tables := tc.GetUncommittedTables()
-	for _, table := range tables {
-		if !table.HasPrimaryKey() {
-			return unimplemented.NewWithIssuef(48026,
-				"primary key of table %s dropped without subsequent addition of new primary key",
-				table.GetName(),
-			)
-		}
 	}
 	return nil
 }
@@ -810,6 +793,22 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	ex.sessionTracing.TracePlanStart(ctx, stmt.AST.StatementTag())
 	ex.statsCollector.phaseTimes[plannerStartLogicalPlan] = timeutil.Now()
 
+	// If adminAuditLogging is enabled, we want to check for HasAdminRole
+	// before the deferred maybeLogStatement.
+	// We must check prior to execution in the case the txn is aborted due to
+	// an error. HasAdminRole can only be checked in a valid txn.
+	if adminAuditLog := adminAuditLogEnabled.Get(
+		&ex.planner.execCfg.Settings.SV,
+	); adminAuditLog {
+		if !ex.extraTxnState.hasAdminRoleCache.IsSet {
+			hasAdminRole, err := ex.planner.HasAdminRole(ctx)
+			if err != nil {
+				return err
+			}
+			ex.extraTxnState.hasAdminRoleCache.HasAdminRole = hasAdminRole
+			ex.extraTxnState.hasAdminRoleCache.IsSet = true
+		}
+	}
 	// Prepare the plan. Note, the error is processed below. Everything
 	// between here and there needs to happen even if there's an error.
 	err := ex.makeExecPlan(ctx, planner)
@@ -835,6 +834,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 			res.RowsAffected(),
 			res.Err(),
 			ex.statsCollector.phaseTimes[sessionQueryReceived],
+			&ex.extraTxnState.hasAdminRoleCache,
 		)
 	}()
 

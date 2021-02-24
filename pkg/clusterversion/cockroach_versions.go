@@ -203,6 +203,24 @@ const (
 	CPutInline
 	// ReplicaVersions enables the versioning of Replica state.
 	ReplicaVersions
+	// replacedTruncatedAndRangeAppliedStateMigration stands in for
+	// TruncatedAndRangeAppliedStateMigration which was	re-introduced after the
+	// migration job was introduced. This is necessary because the jobs
+	// infrastructure used to run this migration in v21.1 and its later alphas
+	// was introduced after this version was first introduced. Later code in the
+	// release relies on the job to run the migration but the job relies on
+	// its startup migrations having been run. Versions associated with long
+	// running migrations must follow LongRunningMigrations.
+	replacedTruncatedAndRangeAppliedStateMigration
+	// replacedPostTruncatedAndRangeAppliedStateMigration is like the above
+	// version. See its comment.
+	replacedPostTruncatedAndRangeAppliedStateMigration
+	// NewSchemaChanger enables the new schema changer.
+	NewSchemaChanger
+	// LongRunningMigrations introduces the LongRunningMigrations table and jobs.
+	// All versions which have a registered long-running migration must have a
+	// version higher than this version.
+	LongRunningMigrations
 	// TruncatedAndRangeAppliedStateMigration is part of the migration to stop
 	// using the legacy truncated state within KV. After the migration, we'll be
 	// using the unreplicated truncated state and the RangeAppliedState on all
@@ -217,8 +235,41 @@ const (
 	// using the replicated legacy TruncatedState. It's also used in asserting
 	// that no replicated truncated state representation is found.
 	PostTruncatedAndRangeAppliedStateMigration
-	// NewSchemaChanger enables the new schema changer.
-	NewSchemaChanger
+	// SeparatedIntents allows the writing of separated intents/locks.
+	SeparatedIntents
+	// TracingVerbosityIndependentSemantics marks a change in which trace spans
+	// are propagated across RPC boundaries independently of their verbosity setting.
+	// This requires a version gate this violates implicit assumptions in v20.2.
+	TracingVerbosityIndependentSemantics
+	// SequencesRegclass starts storing sequences used in DEFAULT expressions
+	// via their IDs instead of their names, which leads to allowing such
+	// sequences to be renamed.
+	SequencesRegclass
+	// ImplicitColumnPartitioning introduces implicit column partitioning to
+	// tables.
+	ImplicitColumnPartitioning
+	// MultiRegionFeatures introduces new multi-region features to the
+	// database, such as adding REGIONS to a DATABASE or setting the LOCALITY
+	// on a TABLE.
+	MultiRegionFeatures
+	// ClosedTimestampsRaftTransport enables the Raft transport for closed
+	// timestamps and disables the previous per-node transport.
+	ClosedTimestampsRaftTransport
+	// ChangefeedsSupportPrimaryIndexChanges is used to indicate that all
+	// nodes support detecting and restarting on primary index changes.
+	ChangefeedsSupportPrimaryIndexChanges
+	// NamespaceTableWithSchemasMigration is for the migration which copies
+	// entries from the old namespace table to the new one (with schema IDs).
+	// Previously this was implemented as an async task with no guarantees about
+	// completion.
+	NamespaceTableWithSchemasMigration
+	// ForeignKeyRepresentationMigration is used to ensure that all no table
+	// descriptors use the pre-19.2 foreign key migration.
+	ForeignKeyRepresentationMigration
+	// PriorReadSummaries introduces support for the use of read summary objects
+	// to ship information about reads on a range through lease changes and
+	// range merges.
+	PriorReadSummaries
 
 	// Step (1): Add new versions here.
 )
@@ -350,16 +401,68 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 12},
 	},
 	{
-		Key:     TruncatedAndRangeAppliedStateMigration,
+		Key:     replacedTruncatedAndRangeAppliedStateMigration,
 		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 14},
 	},
 	{
-		Key:     PostTruncatedAndRangeAppliedStateMigration,
+		Key:     replacedPostTruncatedAndRangeAppliedStateMigration,
 		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 16},
 	},
 	{
 		Key:     NewSchemaChanger,
 		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 18},
+	},
+	{
+		Key:     LongRunningMigrations,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 20},
+	},
+	{
+		Key:     TruncatedAndRangeAppliedStateMigration,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 22},
+	},
+	{
+		Key:     PostTruncatedAndRangeAppliedStateMigration,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 24},
+	},
+	{
+		Key:     SeparatedIntents,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 26},
+	},
+	{
+		Key:     TracingVerbosityIndependentSemantics,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 28},
+	},
+	{
+		Key:     SequencesRegclass,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 30},
+	},
+	{
+		Key:     ImplicitColumnPartitioning,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 32},
+	},
+	{
+		Key:     MultiRegionFeatures,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 34},
+	},
+	{
+		Key:     ClosedTimestampsRaftTransport,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 36},
+	},
+	{
+		Key:     ChangefeedsSupportPrimaryIndexChanges,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 38},
+	},
+	{
+		Key:     NamespaceTableWithSchemasMigration,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 40},
+	},
+	{
+		Key:     ForeignKeyRepresentationMigration,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 42},
+	},
+	{
+		Key:     PriorReadSummaries,
+		Version: roachpb.Version{Major: 20, Minor: 2, Internal: 44},
 	},
 	// Step (2): Add new versions here.
 })

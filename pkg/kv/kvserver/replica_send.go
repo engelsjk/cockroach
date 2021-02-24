@@ -518,22 +518,36 @@ func (r *Replica) executeAdminBatch(
 		sp.SetOperationName(reflect.TypeOf(args).String())
 	}
 
-	// Admin commands always require the range lease.
-	_, pErr := r.redirectOnOrAcquireLease(ctx)
-	if pErr != nil {
-		return nil, pErr
-	}
-	// Note there is no need to limit transaction max timestamp on admin requests.
-
-	// Verify that the batch can be executed.
+	// Verify that the batch can be executed, which includes verifying that the
+	// current replica has the range lease.
 	// NB: we pass nil for the spanlatch guard because we haven't acquired
 	// latches yet. This is ok because each individual request that the admin
 	// request sends will acquire latches.
-	if _, err := r.checkExecutionCanProceed(ctx, ba, nil /* g */); err != nil {
-		return nil, roachpb.NewError(err)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, roachpb.NewError(err)
+		}
+
+		_, err := r.checkExecutionCanProceed(ctx, ba, nil /* g */)
+		if err == nil {
+			break
+		}
+		switch {
+		case errors.HasType(err, (*roachpb.InvalidLeaseError)(nil)):
+			// If the replica does not have the lease, attempt to acquire it, or
+			// redirect to the current leaseholder by returning an error.
+			_, pErr := r.redirectOnOrAcquireLeaseForRequest(ctx, ba.Timestamp)
+			if pErr != nil {
+				return nil, pErr
+			}
+			// Retry...
+		default:
+			return nil, roachpb.NewError(err)
+		}
 	}
 
 	var resp roachpb.Response
+	var pErr *roachpb.Error
 	switch tArgs := args.(type) {
 	case *roachpb.AdminSplitRequest:
 		var reply roachpb.AdminSplitResponse
@@ -694,4 +708,51 @@ func (r *Replica) collectSpans(
 	}
 
 	return latchSpans, lockSpans, nil
+}
+
+// endCmds holds necessary information to end a batch after command processing,
+// either after a write request has achieved consensus and been applied to Raft
+// or after a read-only request has finished evaluation.
+type endCmds struct {
+	repl *Replica
+	g    *concurrency.Guard
+	st   kvserverpb.LeaseStatus // empty for follower reads
+}
+
+// move moves the endCmds into the return value, clearing and making a call to
+// done on the receiver a no-op.
+func (ec *endCmds) move() endCmds {
+	res := *ec
+	*ec = endCmds{}
+	return res
+}
+
+// done releases the latches acquired by the command and updates the timestamp
+// cache using the final timestamp of each command.
+//
+// No-op if the receiver has been zeroed out by a call to move. Idempotent and
+// is safe to call more than once.
+func (ec *endCmds) done(
+	ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse, pErr *roachpb.Error,
+) {
+	if ec.repl == nil {
+		// The endCmds were cleared.
+		return
+	}
+	defer ec.move() // clear
+
+	// Update the timestamp cache. Each request within the batch is considered
+	// in turn; only those marked as affecting the cache are processed. However,
+	// only do so if the request is consistent and was operating on the
+	// leaseholder under a valid range lease.
+	if ba.ReadConsistency == roachpb.CONSISTENT && ec.st.State == kvserverpb.LeaseState_VALID {
+		ec.repl.updateTimestampCache(ctx, &ec.st, ba, br, pErr)
+	}
+
+	// Release the latches acquired by the request and exit lock wait-queues.
+	// Must be done AFTER the timestamp cache is updated. ec.g is only set when
+	// the Raft proposal has assumed responsibility for the request.
+	if ec.g != nil {
+		ec.repl.concMgr.FinishReq(ec.g)
+	}
 }

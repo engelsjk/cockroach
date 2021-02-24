@@ -182,7 +182,11 @@ func (s *sampleAggregator) pushTrailingMeta(ctx context.Context) {
 // Run is part of the Processor interface.
 func (s *sampleAggregator) Run(ctx context.Context) {
 	s.input.Start(ctx)
-	s.StartInternal(ctx, sampleAggregatorProcName)
+	ctx = s.StartInternal(ctx, sampleAggregatorProcName)
+	// Go around "this value of ctx is never used" linter error. We do it this
+	// way instead of omitting the assignment to ctx above so that if in the
+	// future other initialization is added, the correct ctx is used.
+	_ = ctx
 
 	earlyExit, err := s.mainLoop(s.Ctx)
 	if err != nil {
@@ -223,10 +227,10 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 		// If it changed by less than 1%, just check for cancellation (which is more
 		// efficient).
 		if fractionCompleted < 1.0 && fractionCompleted < lastReportedFractionCompleted+0.01 {
-			return job.CheckStatus(ctx)
+			return job.CheckStatus(ctx, nil /* txn */)
 		}
 		lastReportedFractionCompleted = fractionCompleted
-		return job.FractionProgressed(ctx, jobs.FractionUpdater(fractionCompleted))
+		return job.FractionProgressed(ctx, nil /* txn */, jobs.FractionUpdater(fractionCompleted))
 	}
 
 	var rowsProcessed uint64

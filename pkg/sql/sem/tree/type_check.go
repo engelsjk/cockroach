@@ -58,6 +58,10 @@ type SemaContext struct {
 	// globally for the entire txn and this field would not be needed.
 	AsOfTimestamp *hlc.Timestamp
 
+	// TableNameResolver is used to resolve the fully qualified
+	// name of a table given its ID.
+	TableNameResolver QualifiedNameResolver
+
 	Properties SemaProperties
 }
 
@@ -586,7 +590,11 @@ func (expr *CollateExpr) TypeCheck(
 		return nil, err
 	}
 	t := subExpr.ResolvedType()
-	if types.IsStringType(t) || t.Family() == types.UnknownFamily {
+	if types.IsStringType(t) {
+		expr.Expr = subExpr
+		expr.typ = types.MakeCollatedString(t, expr.Locale)
+		return expr, nil
+	} else if t.Family() == types.UnknownFamily {
 		expr.Expr = subExpr
 		expr.typ = types.MakeCollatedString(types.String, expr.Locale)
 		return expr, nil

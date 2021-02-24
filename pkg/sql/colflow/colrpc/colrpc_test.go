@@ -23,9 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -173,7 +173,8 @@ func TestOutboxInbox(t *testing.T) {
 	require.NoError(t, err)
 	if cancellationScenario != transportBreaks {
 		defer func() {
-			require.NoError(t, conn.Close())
+			err := conn.Close() // nolint:grpcconnclose
+			require.NoError(t, err)
 		}()
 	}
 
@@ -189,7 +190,7 @@ func TestOutboxInbox(t *testing.T) {
 	t.Run(fmt.Sprintf("cancellationScenario=%s", cancellationScenarioName), func(t *testing.T) {
 		var (
 			typs        = []*types.T{types.Int}
-			inputBuffer = colexecbase.NewBatchBuffer()
+			inputBuffer = colexecop.NewBatchBuffer()
 			// Generate some random behavior before passing the random number
 			// generator to be used in the Outbox goroutine (to avoid races). These
 			// sleep variables enable a sleep for up to half a millisecond with a .25
@@ -257,7 +258,8 @@ func TestOutboxInbox(t *testing.T) {
 			case readerCtxCancel:
 				readerCancelFn()
 			case transportBreaks:
-				_ = conn.Close()
+				err := conn.Close() // nolint:grpcconnclose
+				require.NoError(t, err)
 			}
 			wg.Done()
 		}()
@@ -266,11 +268,11 @@ func TestOutboxInbox(t *testing.T) {
 		// vector.
 		deselectorMemAcc := testMemMonitor.MakeBoundAccount()
 		defer deselectorMemAcc.Close(ctx)
-		inputBatches := colexec.NewDeselectorOp(
+		inputBatches := colexecutils.NewDeselectorOp(
 			colmem.NewAllocator(ctx, &deselectorMemAcc, coldata.StandardColumnFactory), inputBuffer, typs,
 		)
 		inputBatches.Init()
-		outputBatches := colexecbase.NewBatchBuffer()
+		outputBatches := colexecop.NewBatchBuffer()
 		var readerErr error
 		for {
 			var outputBatch coldata.Batch
@@ -388,7 +390,10 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 
 	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
 	require.NoError(t, err)
-	defer func() { require.NoError(t, conn.Close()) }()
+	defer func() {
+		err := conn.Close() // nolint:grpcconnclose
+		require.NoError(t, err)
+	}()
 
 	rng, _ := randutil.NewPseudoRand()
 	// numNextsBeforeDrain is used in ExplicitDrainRequest. This number is
@@ -551,7 +556,10 @@ func BenchmarkOutboxInbox(b *testing.B) {
 
 	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
 	require.NoError(b, err)
-	defer func() { require.NoError(b, conn.Close()) }()
+	defer func() {
+		err := conn.Close() // nolint:grpcconnclose
+		require.NoError(b, err)
+	}()
 
 	client := execinfrapb.NewDistSQLClient(conn)
 	clientStream, err := client.FlowStream(ctx)
@@ -565,7 +573,7 @@ func BenchmarkOutboxInbox(b *testing.B) {
 	batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	batch.SetLength(coldata.BatchSize())
 
-	input := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
+	input := colexecop.NewRepeatableBatchSource(testAllocator, batch, typs)
 
 	outboxMemAcc := testMemMonitor.MakeBoundAccount()
 	defer outboxMemAcc.Close(ctx)
@@ -622,9 +630,8 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 	var inTags *logtags.Buffer
 
 	nextDone := make(chan struct{})
-	input := &colexecbase.CallbackOperator{NextCb: func(ctx context.Context) coldata.Batch {
+	input := &colexecop.CallbackOperator{NextCb: func(ctx context.Context) coldata.Batch {
 		b := testAllocator.NewMemBatchWithFixedCapacity(typs, 0)
-		b.SetLength(0)
 		inTags = logtags.FromContext(ctx)
 		nextDone <- struct{}{}
 		return b

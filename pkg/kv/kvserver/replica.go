@@ -293,6 +293,13 @@ type Replica struct {
 		// right-hand range in an ongoing merge. This range will allow read-only
 		// traffic below this timestamp, while blocking everything else, until the
 		// merge completes.
+		// TODO(nvanbenschoten): get rid of this. It seemed like a good idea at
+		// the time (b192bba), but in retrospect, it's a premature optimization
+		// that prevents us from being more optimal about the read summary we
+		// ship to the LHS during a merge. Serving reads below the closed
+		// timestamp seems fine because that can't advance after the range is
+		// frozen, but serving reads above the closed timestamp but below the
+		// freeze start time is dangerous.
 		freezeStart hlc.Timestamp
 		// The state of the Raft state machine.
 		state kvserverpb.ReplicaState
@@ -359,6 +366,10 @@ type Replica struct {
 		// evaluation and is consumed by the Raft processing thread. Once
 		// consumed, commands are proposed through Raft and moved to the
 		// proposals map.
+		//
+		// The propBuf is the one closing timestamps, so evaluating writes must be
+		// registered with the propBuf through TrackEvaluatingRequest before their
+		// write timestamp is decided.
 		//
 		// Access to proposalBuf must occur *without* holding the mutex.
 		// Instead, the buffer internally holds a reference to mu and will use
@@ -722,6 +733,10 @@ func (r *Replica) descRLocked() *roachpb.RangeDescriptor {
 	return r.mu.state.Desc
 }
 
+// closedTimestampPolicyRLocked returns the closed timestamp policy of the
+// range, which is updated asynchronously through gossip of zone configurations.
+// NOTE: an exported version of this method which does not require the replica
+// lock exists in helpers_test.go. Move here if needed.
 func (r *Replica) closedTimestampPolicyRLocked() roachpb.RangeClosedTimestampPolicy {
 	if r.mu.zone.GlobalReads != nil && *r.mu.zone.GlobalReads {
 		return roachpb.LEAD_FOR_GLOBAL_READS
@@ -809,6 +824,11 @@ func (r *Replica) GetGCThreshold() hlc.Timestamp {
 
 // Version returns the replica version.
 func (r *Replica) Version() roachpb.Version {
+	if r.mu.state.Version == nil {
+		// TODO(irfansharif,tbg): This is a stop-gap for #58523.
+		return roachpb.Version{}
+	}
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return *r.mu.state.Version
@@ -1129,10 +1149,12 @@ func (r *Replica) State() kvserverpb.RangeInfo {
 	return ri
 }
 
-// assertStateLocked can be called from the Raft goroutine to check that the
-// in-memory and on-disk states of the Replica are congruent.
-// Requires that both r.raftMu and r.mu are held.
-func (r *Replica) assertStateLocked(ctx context.Context, reader storage.Reader) {
+// assertStateRaftMuLockedReplicaMuRLocked can be called from the Raft goroutine
+// to check that the in-memory and on-disk states of the Replica are congruent.
+// Requires that r.raftMu is locked and r.mu is read locked.
+func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
+	ctx context.Context, reader storage.Reader,
+) {
 	diskState, err := r.mu.stateLoader.Load(ctx, reader, r.mu.state.Desc)
 	if err != nil {
 		log.Fatalf(ctx, "%v", err)
@@ -1187,6 +1209,15 @@ func (r *Replica) checkExecutionCanProceed(
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	// Has the replica been initialized?
+	// NB: this should have already been checked in Store.Send, so we don't need
+	// to handle this case particularly well, but if we do reach here (as some
+	// tests that call directly into Replica.Send have), it's better to return
+	// an error than to panic in checkSpanInRangeRLocked.
+	if !r.isInitializedRLocked() {
+		return kvserverpb.LeaseStatus{}, errors.Errorf("%s not initialized", r)
+	}
+
 	// Is the replica destroyed?
 	if _, err := r.isDestroyedRLocked(); err != nil {
 		return kvserverpb.LeaseStatus{}, err
@@ -1215,8 +1246,11 @@ func (r *Replica) checkExecutionCanProceed(
 		}
 	} else {
 		// If the request is a write or a consistent read, it requires the
-		// replica serving it to hold the range lease.
-		st, shouldExtend, err = r.leaseGoodToGoRLocked(ctx, now, ba.Timestamp)
+		// replica serving it to hold the range lease. We pass the write
+		// timestamp of the request because this is the maximum timestamp that
+		// the request will operate at, ignoring the uncertainty interval, which
+		// is already accounted for in LeaseStatus's stasis period handling.
+		st, shouldExtend, err = r.leaseGoodToGoRLocked(ctx, now, ba.WriteTimestamp())
 		if err != nil {
 			// If not, can we serve this request on a follower?
 			// TODO(nvanbenschoten): once we make this check cheaper
@@ -1224,6 +1258,8 @@ func (r *Replica) checkExecutionCanProceed(
 			if !r.canServeFollowerReadRLocked(ctx, ba, err) {
 				return st, err
 			}
+			err = nil                     // ignore error
+			st = kvserverpb.LeaseStatus{} // already empty for follower reads, but be explicit
 		}
 	}
 
@@ -1323,7 +1359,7 @@ func (r *Replica) shouldWaitForPendingMergeRLocked(
 		freezeStart := r.getFreezeStartRLocked()
 		ts := ba.Timestamp
 		if ba.Txn != nil {
-			ts.Forward(ba.Txn.MaxTimestamp)
+			ts.Forward(ba.Txn.GlobalUncertaintyLimit)
 		}
 		if ts.Less(freezeStart) {
 			// When the max timestamp of a read request is less than the subsumption
@@ -1455,50 +1491,6 @@ func (r *Replica) isNewerThanSplitRLocked(split *roachpb.SplitTrigger) bool {
 		// written a tombstone but we will have a replica ID that will exceed the
 		// split replica ID.
 		r.mu.replicaID > rightDesc.ReplicaID
-}
-
-// TODO(nvanbenschoten): move endCmds to replica_send.go.
-
-// endCmds holds necessary information to end a batch after Raft
-// command processing.
-type endCmds struct {
-	repl *Replica
-	g    *concurrency.Guard
-}
-
-// move moves the endCmds into the return value, clearing and making
-// a call to done on the receiver a no-op.
-func (ec *endCmds) move() endCmds {
-	res := *ec
-	*ec = endCmds{}
-	return res
-}
-
-// done releases the latches acquired by the command and updates
-// the timestamp cache using the final timestamp of each command.
-//
-// No-op if the receiver has been zeroed out by a call to move.
-// Idempotent and is safe to call more than once.
-func (ec *endCmds) done(
-	ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse, pErr *roachpb.Error,
-) {
-	if ec.repl == nil {
-		// The endCmds were cleared.
-		return
-	}
-	defer ec.move() // clear
-
-	// Update the timestamp cache if the request is not being re-evaluated. Each
-	// request is considered in turn; only those marked as affecting the cache are
-	// processed.
-	ec.repl.updateTimestampCache(ctx, ba, br, pErr)
-
-	// Release the latches acquired by the request and exit lock wait-queues.
-	// Must be done AFTER the timestamp cache is updated. ec.g is only set when
-	// the Raft proposal has assumed responsibility for the request.
-	if ec.g != nil {
-		ec.repl.concMgr.FinishReq(ec.g)
-	}
 }
 
 // maybeWatchForMerge checks whether a merge of this replica into its left

@@ -47,8 +47,8 @@ func predOutgoing(rDesc roachpb.ReplicaDescriptor) bool {
 	return rDesc.GetType() == roachpb.VOTER_OUTGOING
 }
 
-func predDemoting(rDesc roachpb.ReplicaDescriptor) bool {
-	return rDesc.GetType() == roachpb.VOTER_DEMOTING
+func predDemotingToLearner(rDesc roachpb.ReplicaDescriptor) bool {
+	return rDesc.GetType() == roachpb.VOTER_DEMOTING_LEARNER
 }
 
 type replicationTestKnobs struct {
@@ -77,7 +77,7 @@ func makeReplicationTestKnobs() (base.TestingKnobs, *replicationTestKnobs) {
 	k.storeKnobs.ReplicaAddStopAfterLearnerSnapshot = func(_ []roachpb.ReplicationTarget) bool {
 		return atomic.LoadInt64(&k.replicaAddStopAfterLearnerAtomic) > 0
 	}
-	k.storeKnobs.ReplicaAddStopAfterJointConfig = func() bool {
+	k.storeKnobs.VoterAddStopAfterJointConfig = func() bool {
 		return atomic.LoadInt64(&k.replicaAddStopAfterJointConfig) > 0
 	}
 	k.storeKnobs.ReplicationAlwaysUseJointConfig = func() bool {
@@ -768,7 +768,7 @@ func TestJointConfigLease(t *testing.T) {
 	// it's asked to do.
 	desc = tc.RemoveVotersOrFatal(t, k, tc.Target(1))
 	err = tc.TransferRangeLease(desc, tc.Target(1))
-	exp = `cannot transfer lease to replica of type VOTER_DEMOTING`
+	exp = `cannot transfer lease to replica of type VOTER_DEMOTING_LEARNER`
 	require.True(t, testutils.IsError(err, exp), err)
 }
 
@@ -788,6 +788,7 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 	})
 	defer tc.Stopper().Stop(ctx)
 	db := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tr := tc.Server(0).Tracer().(*tracing.Tracer)
 	db.Exec(t, fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s'`,
 		testingTargetDuration))
 	db.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.close_fraction = $1`, testingCloseFraction)
@@ -800,9 +801,12 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 	})
 
 	check := func() {
+		ts := tc.Server(0).Clock().Now()
+		txn := roachpb.MakeTransaction("txn", nil, 0, ts, 0)
 		req := roachpb.BatchRequest{Header: roachpb.Header{
 			RangeID:   scratchDesc.RangeID,
-			Timestamp: tc.Server(0).Clock().Now(),
+			Timestamp: ts,
+			Txn:       &txn,
 		}}
 		req.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
 			Key: scratchDesc.StartKey.AsRawKey(), EndKey: scratchDesc.EndKey.AsRawKey(),
@@ -812,7 +816,7 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			// Trace the Send call so we can verify that it hit the exact `learner
 			// replicas cannot serve follower reads` branch that we're trying to test.
-			sendCtx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, "manual read request")
+			sendCtx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, tr, "manual read request")
 			defer cancel()
 			_, pErr := repl.Send(sendCtx, req)
 			err := pErr.GoError()
@@ -846,7 +850,7 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 	// Remove the voter and remain in joint config.
 	scratchDesc = tc.RemoveVotersOrFatal(t, scratchStartKey, tc.Target(1))
 	require.True(t, scratchDesc.Replicas().InAtomicReplicationChange(), scratchDesc)
-	require.Len(t, scratchDesc.Replicas().FilterToDescriptors(predDemoting), 1)
+	require.Len(t, scratchDesc.Replicas().FilterToDescriptors(predDemotingToLearner), 1)
 
 	// Can't serve follower read from the VOTER_OUTGOING.
 	check()
@@ -905,7 +909,7 @@ func TestLearnerOrJointConfigAdminRelocateRange(t *testing.T) {
 	atomic.StoreInt64(&ltk.replicationAlwaysUseJointConfig, 1)
 	desc := tc.RemoveVotersOrFatal(t, scratchStartKey, tc.Target(3))
 	require.True(t, desc.Replicas().InAtomicReplicationChange(), desc)
-	require.Len(t, desc.Replicas().FilterToDescriptors(predDemoting), 1)
+	require.Len(t, desc.Replicas().FilterToDescriptors(predDemotingToLearner), 1)
 	atomic.StoreInt64(&ltk.replicaAddStopAfterJointConfig, 0)
 	check([]roachpb.ReplicationTarget{tc.Target(0), tc.Target(1), tc.Target(2)})
 }
@@ -970,29 +974,29 @@ func TestLearnerAndJointConfigAdminMerge(t *testing.T) {
 	// desc{1,2,3} = (VOTER_FULL, VOTER_INCOMING) (VOTER_FULL) (VOTER_FULL, VOTER_INCOMING)
 	checkFails()
 
-	// Turn the incoming voters on desc1 and desc3 into VOTER_DEMOTINGs.
-	// desc{1,2,3} = (VOTER_FULL, VOTER_DEMOTING) (VOTER_FULL) (VOTER_FULL, VOTER_DEMOTING)
+	// Turn the incoming voters on desc1 and desc3 into VOTER_DEMOTING_LEARNERs.
+	// desc{1,2,3} = (VOTER_FULL, VOTER_DEMOTING_LEARNER) (VOTER_FULL) (VOTER_FULL, VOTER_DEMOTING_LEARNER)
 	desc1 = tc.RemoveVotersOrFatal(t, desc1.StartKey.AsRawKey(), tc.Target(1))
-	require.Len(t, desc1.Replicas().FilterToDescriptors(predDemoting), 1)
+	require.Len(t, desc1.Replicas().FilterToDescriptors(predDemotingToLearner), 1)
 	desc3 = tc.RemoveVotersOrFatal(t, desc3.StartKey.AsRawKey(), tc.Target(1))
-	require.Len(t, desc3.Replicas().FilterToDescriptors(predDemoting), 1)
+	require.Len(t, desc3.Replicas().FilterToDescriptors(predDemotingToLearner), 1)
 
-	// VOTER_DEMOTING on the lhs or rhs should fail.
+	// VOTER_DEMOTING_LEARNER on the lhs or rhs should fail.
 	checkFails()
 
 	// Add a VOTER_INCOMING to desc2 to make sure it actually excludes this type
 	// of replicas from merges (rather than really just checking whether the
 	// replica sets are equal).
-	// desc{1,2,3} = (VOTER_FULL, VOTER_DEMOTING) (VOTER_FULL, VOTER_INCOMING) (VOTER_FULL, VOTER_DEMOTING)
+	// desc{1,2,3} = (VOTER_FULL, VOTER_DEMOTING_LEARNER) (VOTER_FULL, VOTER_INCOMING) (VOTER_FULL, VOTER_DEMOTING_LEARNER)
 	desc2 := tc.AddVotersOrFatal(t, splitKey1, tc.Target(1))
 	require.Len(t, desc2.Replicas().FilterToDescriptors(predIncoming), 1)
 
 	checkFails()
 
-	// Ditto VOTER_DEMOTING.
-	// desc{1,2,3} = (VOTER_FULL, VOTER_DEMOTING) (VOTER_FULL, VOTER_DEMOTING) (VOTER_FULL, VOTER_DEMOTING)
+	// Ditto VOTER_DEMOTING_LEARNER.
+	// desc{1,2,3} = (VOTER_FULL, VOTER_DEMOTING_LEARNER) (VOTER_FULL, VOTER_DEMOTING_LEARNER) (VOTER_FULL, VOTER_DEMOTING_LEARNER)
 	desc2 = tc.RemoveVotersOrFatal(t, desc2.StartKey.AsRawKey(), tc.Target(1))
-	require.Len(t, desc2.Replicas().FilterToDescriptors(predDemoting), 1)
+	require.Len(t, desc2.Replicas().FilterToDescriptors(predDemotingToLearner), 1)
 
 	checkFails()
 }
@@ -1090,7 +1094,7 @@ func TestMergeQueueSeesLearnerOrJointConfig(t *testing.T) {
 		desc = splitAndUnsplit()
 		ltk.withStopAfterJointConfig(func() {
 			descRight := tc.RemoveVotersOrFatal(t, desc.EndKey.AsRawKey(), tc.Target(1))
-			require.Len(t, descRight.Replicas().FilterToDescriptors(predDemoting), 1, desc)
+			require.Len(t, descRight.Replicas().FilterToDescriptors(predDemotingToLearner), 1, desc)
 		})
 
 		// This should transition out (i.e. remove the voter on s2 for the RHS)

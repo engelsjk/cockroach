@@ -362,6 +362,13 @@ func FindFKReferencedUniqueConstraint(
 	uniqueWithoutIndexConstraints := referencedTable.GetUniqueWithoutIndexConstraints()
 	for i := range uniqueWithoutIndexConstraints {
 		c := &uniqueWithoutIndexConstraints[i]
+
+		// A partial unique constraint cannot be a reference constraint for a
+		// FK.
+		if c.IsPartial() {
+			continue
+		}
+
 		// TODO(rytaft): We should allow out-of-order unique constraints, as long
 		// as they have the same columns.
 		if descpb.ColumnIDs(c.ColumnIDs).Equals(referencedColIDs) {
@@ -506,4 +513,21 @@ func FindPublicColumnWithID(
 		return nil, fmt.Errorf("column-id \"%d\" does not exist", id)
 	}
 	return col, nil
+}
+
+// FindVirtualColumn returns a catalog.Column matching the virtual column
+// descriptor in `spec` if not nil, nil otherwise.
+func FindVirtualColumn(
+	desc catalog.TableDescriptor, virtualColDesc *descpb.ColumnDescriptor,
+) catalog.Column {
+	if virtualColDesc == nil {
+		return nil
+	}
+	found, err := desc.FindColumnWithID(virtualColDesc.ID)
+	if err != nil {
+		panic(errors.HandleAsAssertionFailure(err))
+	}
+	virtualColumn := found.DeepCopy()
+	*virtualColumn.ColumnDesc() = *virtualColDesc
+	return virtualColumn
 }

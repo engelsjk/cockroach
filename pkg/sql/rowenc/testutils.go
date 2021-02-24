@@ -178,6 +178,9 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 		for i := range typ.TupleContents() {
 			tuple.D[i] = RandDatum(rng, typ.TupleContents()[i], true)
 		}
+		// Calling ResolvedType causes the internal TupleContents types to be
+		// populated.
+		tuple.ResolvedType()
 		return &tuple
 	case types.BitFamily:
 		width := typ.Width()
@@ -999,6 +1002,14 @@ func RandEncDatumRowsOfTypes(rng *rand.Rand, numRows int, types []*types.T) EncD
 func TestingMakePrimaryIndexKey(
 	desc catalog.TableDescriptor, vals ...interface{},
 ) (roachpb.Key, error) {
+	return TestingMakePrimaryIndexKeyForTenant(desc, keys.SystemSQLCodec, vals...)
+}
+
+// TestingMakePrimaryIndexKeyForTenant is the same as TestingMakePrimaryIndexKey, but
+// allows specification of the codec to use when encoding keys.
+func TestingMakePrimaryIndexKeyForTenant(
+	desc catalog.TableDescriptor, codec keys.SQLCodec, vals ...interface{},
+) (roachpb.Key, error) {
 	index := desc.GetPrimaryIndex()
 	if len(vals) > index.NumColumns() {
 		return nil, errors.Errorf("got %d values, PK has %d columns", len(vals), index.NumColumns())
@@ -1034,7 +1045,7 @@ func TestingMakePrimaryIndexKey(
 		colIDToRowIndex.Set(index.GetColumnID(i), i)
 	}
 
-	keyPrefix := MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, index.GetID())
+	keyPrefix := MakeIndexKeyPrefix(codec, desc, index.GetID())
 	key, _, err := EncodeIndexKey(desc, index.IndexDesc(), colIDToRowIndex, datums, keyPrefix)
 	if err != nil {
 		return nil, err

@@ -57,6 +57,27 @@ var NamedZonesByID = func() map[uint32]string {
 	return out
 }()
 
+// MultiRegionZoneConfigFields are the fields on a zone configuration which
+// may be set by the system for multi-region objects".
+var MultiRegionZoneConfigFields = []tree.Name{
+	"global_reads",
+	"num_replicas",
+	"num_voters",
+	"constraints",
+	"voter_constraints",
+	"lease_preferences",
+}
+
+// MultiRegionZoneConfigFieldsSet contain the items in
+// MultiRegionZoneConfigFields but in a set form for fast lookup.
+var MultiRegionZoneConfigFieldsSet = func() map[tree.Name]struct{} {
+	ret := make(map[tree.Name]struct{}, len(MultiRegionZoneConfigFields))
+	for _, f := range MultiRegionZoneConfigFields {
+		ret[f] = struct{}{}
+	}
+	return ret
+}()
+
 // ZoneSpecifierFromID creates a tree.ZoneSpecifier for the zone with the
 // given ID.
 func ZoneSpecifierFromID(
@@ -685,6 +706,37 @@ func (z ZoneConfig) GetSubzoneForKeySuffix(keySuffix []byte) (*Subzone, int32) {
 	return nil, -1
 }
 
+// GetNumVoters returns the number of voting replicas for the given zone config.
+//
+// This method will panic if called on a ZoneConfig with an uninitialized
+// NumReplicas attribute.
+func (z *ZoneConfig) GetNumVoters() int32 {
+	if z.NumReplicas == nil {
+		panic("NumReplicas must not be nil")
+	}
+	if z.NumVoters != nil && *z.NumVoters != 0 {
+		return *z.NumVoters
+	}
+	return *z.NumReplicas
+}
+
+// GetNumNonVoters returns the number of non-voting replicas as defined in the
+// zone config.
+//
+// This method will panic if called on a ZoneConfig with an uninitialized
+// NumReplicas attribute.
+func (z *ZoneConfig) GetNumNonVoters() int32 {
+	if z.NumReplicas == nil {
+		panic("NumReplicas must not be nil")
+	}
+	if z.NumVoters != nil && *z.NumVoters != 0 {
+		return *z.NumReplicas - *z.NumVoters
+	}
+	// `num_voters` hasn't been explicitly configured. Every replica should be a
+	// voting replica.
+	return 0
+}
+
 // SetSubzone installs subzone into the ZoneConfig, overwriting any existing
 // subzone with the same IndexID and PartitionName.
 func (z *ZoneConfig) SetSubzone(subzone Subzone) {
@@ -751,6 +803,16 @@ func (z *ZoneConfig) ReplicaConstraintsCount() int {
 // ReplicaConstraints is part of the cat.Zone interface.
 func (z *ZoneConfig) ReplicaConstraints(i int) cat.ReplicaConstraints {
 	return &z.Constraints[i]
+}
+
+// VoterConstraintsCount is part of the cat.Zone interface.
+func (z *ZoneConfig) VoterConstraintsCount() int {
+	return len(z.VoterConstraints)
+}
+
+// VoterConstraint is part of the cat.Zone interface.
+func (z *ZoneConfig) VoterConstraint(i int) cat.ReplicaConstraints {
+	return &z.VoterConstraints[i]
 }
 
 // LeasePreferenceCount is part of the cat.Zone interface.

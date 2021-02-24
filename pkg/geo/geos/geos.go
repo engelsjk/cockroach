@@ -266,19 +266,6 @@ func statusToError(s C.CR_GEOS_Status) error {
 	return &Error{msg: string(cStringToSafeGoBytes(s))}
 }
 
-// WKTToEWKB parses a WKT into WKB using the GEOS library.
-func WKTToEWKB(wkt geopb.WKT, srid geopb.SRID) (geopb.EWKB, error) {
-	g, err := ensureInitInternal()
-	if err != nil {
-		return nil, err
-	}
-	var cEWKB C.CR_GEOS_String
-	if err := statusToError(C.CR_GEOS_WKTToEWKB(g, goToCSlice([]byte(wkt)), C.int(srid), &cEWKB)); err != nil {
-		return nil, err
-	}
-	return cStringToSafeGoBytes(cEWKB), nil
-}
-
 // BufferParamsJoinStyle maps to the GEOSBufJoinStyles enum in geos_c.h.in.
 type BufferParamsJoinStyle int
 
@@ -655,18 +642,16 @@ func PrepareGeometry(a geopb.EWKB) (PreparedGeometry, error) {
 	return PreparedGeometry(ret), nil
 }
 
-// PreparedGeomDestroy destroyed a prepared geometry.
-func PreparedGeomDestroy(a PreparedGeometry) error {
-	// Double check - since PreparedGeometry is actually a pointer to C type.
-	if a == nil {
-		return errors.New("provided PreparedGeometry is nil")
-	}
+// PreparedGeomDestroy destroys a prepared geometry.
+func PreparedGeomDestroy(a PreparedGeometry) {
 	g, err := ensureInitInternal()
 	if err != nil {
-		return err
+		panic(errors.AssertionFailedf("trying to destroy PreparedGeometry with no GEOS: %v", err))
 	}
 	ap := (*C.CR_GEOS_PreparedGeometry)(unsafe.Pointer(a))
-	return statusToError(C.CR_GEOS_PreparedGeometryDestroy(g, ap))
+	if err := statusToError(C.CR_GEOS_PreparedGeometryDestroy(g, ap)); err != nil {
+		panic(errors.AssertionFailedf("PreparedGeometryDestroy returned an error: %v", err))
+	}
 }
 
 //

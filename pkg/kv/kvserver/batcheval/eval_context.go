@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -96,6 +97,14 @@ type EvalContext interface {
 	GetLastReplicaGCTimestamp(context.Context) (hlc.Timestamp, error)
 	GetLease() (roachpb.Lease, roachpb.Lease)
 	GetRangeInfo(context.Context) roachpb.RangeInfo
+	GetFrozenClosedTimestamp() hlc.Timestamp
+
+	// GetCurrentReadSummary returns a new ReadSummary reflecting all reads
+	// served by the range to this point. The method requires a write latch
+	// across all keys in the range (see declareAllKeys), because it will only
+	// return a meaningful summary if the caller has serialized with all other
+	// requests on the range.
+	GetCurrentReadSummary() rspb.ReadSummary
 
 	GetExternalStorage(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error)
 	GetExternalStorageFromURI(ctx context.Context, uri string, user security.SQLUsername) (cloud.ExternalStorage,
@@ -105,17 +114,18 @@ type EvalContext interface {
 // MockEvalCtx is a dummy implementation of EvalContext for testing purposes.
 // For technical reasons, the interface is implemented by a wrapper .EvalContext().
 type MockEvalCtx struct {
-	ClusterSettings  *cluster.Settings
-	Desc             *roachpb.RangeDescriptor
-	StoreID          roachpb.StoreID
-	Clock            *hlc.Clock
-	Stats            enginepb.MVCCStats
-	QPS              float64
-	AbortSpan        *abortspan.AbortSpan
-	GCThreshold      hlc.Timestamp
-	Term, FirstIndex uint64
-	CanCreateTxn     func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason)
-	Lease            roachpb.Lease
+	ClusterSettings    *cluster.Settings
+	Desc               *roachpb.RangeDescriptor
+	StoreID            roachpb.StoreID
+	Clock              *hlc.Clock
+	Stats              enginepb.MVCCStats
+	QPS                float64
+	AbortSpan          *abortspan.AbortSpan
+	GCThreshold        hlc.Timestamp
+	Term, FirstIndex   uint64
+	CanCreateTxn       func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason)
+	Lease              roachpb.Lease
+	CurrentReadSummary rspb.ReadSummary
 }
 
 // EvalContext returns the MockEvalCtx as an EvalContext. It will reflect future
@@ -184,6 +194,9 @@ func (m *mockEvalCtxImpl) GetLeaseAppliedIndex() uint64 {
 func (m *mockEvalCtxImpl) GetTracker() closedts.TrackerI {
 	panic("unimplemented")
 }
+func (m *mockEvalCtxImpl) GetFrozenClosedTimestamp() hlc.Timestamp {
+	panic("unimplemented")
+}
 func (m *mockEvalCtxImpl) Desc() *roachpb.RangeDescriptor {
 	return m.MockEvalCtx.Desc
 }
@@ -213,13 +226,14 @@ func (m *mockEvalCtxImpl) GetLease() (roachpb.Lease, roachpb.Lease) {
 func (m *mockEvalCtxImpl) GetRangeInfo(ctx context.Context) roachpb.RangeInfo {
 	return roachpb.RangeInfo{Desc: *m.Desc(), Lease: m.Lease}
 }
-
+func (m *mockEvalCtxImpl) GetCurrentReadSummary() rspb.ReadSummary {
+	return m.CurrentReadSummary
+}
 func (m *mockEvalCtxImpl) GetExternalStorage(
 	ctx context.Context, dest roachpb.ExternalStorage,
 ) (cloud.ExternalStorage, error) {
 	panic("unimplemented")
 }
-
 func (m *mockEvalCtxImpl) GetExternalStorageFromURI(
 	ctx context.Context, uri string, user security.SQLUsername,
 ) (cloud.ExternalStorage, error) {

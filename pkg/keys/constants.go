@@ -93,6 +93,9 @@ var (
 	// LocalLeaseAppliedIndexLegacySuffix is the suffix for the applied lease
 	// index.
 	LocalLeaseAppliedIndexLegacySuffix = []byte("rlla")
+	// LocalRangePriorReadSummarySuffix is the suffix for a range's prior read
+	// summary.
+	LocalRangePriorReadSummarySuffix = []byte("rprs")
 	// LocalRangeVersionSuffix is the suffix for the range version.
 	LocalRangeVersionSuffix = []byte("rver")
 	// LocalRangeStatsLegacySuffix is the suffix for range statistics.
@@ -399,6 +402,7 @@ const (
 	ScheduledJobsTableID                = 37
 	TenantsRangesID                     = 38 // pseudo
 	SqllivenessID                       = 39
+	MigrationsID                        = 40
 
 	// CommentType is type for system.comments
 	DatabaseCommentType = 0

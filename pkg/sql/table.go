@@ -67,7 +67,7 @@ func (p *planner) createDropDatabaseJob(
 	if err != nil {
 		return err
 	}
-	log.Infof(ctx, "queued new drop database job %d for database %d", *newJob.ID(), databaseID)
+	log.Infof(ctx, "queued new drop database job %d for database %d", newJob.ID(), databaseID)
 	return nil
 }
 
@@ -91,7 +91,7 @@ func (p *planner) createNonDropDatabaseChangeJob(
 	if err != nil {
 		return err
 	}
-	log.Infof(ctx, "queued new database schema change job %d for database %d", *newJob.ID(), databaseID)
+	log.Infof(ctx, "queued new database schema change job %d for database %d", newJob.ID(), databaseID)
 	return nil
 }
 
@@ -149,10 +149,10 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 		// TODO (lucy): get rid of this when we get rid of MutationJobs.
 		if mutationID != descpb.InvalidMutationID {
 			tableDesc.MutationJobs = append(tableDesc.MutationJobs, descpb.TableDescriptor_MutationJob{
-				MutationID: mutationID, JobID: *newJob.ID()})
+				MutationID: mutationID, JobID: newJob.ID()})
 		}
 		log.Infof(ctx, "queued new schema change job %d for table %d, mutation %d",
-			*newJob.ID(), tableDesc.ID, mutationID)
+			newJob.ID(), tableDesc.ID, mutationID)
 	} else {
 		// Update the existing job.
 		oldDetails := job.Details().(jobspb.SchemaChangeDetails)
@@ -180,15 +180,15 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 				// Also add a MutationJob on the table descriptor.
 				// TODO (lucy): get rid of this when we get rid of MutationJobs.
 				tableDesc.MutationJobs = append(tableDesc.MutationJobs, descpb.TableDescriptor_MutationJob{
-					MutationID: mutationID, JobID: *job.ID()})
+					MutationID: mutationID, JobID: job.ID()})
 			}
 		}
-		if err := job.WithTxn(p.txn).SetDetails(ctx, newDetails); err != nil {
+		if err := job.SetDetails(ctx, p.txn, newDetails); err != nil {
 			return err
 		}
 		if jobDesc != "" {
-			if err := job.WithTxn(p.txn).SetDescription(
-				ctx,
+			if err := job.SetDescription(
+				ctx, p.txn,
 				func(ctx context.Context, description string) (string, error) {
 					return strings.Join([]string{description, jobDesc}, ";"), nil
 				},
@@ -197,7 +197,7 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 			}
 		}
 		log.Infof(ctx, "job %d: updated with schema change for table %d, mutation %d",
-			*job.ID(), tableDesc.ID, mutationID)
+			job.ID(), tableDesc.ID, mutationID)
 	}
 	return nil
 }
@@ -279,7 +279,7 @@ func (p *planner) writeTableDescToBatch(
 		}
 	}
 
-	if err := tableDesc.ValidateTable(ctx); err != nil {
+	if err := tableDesc.ValidateSelf(ctx); err != nil {
 		return errors.AssertionFailedf("table descriptor is not valid: %s\n%v", err, tableDesc)
 	}
 

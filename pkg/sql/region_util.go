@@ -31,14 +31,16 @@ import (
 
 const minNumRegionsForSurviveRegionGoal = 3
 
-type liveClusterRegions map[descpb.RegionName]struct{}
+// LiveClusterRegions is a set representing regions that are live in
+// a given cluster.
+type LiveClusterRegions map[descpb.RegionName]struct{}
 
-func (s *liveClusterRegions) isActive(region descpb.RegionName) bool {
+func (s *LiveClusterRegions) isActive(region descpb.RegionName) bool {
 	_, ok := (*s)[region]
 	return ok
 }
 
-func (s *liveClusterRegions) toStrings() []string {
+func (s *LiveClusterRegions) toStrings() []string {
 	ret := make([]string, 0, len(*s))
 	for region := range *s {
 		ret = append(ret, string(region))
@@ -52,26 +54,30 @@ func (s *liveClusterRegions) toStrings() []string {
 // getLiveClusterRegions returns a set of live region names in the cluster.
 // A region name is deemed active if there is at least one alive node
 // in the cluster in with locality set to a given region.
-func (p *planner) getLiveClusterRegions() (liveClusterRegions, error) {
-	nodes, err := getAllNodeDescriptors(p)
+func (p *planner) getLiveClusterRegions(ctx context.Context) (LiveClusterRegions, error) {
+	rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryEx(
+		ctx,
+		"get_live_cluster_regions",
+		p.txn,
+		sessiondata.InternalExecutorOverride{
+			User: p.SessionData().User(),
+		},
+		"SELECT region FROM [SHOW REGIONS FROM CLUSTER]",
+	)
 	if err != nil {
 		return nil, err
 	}
-	var ret liveClusterRegions = make(map[descpb.RegionName]struct{})
-	for _, node := range nodes {
-		for _, tier := range node.Locality.Tiers {
-			if tier.Key == "region" {
-				ret[descpb.RegionName(tier.Value)] = struct{}{}
-				break
-			}
-		}
+
+	var ret LiveClusterRegions = make(map[descpb.RegionName]struct{}, len(rows))
+	for _, row := range rows {
+		ret[descpb.RegionName(*row[0].(*tree.DString))] = struct{}{}
 	}
 	return ret, nil
 }
 
-// checkLiveClusterRegion checks whether a region can be added to a database
+// CheckLiveClusterRegion checks whether a region can be added to a database
 // based on whether the cluster regions are alive.
-func checkLiveClusterRegion(liveClusterRegions liveClusterRegions, region descpb.RegionName) error {
+func CheckLiveClusterRegion(liveClusterRegions LiveClusterRegions, region descpb.RegionName) error {
 	if !liveClusterRegions.isActive(region) {
 		return errors.WithHintf(
 			pgerror.Newf(
@@ -319,15 +325,6 @@ func synthesizeVoterConstraints(
 	}
 }
 
-var multiRegionZoneConfigFields = []tree.Name{
-	"global_reads",
-	"num_replicas",
-	"num_voters",
-	"constraints",
-	"voter_constraints",
-	"lease_preferences",
-}
-
 // zoneConfigForMultiRegionTable generates a ZoneConfig stub for a
 // regional-by-table or global table in a multi-region database.
 //
@@ -340,7 +337,7 @@ var multiRegionZoneConfigFields = []tree.Name{
 // configuration is required.
 //
 // Relevant multi-region configured fields (as defined in
-// `multiRegionZoneConfigFields`) will be overwritten by the calling function
+// `zonepb.MultiRegionZoneConfigFields`) will be overwritten by the calling function
 // into an existing ZoneConfig.
 func zoneConfigForMultiRegionTable(
 	localityConfig descpb.TableDescriptor_LocalityConfig,
@@ -385,33 +382,33 @@ func zoneConfigForMultiRegionTable(
 	return ret, nil
 }
 
-// TODO(#59631): everything using this should instead use getZoneConfigRaw
-// and writeZoneConfig instead of calling SQL for each query.
 // This removes the requirement to only call this function after writeSchemaChange
 // is called on creation of tables, and potentially removes the need for ReadingOwnWrites
 // for some subcommands.
 // Requires some logic to "inherit" from parents.
-func (p *planner) applyZoneConfigForMultiRegion(
-	ctx context.Context, zs tree.ZoneSpecifier, zc *zonepb.ZoneConfig, desc string,
+func applyZoneConfigForMultiRegion(
+	ctx context.Context,
+	zc *zonepb.ZoneConfig,
+	targetID descpb.ID,
+	table catalog.TableDescriptor,
+	txn *kv.Txn,
+	execConfig *ExecutorConfig,
 ) error {
-	// Convert the partially filled zone config to re-run as a SQL command.
-	// This avoid us having to modularize planNode logic from set_zone_config
-	// and the optimizer.
-	sql, err := zoneConfigToSQL(&zs, zc)
-	if err != nil {
-		return err
-	}
-	if _, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
+	// TODO (multiregion): Much like applyZoneConfigForMultiRegionTable we need to
+	// merge the zone config that we're writing with anything previously existing
+	// in there.
+	if _, err := writeZoneConfig(
 		ctx,
-		desc,
-		p.Txn(),
-		sessiondata.InternalExecutorOverride{
-			User: p.SessionData().User(),
-		},
-		sql,
+		txn,
+		targetID,
+		table,
+		zc,
+		execConfig,
+		true, /* hasNewSubzones */
 	); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -450,11 +447,10 @@ func applyZoneConfigForMultiRegionTableOptionNewIndexes(
 	}
 }
 
-// isRegionalByRowPlaceholderZoneConfig returns whether a given zone config
-// should be marked as a placeholder config if the zone config belongs to
-// a REGIONAL BY ROW table.
+// isPlaceholderZoneConfigForMultiRegion returns whether a given zone config
+// should be marked as a placeholder config for a multi-region object.
 // See zonepb.IsSubzonePlaceholder for why this is necessary.
-func isRegionalByRowPlaceholderZoneConfig(zc zonepb.ZoneConfig) bool {
+func isPlaceholderZoneConfigForMultiRegion(zc zonepb.ZoneConfig) bool {
 	// Strip Subzones / SubzoneSpans, as these may contain items if migrating
 	// from one REGIONAL BY ROW table to another.
 	strippedZC := zc
@@ -479,20 +475,15 @@ func applyZoneConfigForMultiRegionTableOptionTableNewConfig(
 		if err != nil {
 			return false, zonepb.ZoneConfig{}, err
 		}
-		zc.CopyFromZone(*localityZoneConfig, multiRegionZoneConfigFields)
-		if newConfig.GetRegionalByRow() != nil {
-			if isRegionalByRowPlaceholderZoneConfig(zc) {
-				zc.NumReplicas = proto.Int32(0)
-			}
-		}
+		zc.CopyFromZone(*localityZoneConfig, zonepb.MultiRegionZoneConfigFields)
 		return false, zc, nil
 	}
 }
 
-// applyZoneConfigForMultiRegionTableOptionTableAndIndexes applies table zone configs
+// ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes applies table zone configs
 // on the entire table as well as its indexes, replacing multi-region related zone
 // configuration fields.
-var applyZoneConfigForMultiRegionTableOptionTableAndIndexes = func(
+var ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes = func(
 	zc zonepb.ZoneConfig,
 	regionConfig descpb.DatabaseDescriptor_RegionConfig,
 	table catalog.TableDescriptor,
@@ -505,14 +496,10 @@ var applyZoneConfigForMultiRegionTableOptionTableAndIndexes = func(
 	if err != nil {
 		return false, zonepb.ZoneConfig{}, err
 	}
-	zc.CopyFromZone(*localityZoneConfig, multiRegionZoneConfigFields)
+	zc.CopyFromZone(*localityZoneConfig, zonepb.MultiRegionZoneConfigFields)
 
 	hasNewSubzones := table.IsLocalityRegionalByRow()
 	if hasNewSubzones {
-		if isRegionalByRowPlaceholderZoneConfig(zc) {
-			zc.NumReplicas = proto.Int32(0)
-		}
-
 		for _, region := range regionConfig.Regions {
 			subzoneConfig, err := zoneConfigForMultiRegionPartition(region, regionConfig)
 			if err != nil {
@@ -530,9 +517,9 @@ var applyZoneConfigForMultiRegionTableOptionTableAndIndexes = func(
 	return hasNewSubzones, zc, nil
 }
 
-// applyZoneConfigForMultiRegionTable applies zone config settings based
+// ApplyZoneConfigForMultiRegionTable applies zone config settings based
 // on the options provided.
-func applyZoneConfigForMultiRegionTable(
+func ApplyZoneConfigForMultiRegionTable(
 	ctx context.Context,
 	txn *kv.Txn,
 	execCfg *ExecutorConfig,
@@ -562,6 +549,14 @@ func applyZoneConfigForMultiRegionTable(
 		}
 		hasNewSubzones = newHasNewSubzones || hasNewSubzones
 		zoneConfig = newZoneConfig
+	}
+
+	// Mark the NumReplicas as 0 if we have subzones but no other features
+	// in the zone config. This signifies a placeholder.
+	// Note we do not use hasNewSubzones here as there may be existing subzones
+	// on the zone config which may still be a placeholder.
+	if len(zoneConfig.Subzones) > 0 && isPlaceholderZoneConfigForMultiRegion(zoneConfig) {
+		zoneConfig.NumReplicas = proto.Int32(0)
 	}
 
 	if !zoneConfig.Equal(zonepb.NewZoneConfig()) {
@@ -608,21 +603,27 @@ func applyZoneConfigForMultiRegionTable(
 	return nil
 }
 
-func (p *planner) applyZoneConfigFromDatabaseRegionConfig(
-	ctx context.Context, dbName tree.Name, regionConfig descpb.DatabaseDescriptor_RegionConfig,
+// ApplyZoneConfigFromDatabaseRegionConfig applies a zone configuration to the
+// database using the information in the supplied RegionConfig.
+func ApplyZoneConfigFromDatabaseRegionConfig(
+	ctx context.Context,
+	dbID descpb.ID,
+	regionConfig descpb.DatabaseDescriptor_RegionConfig,
+	txn *kv.Txn,
+	execConfig *ExecutorConfig,
 ) error {
-	// Convert the partially filled zone config to re-run as a SQL command.
-	// This avoid us having to modularize planNode logic from set_zone_config
-	// and the optimizer.
+	// Build a zone config based on the RegionConfig information.
 	dbZoneConfig, err := zoneConfigForMultiRegionDatabase(regionConfig)
 	if err != nil {
 		return err
 	}
-	return p.applyZoneConfigForMultiRegion(
+	return applyZoneConfigForMultiRegion(
 		ctx,
-		tree.ZoneSpecifier{Database: dbName},
 		dbZoneConfig,
-		"database-multiregion-set-zone-config",
+		dbID,
+		nil,
+		txn,
+		execConfig,
 	)
 }
 
@@ -694,13 +695,13 @@ func (p *planner) updateZoneConfigsForAllTables(ctx context.Context, desc *dbdes
 		ctx,
 		desc,
 		func(ctx context.Context, schema string, tbName tree.TableName, tbDesc *tabledesc.Mutable) error {
-			return applyZoneConfigForMultiRegionTable(
+			return ApplyZoneConfigForMultiRegionTable(
 				ctx,
 				p.txn,
 				p.ExecCfg(),
 				*desc.RegionConfig,
 				tbDesc,
-				applyZoneConfigForMultiRegionTableOptionTableAndIndexes,
+				ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes,
 			)
 		},
 	)
@@ -732,10 +733,12 @@ func (p *planner) initializeMultiRegionDatabase(ctx context.Context, desc *dbdes
 	}
 
 	// Create the database-level zone configuration.
-	if err := p.applyZoneConfigFromDatabaseRegionConfig(
+	if err := ApplyZoneConfigFromDatabaseRegionConfig(
 		ctx,
-		tree.Name(desc.Name),
-		*desc.RegionConfig); err != nil {
+		desc.ID,
+		*desc.RegionConfig,
+		p.txn,
+		p.execCfg); err != nil {
 		return err
 	}
 

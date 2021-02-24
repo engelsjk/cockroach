@@ -128,7 +128,7 @@ func newScrubTableReader(
 		flowCtx, &fetcher, tr.tableDesc, int(spec.IndexIdx), catalog.ColumnIDToOrdinalMap(tr.tableDesc.PublicColumns()),
 		spec.Reverse, neededColumns, true /* isCheck */, flowCtx.EvalCtx.Mon, &tr.alloc,
 		execinfra.ScanVisibilityPublic, spec.LockingStrength, spec.LockingWaitPolicy,
-		nil /* systemColumns */, nil, /* virtualColumn */
+		false /* withSystemColumns */, nil, /* virtualColumn */
 	); err != nil {
 		return nil, err
 	}
@@ -209,7 +209,7 @@ func (tr *scrubTableReader) prettyPrimaryKeyValues(
 }
 
 // Start is part of the RowSource interface.
-func (tr *scrubTableReader) Start(ctx context.Context) context.Context {
+func (tr *scrubTableReader) Start(ctx context.Context) {
 	if tr.FlowCtx.Txn == nil {
 		tr.MoveToDraining(errors.Errorf("scrubTableReader outside of txn"))
 	}
@@ -224,8 +224,6 @@ func (tr *scrubTableReader) Start(ctx context.Context) context.Context {
 	); err != nil {
 		tr.MoveToDraining(err)
 	}
-
-	return ctx
 }
 
 // Next is part of the RowSource interface.

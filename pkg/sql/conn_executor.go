@@ -371,9 +371,8 @@ func (s *Server) GetUnscrubbedStmtStats() []roachpb.CollectedStatementStatistics
 	return s.sqlStats.getUnscrubbedStmtStats(s.cfg.VirtualSchemas)
 }
 
-// GetUnscrubbedTxnStats returns the same transaction statistics by app, with
-// the queries scrubbed of their identifiers. Any statement which cannot be
-// scrubbed will be omitted from the returned map.
+// GetUnscrubbedTxnStats returns the same transaction statistics by app.
+// Identifiers (e.g. table and column names) aren't scrubbed from the statements.
 func (s *Server) GetUnscrubbedTxnStats() []roachpb.CollectedTransactionStatistics {
 	return s.sqlStats.getUnscrubbedTxnStats()
 }
@@ -382,12 +381,6 @@ func (s *Server) GetUnscrubbedTxnStats() []roachpb.CollectedTransactionStatistic
 // returns statistics from the reported stats pool.
 func (s *Server) GetScrubbedReportingStats() []roachpb.CollectedStatementStatistics {
 	return s.reportedStats.getScrubbedStmtStats(s.cfg.VirtualSchemas)
-}
-
-// GetUnscrubbedReportingStats does the same thing as GetUnscrubbedStmtStats but
-// returns statistics from the reported stats pool.
-func (s *Server) GetUnscrubbedReportingStats() []roachpb.CollectedStatementStatistics {
-	return s.reportedStats.getUnscrubbedStmtStats(s.cfg.VirtualSchemas)
 }
 
 // GetStmtStatsLastReset returns the time at which the statement statistics were
@@ -592,9 +585,10 @@ func (s *Server) newConnExecutor(
 			nodeIDOrZero: nodeIDOrZero,
 			clock:        s.cfg.Clock,
 			// Future transaction's monitors will inherits from sessionRootMon.
-			connMon:  sessionRootMon,
-			tracer:   s.cfg.AmbientCtx.Tracer,
-			settings: s.cfg.Settings,
+			connMon:          sessionRootMon,
+			tracer:           s.cfg.AmbientCtx.Tracer,
+			settings:         s.cfg.Settings,
+			execTestingKnobs: s.GetExecutorConfig().TestingKnobs,
 		},
 		memMetrics: memMetrics,
 		planner:    planner{execCfg: s.cfg, alloc: &rowenc.DatumAlloc{}},
@@ -647,6 +641,8 @@ func (s *Server) newConnExecutor(
 	ex.sessionTracing.ex = ex
 	ex.transitionCtx.sessionTracing = &ex.sessionTracing
 	ex.statsCollector = ex.newStatsCollector()
+
+	ex.extraTxnState.hasAdminRoleCache = HasAdminRoleCache{}
 
 	ex.initPlanner(ctx, &ex.planner)
 
@@ -792,7 +788,8 @@ func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{})
 
 			// Embed the statement in the error object for the telemetry
 			// report below. The statement gets anonymized.
-			panicErr = WithAnonymizedStatement(panicErr, ex.curStmtAST)
+			vt := ex.planner.extendedEvalCtx.VirtualSchemas
+			panicErr = WithAnonymizedStatement(panicErr, ex.curStmtAST, vt)
 		}
 
 		// Report the panic to telemetry in any case.
@@ -891,6 +888,20 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 		ex.sessionMon.EmergencyStop(ctx)
 		ex.mon.EmergencyStop(ctx)
 	}
+}
+
+// HasAdminRoleCache is stored in extraTxnState and used to cache if the
+// user has admin role throughout a transaction.
+// This is used for admin audit logging to check if a transaction is being
+// executed with admin privileges.
+// HasAdminRoleCache does not have to be reset when a transaction restarts
+// or roles back as the user's admin status will not change throughout the
+// lifecycle of a single transaction.
+type HasAdminRoleCache struct {
+	HasAdminRole bool
+
+	// IsSet is used to determine if the value for caching is set or not.
+	IsSet bool
 }
 
 type connExecutor struct {
@@ -1053,6 +1064,11 @@ type connExecutor struct {
 		// QueryLevelStats which are sampled.
 		rowsRead  int64
 		bytesRead int64
+
+		// hasAdminRole is used to cache if the user running the transaction
+		// has admin privilege. hasAdminRoleCache is set for the first statement
+		// in a transaction.
+		hasAdminRoleCache HasAdminRoleCache
 	}
 
 	// sessionData contains the user-configurable connection variables.
@@ -1243,6 +1259,7 @@ func (ns *prepStmtNamespace) resetTo(
 // commits, rolls back or restarts.
 func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) error {
 	ex.extraTxnState.jobs = nil
+	ex.extraTxnState.hasAdminRoleCache = HasAdminRoleCache{}
 	if ex.server.cfg.Settings.Version.IsActive(ctx, clusterversion.NewSchemaChanger) {
 		ex.extraTxnState.schemaChangerState = SchemaChangerState{
 			mode: ex.sessionData.NewSchemaChangerMode,
@@ -2239,6 +2256,7 @@ func (ex *connExecutor) resetPlanner(
 	p.semaCtx.AsOfTimestamp = nil
 	p.semaCtx.Annotations = nil
 	p.semaCtx.TypeResolver = p
+	p.semaCtx.TableNameResolver = p
 
 	ex.resetEvalCtx(&p.extendedEvalCtx, txn, stmtTS)
 
@@ -2713,7 +2731,13 @@ func (sc *StatementCounters) incrementCount(ex *connExecutor, stmt tree.Statemen
 	case *tree.CommitTransaction:
 		sc.TxnCommitCount.Inc()
 	case *tree.RollbackTransaction:
-		sc.TxnRollbackCount.Inc()
+		// The CommitWait state means that the transaction has already committed
+		// after a specially handled `RELEASE SAVEPOINT cockroach_restart` command.
+		if ex.getTransactionState() == CommitWaitStateStr {
+			sc.TxnCommitCount.Inc()
+		} else {
+			sc.TxnRollbackCount.Inc()
+		}
 	case *tree.Savepoint:
 		if ex.isCommitOnReleaseSavepoint(t.Name) {
 			sc.RestartSavepointCount.Inc()
@@ -2810,6 +2834,6 @@ func init() {
 			return ""
 		}
 		// Anonymize the statement for reporting.
-		return anonymizeStmtAndConstants(stmt)
+		return anonymizeStmtAndConstants(stmt, nil /* VirtualTabler */)
 	})
 }

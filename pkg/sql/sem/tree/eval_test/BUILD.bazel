@@ -2,10 +2,12 @@ load("@io_bazel_rules_go//go:def.bzl", "go_test")
 
 go_test(
     name = "eval_test_test",
+    size = "small",
     srcs = [
         "eval_test.go",
         "main_test.go",
     ],
+    tags = ["broken_in_bazel"],
     deps = [
         "//pkg/base",
         "//pkg/col/coldata",
@@ -15,7 +17,8 @@ go_test(
         "//pkg/settings/cluster",
         "//pkg/sql/colexec",
         "//pkg/sql/colexec/colbuilder",
-        "//pkg/sql/colexecbase",
+        "//pkg/sql/colexec/colexecargs",
+        "//pkg/sql/colexecop",
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",
         "//pkg/sql/parser",

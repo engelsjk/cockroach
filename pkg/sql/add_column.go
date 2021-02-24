@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -79,7 +78,7 @@ func (p *planner) addColumnImpl(
 	// its descriptor and this column descriptor.
 	if d.HasDefaultExpr() {
 		changedSeqDescs, err := maybeAddSequenceDependencies(
-			params.ctx, params.p, n.tableDesc, col, expr, nil,
+			params.ctx, params.ExecCfg().Settings, params.p, n.tableDesc, col, expr, nil,
 		)
 		if err != nil {
 			return err
@@ -128,9 +127,6 @@ func (p *planner) addColumnImpl(
 	}
 
 	if d.IsComputed() {
-		if d.IsVirtual() && !sessionData.VirtualColumnsEnabled {
-			return unimplemented.NewWithIssue(57608, "virtual computed columns")
-		}
 		computedColValidator := schemaexpr.MakeComputedColumnValidator(
 			params.ctx,
 			n.tableDesc,
@@ -153,6 +149,11 @@ func checkColumnDoesNotExist(
 	col, _ := tableDesc.FindColumnWithName(name)
 	if col == nil {
 		return false, nil
+	}
+	if col.IsSystemColumn() {
+		return false, pgerror.Newf(pgcode.DuplicateColumn,
+			"column name %q conflicts with a system column name",
+			col.GetName())
 	}
 	if col.Public() {
 		return true, sqlerrors.NewColumnAlreadyExistsError(tree.ErrString(&name), tableDesc.GetName())

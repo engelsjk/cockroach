@@ -58,6 +58,10 @@ func makeIDKey() kvserverbase.CmdIDKey {
 // caller should relinquish all ownership of it. If it does return an error, the
 // caller retains full ownership over the guard.
 //
+// evalAndPropose takes ownership of the supplied token; the caller should
+// tok.Move() it into this method. It will be used to untrack the request once
+// it comes out of the proposal buffer.
+//
 // Return values:
 // - a channel which receives a response or error upon application
 // - a closure used to attempt to abandon the command. When called, it unbinds
@@ -68,22 +72,28 @@ func makeIDKey() kvserverbase.CmdIDKey {
 // - any error obtained during the creation or proposal of the command, in
 //   which case the other returned values are zero.
 func (r *Replica) evalAndPropose(
-	ctx context.Context, ba *roachpb.BatchRequest, g *concurrency.Guard, lease *roachpb.Lease,
+	ctx context.Context,
+	ba *roachpb.BatchRequest,
+	g *concurrency.Guard,
+	st kvserverpb.LeaseStatus,
+	lul hlc.Timestamp,
+	tok TrackedRequestToken,
 ) (chan proposalResult, func(), int64, *roachpb.Error) {
+	defer tok.DoneIfNotMoved(ctx)
 	idKey := makeIDKey()
-	proposal, pErr := r.requestToProposal(ctx, idKey, ba, g.LatchSpans())
+	proposal, pErr := r.requestToProposal(ctx, idKey, ba, st, lul, g.LatchSpans())
 	log.Event(proposal.ctx, "evaluated request")
 
 	// If the request hit a server-side concurrency retry error, immediately
 	// proagate the error. Don't assume ownership of the concurrency guard.
 	if isConcurrencyRetryError(pErr) {
-		pErr = maybeAttachLease(pErr, lease)
+		pErr = maybeAttachLease(pErr, &st.Lease)
 		return nil, nil, 0, pErr
 	}
 
 	// Attach the endCmds to the proposal and assume responsibility for
 	// releasing the concurrency guard if the proposal makes it to Raft.
-	proposal.ec = endCmds{repl: r, g: g}
+	proposal.ec = endCmds{repl: r, g: g, st: st}
 
 	// Pull out proposal channel to return. proposal.doneCh may be set to
 	// nil if it is signaled in this function.
@@ -124,7 +134,14 @@ func (r *Replica) evalAndPropose(
 
 		// Fork the proposal's context span so that the proposal's context
 		// can outlive the original proposer's context.
-		proposal.ctx, proposal.sp = tracing.ForkCtxSpan(ctx, "async consensus")
+		proposal.ctx, proposal.sp = tracing.ForkSpan(ctx, "async consensus")
+		{
+			// This span sometimes leaks. Disable it for the time being.
+			//
+			// Tracked in: https://github.com/cockroachdb/cockroach/issues/60677
+			proposal.sp.Finish()
+			proposal.sp = nil
+		}
 
 		// Signal the proposal's response channel immediately.
 		reply := *proposal.Local.Reply
@@ -139,7 +156,11 @@ func (r *Replica) evalAndPropose(
 	}
 
 	// Attach information about the proposer to the command.
-	proposal.command.ProposerLeaseSequence = lease.Sequence
+	proposal.command.ProposerLeaseSequence = st.Lease.Sequence
+	// Perform a sanity check that the lease is owned by this replica.
+	if !st.Lease.OwnedBy(r.store.StoreID()) && !ba.IsLeaseRequest() {
+		log.Fatalf(ctx, "cannot propose %s on follower with remotely owned lease %s", ba, st.Lease)
+	}
 
 	// Once a command is written to the raft log, it must be loaded into memory
 	// and replayed on all replicas. If a command is too big, stop it here. If
@@ -185,7 +206,7 @@ func (r *Replica) evalAndPropose(
 		}
 	}
 
-	maxLeaseIndex, pErr := r.propose(ctx, proposal)
+	maxLeaseIndex, pErr := r.propose(ctx, proposal, tok.Move(ctx))
 	if pErr != nil {
 		return nil, nil, 0, pErr
 	}
@@ -205,7 +226,7 @@ func (r *Replica) evalAndPropose(
 		defer r.raftMu.Unlock()
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		// TODO(radu): Should this context be created via tracer.ForkCtxSpan?
+		// TODO(radu): Should this context be created via tracer.ForkSpan?
 		// We'd need to make sure the span is finished eventually.
 		proposal.ctx = r.AnnotateCtx(context.TODO())
 	}
@@ -219,7 +240,14 @@ func (r *Replica) evalAndPropose(
 // the method returns, all access to the command must be performed while holding
 // Replica.mu and Replica.raftMu. If a non-nil error is returned the
 // MaxLeaseIndex is not updated.
-func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pErr *roachpb.Error) {
+//
+// propose takes ownership of the supplied token; the caller should tok.Move()
+// it into this method. It will be used to untrack the request once it comes out
+// of the proposal buffer.
+func (r *Replica) propose(
+	ctx context.Context, p *ProposalData, tok TrackedRequestToken,
+) (index int64, pErr *roachpb.Error) {
+	defer tok.DoneIfNotMoved(ctx)
 
 	// If an error occurs reset the command's MaxLeaseIndex to its initial value.
 	// Failure to propose will propagate to the client. An invariant of this
@@ -233,7 +261,7 @@ func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pE
 
 	// Make sure the maximum lease index is unset. This field will be set in
 	// propBuf.Insert and its encoded bytes will be appended to the encoding
-	// buffer as a RaftCommandFooter.
+	// buffer as a MaxLeaseFooter.
 	p.command.MaxLeaseIndex = 0
 
 	// Determine the encoding style for the Raft command.
@@ -289,8 +317,12 @@ func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pE
 		preLen = raftCommandPrefixLen
 	}
 	cmdLen := p.command.Size()
-	cap := preLen + cmdLen + kvserverpb.MaxRaftCommandFooterSize()
-	data := make([]byte, preLen, cap)
+	// Allocate the data slice with enough capacity to eventually hold the two
+	// "footers" that are filled later.
+	needed := preLen + cmdLen +
+		kvserverpb.MaxMaxLeaseFooterSize() +
+		kvserverpb.MaxClosedTimestampFooterSize()
+	data := make([]byte, preLen, needed)
 	// Encode prefix with command ID, if necessary.
 	if prefix {
 		encodeRaftCommandPrefix(data, version, p.idKey)
@@ -330,7 +362,7 @@ func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pE
 	//
 	// NB: we must not hold r.mu while using the proposal buffer, see comment
 	// on the field.
-	maxLeaseIndex, err := r.mu.proposalBuf.Insert(ctx, p, data)
+	maxLeaseIndex, err := r.mu.proposalBuf.Insert(ctx, p, data, tok.Move(ctx))
 	if err != nil {
 		return 0, roachpb.NewError(err)
 	}
@@ -961,6 +993,9 @@ const (
 // ensuring that the proposer will eventually get a reply on the channel it's
 // waiting on.
 // mu must be held.
+//
+// Note that reproposals don't need to worry about checking the closed timestamp
+// before reproposing, since they're reusing the original LAI.
 //
 // refreshAtDelta only applies for reasonTicks and specifies how old (in ticks)
 // a command must be for it to be inspected; the usual value is the number of

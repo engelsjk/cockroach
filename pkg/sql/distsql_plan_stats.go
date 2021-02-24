@@ -81,7 +81,7 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	}
 	var colIdxMap catalog.TableColMap
 	for i, c := range scan.cols {
-		colIdxMap.Set(c.ID, i)
+		colIdxMap.Set(c.GetID(), i)
 	}
 	sb := span.MakeBuilder(planCtx.EvalContext(), planCtx.ExtendedEvalCtx.Codec, desc, scan.index)
 	scan.spans, err = sb.UnconstrainedSpans()
@@ -202,11 +202,6 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		))
 	}
 
-	var jobID int64
-	if job.ID() != nil {
-		jobID = *job.ID()
-	}
-
 	// Set up the final SampleAggregator stage.
 	agg := &execinfrapb.SampleAggregatorSpec{
 		Sketches:         sketchSpecs,
@@ -214,7 +209,7 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		SampleSize:       sampler.SampleSize,
 		SampledColumnIDs: sampledColumnIDs,
 		TableID:          desc.GetID(),
-		JobID:            jobID,
+		JobID:            job.ID(),
 		RowsExpected:     rowsExpected,
 	}
 	// Plan the SampleAggregator on the gateway, unless we have a single Sampler.

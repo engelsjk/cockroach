@@ -36,10 +36,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -1495,9 +1495,7 @@ func TestReverseScanWithSplitAndMerge(t *testing.T) {
 func TestBadRequest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.WithIssue(t, 51795, "TODO(andreimatei): This last assertion in this test was broken by #33150. "+
-		"I suspect the reason is that there is no longer a single Range "+
-		"that spans [KeyMin, z), so we're not hitting the error.")
+
 	s, db := startNoSplitMergeServer(t)
 	defer s.Stopper().Stop(context.Background())
 	ctx := context.Background()
@@ -1519,8 +1517,13 @@ func TestBadRequest(t *testing.T) {
 		t.Fatalf("unexpected error on deletion on [x, a): %v", err)
 	}
 
-	if err := db.DelRange(ctx, "", "z"); !testutils.IsError(err, "must be greater than LocalMax") {
-		t.Fatalf("unexpected error on deletion on [KeyMin, z): %v", err)
+	// To make the last check fail we need to search the replica that starts at
+	// KeyMin i.e. typically it's Range(1).
+	store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
+	require.NoError(t, err)
+	repl := store.LookupReplica(roachpb.RKeyMin)
+	if err := db.DelRange(ctx, "", repl.Desc().EndKey); !testutils.IsError(err, "must be greater than LocalMax") {
+		t.Fatalf("unexpected error on deletion on [KeyMin, %s): %v", repl.Desc().EndKey, err)
 	}
 }
 
@@ -1569,7 +1572,7 @@ func TestPropagateTxnOnError(t *testing.T) {
 			case *roachpb.ConditionalPutRequest:
 				if k.Equal(keyB) {
 					if atomic.AddInt32(&numCPuts, 1) == 1 {
-						pErr := roachpb.NewReadWithinUncertaintyIntervalError(hlc.Timestamp{}, hlc.Timestamp{}, nil)
+						pErr := roachpb.NewReadWithinUncertaintyIntervalError(hlc.Timestamp{}, hlc.Timestamp{}, hlc.Timestamp{}, nil)
 						return roachpb.NewErrorWithTxn(pErr, fArgs.Hdr.Txn)
 					}
 				}
@@ -1813,7 +1816,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 					return nil
 				}
 				err := roachpb.NewReadWithinUncertaintyIntervalError(
-					fArgs.Hdr.Timestamp, s.Clock().Now(), fArgs.Hdr.Txn)
+					fArgs.Hdr.Timestamp, s.Clock().Now(), hlc.Timestamp{}, fArgs.Hdr.Txn)
 				return roachpb.NewErrorWithTxn(err, fArgs.Hdr.Txn)
 			}
 			return nil
@@ -3197,8 +3200,9 @@ func TestTxnCoordSenderRetriesAcrossEndTxn(t *testing.T) {
 			})
 
 			require.Regexp(t, "injected", txn.CommitInBatch(ctx, b))
+			tr := s.Tracer().(*tracing.Tracer)
 			err = kvclientutils.CheckPushResult(
-				ctx, db, *origTxn, kvclientutils.ExpectAborted, tc.txnRecExpectation)
+				ctx, db, tr, *origTxn, kvclientutils.ExpectAborted, tc.txnRecExpectation)
 			require.NoError(t, err)
 		})
 	}

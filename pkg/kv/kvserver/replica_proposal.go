@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -38,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/kr/pretty"
-	opentracing "github.com/opentracing/opentracing-go"
 	"golang.org/x/time/rate"
 )
 
@@ -82,7 +82,7 @@ type ProposalData struct {
 	quotaAlloc *quotapool.IntAlloc
 
 	// tmpFooter is used to avoid an allocation.
-	tmpFooter kvserverpb.RaftCommandFooter
+	tmpFooter kvserverpb.MaxLeaseFooter
 
 	// ec.done is called after command application to update the timestamp
 	// cache and optionally release latches and exits lock wait-queues.
@@ -115,6 +115,15 @@ type ProposalData struct {
 	// here; this could be replaced with isLease and isChangeReplicas
 	// booleans.
 	Request *roachpb.BatchRequest
+
+	// leaseStatus represents the lease under which the Request was evaluated and
+	// under which this proposal is being made. For lease requests, this is the
+	// previous lease that the requester was aware of.
+	leaseStatus kvserverpb.LeaseStatus
+
+	// tok identifies the request to the propBuf. Once the proposal is made, the
+	// token will be used to stop tracking this request.
+	tok TrackedRequestToken
 }
 
 // finishApplication is called when a command application has finished. The
@@ -293,23 +302,54 @@ A file preventing this node from restarting was placed at:
 	}
 }
 
+// leaseJumpOption controls what assertions leasePostApplyLocked can make.
+type leaseJumpOption bool
+
+const (
+	// assertNoLeaseJump means that the new lease must follow the old lease, with
+	// no gaps in the sequence number.
+	assertNoLeaseJump leaseJumpOption = false
+	// allowLeaseJump meanms that sequence number gaps must be tolerated. This is
+	// used when we've found out about the new lease through a snapshot and we
+	// don't know what other previous leases we haven't applied.
+	allowLeaseJump = true
+)
+
 // leasePostApplyLocked updates the Replica's internal state to reflect the
 // application of a new Range lease. The method is idempotent, so it can be
 // called repeatedly for the same lease safely. However, the method will panic
-// if passed a lease with a lower sequence number than the current lease. By
-// default, the method will also panic if passed a lease that indicates a
-// forward sequence number jump (i.e. a skipped lease). This behavior can
-// be disabled by passing permitJump as true.
+// if newLease has a lower sequence number than the current lease. Depending on
+// jumpOpt, we'll also panic if newLease indicates a forward sequence number
+// jump compared to prevLease (i.e. a skipped lease).
+//
+// prevLease represents the most recent lease this replica was aware of before
+// newLease came along. This is usually (but not necessarily) the latest lease
+// ever applied to the range. However, there's also the case when the replica
+// found out about newLease through a snapshot; in this case the replica might
+// not be aware of other lease changes that happened before the snapshot was
+// generated. This method thus tolerates prevLease being "stale" when
+// allowLeaseJump is passed. prevLease can also be the same as newLease; see
+// below.
+//
+// newLease represents the lease being applied. Can be the same as prevLease.
+// This allows leasePostApplyLocked to be called for some of its side-effects
+// even if the lease in question has otherwise already been applied to the
+// range.
+//
+// In addition to the leases, the method accepts a summary of the reads served
+// on the range by prior leaseholders. This can be used by the new leaseholder
+// to ensure that no future writes are allowed to invalidate prior reads. If a
+// summary is not provided, the method pessimistically assumes that prior
+// leaseholders served reads all the way up to the start of the new lease.
 func (r *Replica) leasePostApplyLocked(
-	ctx context.Context, newLease roachpb.Lease, permitJump bool,
+	ctx context.Context,
+	prevLease, newLease *roachpb.Lease,
+	priorReadSum *rspb.ReadSummary,
+	jumpOpt leaseJumpOption,
 ) {
-	// Pull out the last lease known to this Replica. It's possible that this is
-	// not actually the last lease in the Range's lease sequence because the
-	// Replica may have missed the application of a lease between prevLease and
-	// newLease. However, this should only be possible if a snapshot includes a
-	// lease update. All other forms of lease updates should be continuous
-	// without jumps (see permitJump).
-	prevLease := *r.mu.state.Lease
+	// Note that we actually install the lease further down in this method.
+	// Everything we do before then doesn't need to worry about requests being
+	// evaluated under the new lease.
 
 	// Sanity check to make sure that the lease sequence is moving in the right
 	// direction.
@@ -324,13 +364,13 @@ func (r *Replica) leasePostApplyLocked(
 			// the same lease. This can happen when callers are using
 			// leasePostApply for some of its side effects, like with
 			// splitPostApply. It can also happen during lease extensions.
-			if !prevLease.Equivalent(newLease) {
+			if !prevLease.Equivalent(*newLease) {
 				log.Fatalf(ctx, "sequence identical for different leases, prevLease=%s, newLease=%s",
 					log.Safe(prevLease), log.Safe(newLease))
 			}
 		case s2 == s1+1:
 			// Lease sequence incremented by 1. Expected case.
-		case s2 > s1+1 && !permitJump:
+		case s2 > s1+1 && jumpOpt == assertNoLeaseJump:
 			log.Fatalf(ctx, "lease sequence jump, prevLease=%s, newLease=%s",
 				log.Safe(prevLease), log.Safe(newLease))
 		}
@@ -369,18 +409,28 @@ func (r *Replica) leasePostApplyLocked(
 				newLease, err)
 		}
 
-		// If this replica is a new holder of the lease, update the low water
-		// mark of the timestamp cache. Note that clock offset scenarios are
-		// handled via a stasis period inherent in the lease which is documented
-		// in the Lease struct.
+		// If this replica is a new holder of the lease, update the timestamp
+		// cache. Note that clock offset scenarios are handled via a stasis
+		// period inherent in the lease which is documented in the Lease struct.
+		//
+		// If the Raft entry included a prior read summary then we can use that
+		// directly to update the timestamp cache. Otherwise, we pessimistically
+		// assume that prior leaseholders served reads all the way up to the
+		// start of the new lease.
 		//
 		// The introduction of lease transfers implies that the previous lease
-		// may have been shortened and we are now applying a formally overlapping
-		// lease (since the old lease holder has promised not to serve any more
-		// requests, this is kosher). This means that we don't use the old
-		// lease's expiration but instead use the new lease's start to initialize
-		// the timestamp cache low water.
-		setTimestampCacheLowWaterMark(r.store.tsCache, r.descRLocked(), newLease.Start.ToTimestamp())
+		// may have been shortened and we are now applying a formally
+		// overlapping lease (since the old lease holder has promised not to
+		// serve any more requests, this is kosher). This means that we don't
+		// use the old lease's expiration but instead use the new lease's start
+		// to initialize the timestamp cache low water.
+		var sum rspb.ReadSummary
+		if priorReadSum != nil {
+			sum = *priorReadSum
+		} else {
+			sum = rspb.FromTimestamp(newLease.Start.ToTimestamp())
+		}
+		applyReadSummaryToTimestampCache(r.store.tsCache, r.descRLocked(), sum)
 
 		// Reset the request counts used to make lease placement decisions whenever
 		// starting a new lease.
@@ -396,12 +446,16 @@ func (r *Replica) leasePostApplyLocked(
 	// to not matter).
 	r.concMgr.OnRangeLeaseUpdated(newLease.Sequence, iAmTheLeaseHolder)
 
+	// Inform the propBuf about the new lease so that it can initialize its closed
+	// timestamp tracking.
+	r.mu.proposalBuf.OnLeaseChangeLocked(iAmTheLeaseHolder, r.mu.state.ClosedTimestamp)
+
 	// Ordering is critical here. We only install the new lease after we've
 	// checked for an in-progress merge and updated the timestamp cache. If the
 	// ordering were reversed, it would be possible for requests to see the new
 	// lease but not the updated merge or timestamp cache state, which can result
 	// in serializability violations.
-	r.mu.state.Lease = &newLease
+	r.mu.state.Lease = newLease
 	expirationBasedLease := r.requiresExpiringLeaseRLocked()
 
 	// Gossip the first range whenever its lease is acquired. We check to make
@@ -474,7 +528,7 @@ func (r *Replica) leasePostApplyLocked(
 
 	// Mark the new lease in the replica's lease history.
 	if r.leaseHistory != nil {
-		r.leaseHistory.add(newLease)
+		r.leaseHistory.add(*newLease)
 	}
 }
 
@@ -686,6 +740,7 @@ func (r *Replica) evaluateProposal(
 	ctx context.Context,
 	idKey kvserverbase.CmdIDKey,
 	ba *roachpb.BatchRequest,
+	lul hlc.Timestamp,
 	latchSpans *spanset.SpanSet,
 ) (*result.Result, bool, *roachpb.Error) {
 	if ba.Timestamp.IsEmpty() {
@@ -697,7 +752,7 @@ func (r *Replica) evaluateProposal(
 	// important since evaluating a proposal is expensive.
 	// TODO(tschottdorf): absorb all returned values in `res` below this point
 	// in the call stack as well.
-	batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ba, latchSpans)
+	batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ba, lul, latchSpans)
 
 	// Note: reusing the proposer's batch when applying the command on the
 	// proposer was explored as an optimization but resulted in no performance
@@ -816,17 +871,20 @@ func (r *Replica) requestToProposal(
 	ctx context.Context,
 	idKey kvserverbase.CmdIDKey,
 	ba *roachpb.BatchRequest,
+	st kvserverpb.LeaseStatus,
+	lul hlc.Timestamp,
 	latchSpans *spanset.SpanSet,
 ) (*ProposalData, *roachpb.Error) {
-	res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, latchSpans)
+	res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, lul, latchSpans)
 
 	// Fill out the results even if pErr != nil; we'll return the error below.
 	proposal := &ProposalData{
-		ctx:     ctx,
-		idKey:   idKey,
-		doneCh:  make(chan proposalResult, 1),
-		Local:   &res.Local,
-		Request: ba,
+		ctx:         ctx,
+		idKey:       idKey,
+		doneCh:      make(chan proposalResult, 1),
+		Local:       &res.Local,
+		Request:     ba,
+		leaseStatus: st,
 	}
 
 	if needConsensus {
@@ -842,20 +900,21 @@ func (r *Replica) requestToProposal(
 }
 
 // getTraceData extracts the SpanMeta of the current span.
-func (r *Replica) getTraceData(ctx context.Context) opentracing.TextMapCarrier {
+func (r *Replica) getTraceData(ctx context.Context) map[string]string {
 	sp := tracing.SpanFromContext(ctx)
 	if sp == nil {
 		return nil
 	}
-	if sp.IsBlackHole() {
+	if !sp.IsVerbose() {
 		return nil
 	}
-	traceData := opentracing.TextMapCarrier{}
-	if err := r.AmbientContext.Tracer.Inject(
-		sp.Meta(), opentracing.TextMap, traceData,
-	); err != nil {
+
+	traceCarrier := tracing.MapCarrier{
+		Map: make(map[string]string),
+	}
+	if err := r.AmbientContext.Tracer.InjectMetaInto(sp.Meta(), traceCarrier); err != nil {
 		log.Errorf(ctx, "failed to inject sp context (%+v) as trace data: %s", sp.Meta(), err)
 		return nil
 	}
-	return traceData
+	return traceCarrier.Map
 }

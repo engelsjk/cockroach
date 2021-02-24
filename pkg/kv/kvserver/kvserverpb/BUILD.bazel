@@ -12,7 +12,10 @@ go_library(
     embed = [":kvserverpb_go_proto"],
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb",
     visibility = ["//visibility:public"],
-    deps = ["//pkg/roachpb"],
+    deps = [
+        "//pkg/roachpb",
+        "//pkg/util/hlc",
+    ],
 )
 
 proto_library(
@@ -27,6 +30,7 @@ proto_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv/kvserver/liveness/livenesspb:livenesspb_proto",
+        "//pkg/kv/kvserver/readsummary/rspb:rspb_proto",
         "//pkg/roachpb:roachpb_proto",
         "//pkg/storage/enginepb:enginepb_proto",
         "//pkg/util/hlc:hlc_proto",
@@ -43,9 +47,11 @@ go_proto_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv/kvserver/liveness/livenesspb",
+        "//pkg/kv/kvserver/readsummary/rspb",
         "//pkg/roachpb",
         "//pkg/storage/enginepb",
         "//pkg/util/hlc",
+        "//pkg/util/uuid",  # keep
         "@com_github_gogo_protobuf//gogoproto",
     ],
 )

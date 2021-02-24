@@ -19,6 +19,7 @@ go_library(
         "//pkg/storage",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
+        "//pkg/util/contextutil",
         "//pkg/util/hlc",
         "//pkg/util/log",
         "//pkg/util/retry",
@@ -28,12 +29,14 @@ go_library(
         "//pkg/util/tracing",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
+        "@com_github_stretchr_testify//require",
         "@io_etcd_go_etcd_raft_v3//:raft",
     ],
 )
 
 go_test(
     name = "testcluster_test",
+    size = "medium",
     srcs = [
         "main_test.go",
         "testcluster_test.go",

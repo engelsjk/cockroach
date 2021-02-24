@@ -60,6 +60,8 @@ go_library(
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/kv/kvserver/kvserverpb",
         "//pkg/kv/kvserver/rditer",
+        "//pkg/kv/kvserver/readsummary",
+        "//pkg/kv/kvserver/readsummary/rspb",
         "//pkg/kv/kvserver/spanset",
         "//pkg/kv/kvserver/stateloader",
         "//pkg/kv/kvserver/txnwait",
@@ -82,6 +84,7 @@ go_library(
 
 go_test(
     name = "batcheval_test",
+    size = "medium",
     srcs = [
         "cmd_add_sstable_test.go",
         "cmd_clear_range_test.go",
@@ -105,11 +108,14 @@ go_test(
         "//pkg/kv",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/abortspan",
+        "//pkg/kv/kvserver/readsummary",
+        "//pkg/kv/kvserver/readsummary/rspb",
         "//pkg/kv/kvserver/spanset",
         "//pkg/roachpb",
         "//pkg/security",
         "//pkg/security/securitytest",
         "//pkg/server",
+        "//pkg/settings/cluster",
         "//pkg/storage",
         "//pkg/storage/enginepb",
         "//pkg/testutils",

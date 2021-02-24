@@ -3021,6 +3021,15 @@ type EvalDatabase interface {
 	// LookupSchema looks up the schema with the given name in the given
 	// database.
 	LookupSchema(ctx context.Context, dbName, scName string) (found bool, scMeta SchemaMeta, err error)
+
+	// IsTableVisible checks if the table with the given ID belongs to a schema
+	// on the given sessiondata.SearchPath.
+	IsTableVisible(
+		ctx context.Context,
+		curDB string,
+		searchPath sessiondata.SearchPath,
+		tableID int64,
+	) (isVisible bool, exists bool, err error)
 }
 
 // EvalPlanner is a limited planner that can be used from EvalContext.
@@ -3127,12 +3136,6 @@ type ClientNoticeSender interface {
 // this to sqlutil.InternalExecutor or sql.InternalExecutor, and use the
 // alternatives.
 type InternalExecutor interface {
-	// Query is part of the sqlutil.InternalExecutor interface.
-	Query(
-		ctx context.Context, opName string, txn *kv.Txn,
-		stmt string, qargs ...interface{},
-	) ([]Datums, error)
-
 	// QueryRow is part of the sqlutil.InternalExecutor interface.
 	QueryRow(
 		ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
@@ -3887,7 +3890,7 @@ func (expr *CoalesceExpr) Eval(ctx *EvalContext) (Datum, error) {
 
 // Eval implements the TypedExpr interface.
 // Note: if you're modifying this function, please make sure to adjust
-// colexec.comparisonExprAdapter implementations accordingly.
+// colexeccmp.ComparisonExprAdapter implementations accordingly.
 func (expr *ComparisonExpr) Eval(ctx *EvalContext) (Datum, error) {
 	left, err := expr.Left.(TypedExpr).Eval(ctx)
 	if err != nil {
@@ -3937,7 +3940,7 @@ func EvalComparisonExprWithSubOperator(
 	return evalDatumsCmp(ctx, expr.Operator, expr.SubOperator, expr.Fn, left, datums)
 }
 
-// EvalArgsAndGetGenerator evaluates the arguments and instanciates a
+// EvalArgsAndGetGenerator evaluates the arguments and instantiates a
 // ValueGenerator for use by set projections.
 func (expr *FuncExpr) EvalArgsAndGetGenerator(ctx *EvalContext) (ValueGenerator, error) {
 	if expr.fn == nil || expr.fnProps.Class != GeneratorClass {

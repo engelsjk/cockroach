@@ -263,9 +263,9 @@ func NewTestStorePool(cfg StoreConfig) *StorePool {
 func (r *Replica) AssertState(ctx context.Context, reader storage.Reader) {
 	r.raftMu.Lock()
 	defer r.raftMu.Unlock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.assertStateLocked(ctx, reader)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	r.assertStateRaftMuLockedReplicaMuRLocked(ctx, reader)
 }
 
 func (r *Replica) RaftLock() {
@@ -512,6 +512,14 @@ func (r *Replica) ReadProtectedTimestamps(ctx context.Context) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	ts = r.readProtectedTimestampsRLocked(ctx, nil /* f */)
+}
+
+// ClosedTimestampPolicy returns the closed timestamp policy of the range, which
+// is updated asynchronously through gossip of zone configurations.
+func (r *Replica) ClosedTimestampPolicy() roachpb.RangeClosedTimestampPolicy {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.closedTimestampPolicyRLocked()
 }
 
 // GetCircuitBreaker returns the circuit breaker controlling

@@ -13,6 +13,7 @@ package cockroach.roachpb;
 option go_package = "roachpb";
 
 import "kv/kvserver/concurrency/lock/locking.proto";
+import "kv/kvserver/readsummary/rspb/summary.proto";
 import "roachpb/data.proto";
 import "roachpb/errors.proto";
 import "roachpb/metadata.proto";
@@ -1015,11 +1016,8 @@ message QueryIntentRequest {
   // intent is a match or not is defined as whether an intent exists that could
   // be committed by the provided transaction. If an intent is found at the
   // specified key, the intent is only considered a match if it has the same ID,
-  // the same epoch, and a provisional commit timestamp that is equal to or less
-  // than that in the provided transaction. The TxnMeta's provisional commit
-  // timestamp is forwarded by the provisional commit timestamp of the request
-  // header transaction if the transactions are the same (i.e. a transaction is
-  // querying its own intent after successfully having refreshed).
+  // the same epoch, and a write timestamp that is equal to or less than that in
+  // the provided transaction.
   //
   // Additionally, the intent is only considered a match if its sequence number
   // is equal to or greater than the expected txn's sequence number. The
@@ -1029,6 +1027,17 @@ message QueryIntentRequest {
   // successfully written an intent at a larger sequence number then it must
   // have succeeeded in writing an intent at the smaller sequence number as
   // well.
+  //
+  // QueryIntentRequests may be issued in non-transactional BatchRequests or in
+  // transactional BatchRequests. If issued inside of a transaction, the TxnMeta
+  // must be a reference to the same transaction as the batch's transaction, or
+  // the request will be rejected. In other words, a transaction can only query
+  // its own intents. In these cases where the BatchRequest is transactional,
+  // the TxnMeta's write timestamp is forwarded by the write timestamp of the
+  // request header transaction for purposes of determining whether a matching
+  // intent is found or not (see condition above). This is useful to avoid the
+  // need to update each QueryIntentRequest when a transaction is querying its
+  // own intent after having successfully refreshed.
   storage.enginepb.TxnMeta txn = 2 [(gogoproto.nullable) = false];
 
   // If true, return an IntentMissingError if a matching intent is not found.
@@ -1654,9 +1663,40 @@ message SubsumeResponse {
   // timestamps at which any requests were serviced by the responding replica
   // before it stopped responding to requests altogether (in anticipation of
   // being subsumed). It is suitable for use as the timestamp cache's low water
-  // mark for the keys previously owned by the subsumed range.
+  // mark for the keys previously owned by the subsumed range though this role
+  // is largely being... subsumed by the RightReadSummary.
   util.hlc.Timestamp freeze_start = 5 [(gogoproto.nullable) = false,
     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
+
+  // closed_timestamp is the range's closed timestamp at the moment of the
+  // subsumption. Because the SubsumeRequest synchronizes with all other
+  // requests, the range's closed timestamp does not advance past the snapshot
+  // captured here.
+  //
+  // Like the freeze_start, this is used by the merged range to conditionally
+  // bump the timestamp cache for the keys previously owned by the subsumed
+  // range.
+  //
+  // Note that the closed timestamp is also reflected in the read_summary.
+  // However, we carry it explicitly too because, in case the leaseholders of
+  // the two sides are collocated at merge time, we don't need to use the
+  // read_summary and simply use this field.
+  util.hlc.Timestamp closed_timestamp = 6 [(gogoproto.nullable) = false];
+
+  // ReadSummary is a summary of the reads that have been performed on the range
+  // up to the point of the Subsume request, which serializes with past reads
+  // and begins blocking future reads. It is suitable for use to update the
+  // timestamp cache for the keys previously owned by the subsumed range.
+  //
+  // ReadSummary can be used in place of FreezeStart, when available. It has two
+  // distinct advantages:
+  // 1. it can transfer a higher-resolution snapshot of the reads on the range
+  //    through a range merge, to make the merge less disruptive to writes on
+  //    the post-merge range because the timestamp cache won't be bumped as
+  //    high.
+  // 2. it can transfer information about reads with synthetic timestamps, which
+  //    are not otherwise captured by the FreezeStart clock timestamp.
+  kv.kvserver.readsummary.ReadSummary read_summary = 7;
 }
 
 // RangeStatsRequest is the argument to the RangeStats() method. It requests the

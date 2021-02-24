@@ -23,7 +23,20 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
-//go:generate go run -tags gen-batch gen_batch.go
+//go:generate go run -tags gen-batch gen/main.go
+
+// WriteTimestamp returns the timestamps at which this request is writing. For
+// non-transactional requests, this is the same as the read timestamp. For
+// transactional requests, the write timestamp can be higher until commit time.
+//
+// This should only be called after SetActiveTimestamp().
+func (h Header) WriteTimestamp() hlc.Timestamp {
+	ts := h.Timestamp
+	if h.Txn != nil {
+		ts.Forward(h.Txn.WriteTimestamp)
+	}
+	return ts
+}
 
 // SetActiveTimestamp sets the correct timestamp at which the request is to be
 // carried out. For transactional requests, ba.Timestamp must be zero initially
@@ -43,7 +56,7 @@ func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
 		// provisional commit timestamp evolves.
 		//
 		// Note that writes will be performed at the provisional commit timestamp,
-		// txn.Timestamp, regardless of the batch timestamp.
+		// txn.WriteTimestamp, regardless of the batch timestamp.
 		ba.Timestamp = txn.ReadTimestamp
 	} else {
 		// When not transactional, allow empty timestamp and use nowFn instead

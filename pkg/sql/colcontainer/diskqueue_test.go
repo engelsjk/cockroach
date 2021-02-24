@@ -18,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -178,7 +178,7 @@ func TestDiskQueueCloseOnErr(t *testing.T) {
 	defer cleanup()
 
 	serverCfg := &execinfra.ServerConfig{}
-	serverCfg.TestingKnobs.MemoryLimitBytes = 1
+	serverCfg.TestingKnobs.ForceDiskSpill = true
 	diskMon := execinfra.NewLimitedMonitor(ctx, testDiskMonitor, serverCfg, t.Name())
 	defer diskMon.Stop(ctx)
 	diskAcc := diskMon.MakeBoundAccount()
@@ -189,7 +189,6 @@ func TestDiskQueueCloseOnErr(t *testing.T) {
 	require.NoError(t, err)
 
 	b := coldata.NewMemBatch(typs, coldata.StandardColumnFactory)
-	b.SetLength(0)
 
 	err = q.Enqueue(ctx, b)
 	require.Error(t, err, "expected Enqueue to produce an error given a disk limit of one byte")
@@ -232,7 +231,7 @@ func BenchmarkDiskQueue(b *testing.B) {
 	rng, _ := randutil.NewPseudoRand()
 	typs := []*types.T{types.Int}
 	batch := coldatatestutils.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0, 0)
-	op := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
+	op := colexecop.NewRepeatableBatchSource(testAllocator, batch, typs)
 	ctx := context.Background()
 	for i := 0; i < b.N; i++ {
 		op.ResetBatchesToReturn(numBatches)

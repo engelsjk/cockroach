@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
@@ -175,7 +176,7 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 		tree.PersistencePermanent,
 	)
 	if err != nil {
-		return mutDesc.TableDescriptor, err
+		return descpb.TableDescriptor{}, err
 	}
 	for _, index := range mutDesc.PublicNonPrimaryIndexes() {
 		if index.NumColumns() > 1 {
@@ -643,10 +644,15 @@ func NewVirtualSchemaHolder(
 					return nil, errors.NewAssertionErrorWithWrappedErrf(err, "programmer error")
 				}
 			}
+			td := tabledesc.NewImmutable(tableDesc)
+			if err := td.ValidateSelf(ctx); err != nil {
+				return nil, errors.NewAssertionErrorWithWrappedErrf(err,
+					"failed to validate virtual table %s: programmer error", errors.Safe(td.GetName()))
+			}
 
 			entry := &virtualDefEntry{
 				virtualDef:                 def,
-				desc:                       tabledesc.NewImmutable(tableDesc),
+				desc:                       td,
 				validWithNoDatabaseContext: schema.validWithNoDatabaseContext,
 				comment:                    def.getComment(),
 			}
@@ -714,6 +720,7 @@ func (vs *VirtualSchemaHolder) getVirtualTableEntry(tn *tree.TableName) (*virtua
 	if db, ok := vs.getVirtualSchemaEntry(tn.Schema()); ok {
 		tableName := tn.Table()
 		if t, ok := db.defs[tableName]; ok {
+			sqltelemetry.IncrementGetVirtualTableEntry(tn.Schema(), tableName)
 			return t, nil
 		}
 		if _, ok := db.allTableNames[tableName]; ok {

@@ -26,6 +26,9 @@ func (m *NodeRestart) LoggingChannel() logpb.Channel { return logpb.Channel_OPS 
 func (m *SetClusterSetting) LoggingChannel() logpb.Channel { return logpb.Channel_DEV }
 
 // LoggingChannel implements the EventPayload interface.
+func (m *AdminQuery) LoggingChannel() logpb.Channel { return logpb.Channel_SENSITIVE_ACCESS }
+
+// LoggingChannel implements the EventPayload interface.
 func (m *SensitiveTableAccess) LoggingChannel() logpb.Channel { return logpb.Channel_SENSITIVE_ACCESS }
 
 // LoggingChannel implements the EventPayload interface.
@@ -33,6 +36,9 @@ func (m *QueryExecute) LoggingChannel() logpb.Channel { return logpb.Channel_SQL
 
 // LoggingChannel implements the EventPayload interface.
 func (m *AlterDatabaseAddRegion) LoggingChannel() logpb.Channel { return logpb.Channel_SQL_SCHEMA }
+
+// LoggingChannel implements the EventPayload interface.
+func (m *AlterDatabaseDropRegion) LoggingChannel() logpb.Channel { return logpb.Channel_SQL_SCHEMA }
 
 // LoggingChannel implements the EventPayload interface.
 func (m *AlterDatabasePrimaryRegion) LoggingChannel() logpb.Channel { return logpb.Channel_SQL_SCHEMA }

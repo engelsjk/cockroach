@@ -12,6 +12,7 @@ package testcat
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"reflect"
 	"sort"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -153,6 +155,11 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 	)
 	tab.Columns = append(tab.Columns, mvcc)
 
+	// Cache the partitioning statement for the primary index.
+	if stmt.PartitionByTable != nil {
+		tab.partitionBy = stmt.PartitionByTable.PartitionBy
+	}
+
 	// Add the primary index.
 	if hasPrimaryIndex {
 		for _, def := range stmt.Defs {
@@ -172,9 +179,6 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 	} else {
 		tab.addPrimaryColumnIndex("rowid")
 	}
-	if stmt.PartitionByTable != nil {
-		tab.Indexes[0].partitionBy = stmt.PartitionByTable.PartitionBy
-	}
 
 	// Add check constraints.
 	for _, def := range stmt.Defs {
@@ -192,7 +196,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 		switch def := def.(type) {
 		case *tree.UniqueConstraintTableDef:
 			if def.WithoutIndex {
-				tab.addUniqueConstraint(def.Name, def.Columns, def.WithoutIndex)
+				tab.addUniqueConstraint(def.Name, def.Columns, def.Predicate, def.WithoutIndex)
 			} else if !def.PrimaryKey {
 				tab.addIndex(&def.IndexTableDef, uniqueIndex)
 			}
@@ -209,6 +213,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 					tab.addUniqueConstraint(
 						def.Unique.ConstraintName,
 						tree.IndexElemList{{Column: def.Name}},
+						nil, /* predicate */
 						def.Unique.WithoutIndex,
 					)
 				} else {
@@ -484,8 +489,14 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 }
 
 func (tt *Table) addUniqueConstraint(
-	name tree.Name, columns tree.IndexElemList, withoutIndex bool,
+	name tree.Name, columns tree.IndexElemList, predicate tree.Expr, withoutIndex bool,
 ) {
+	// We don't currently use unique constraints with an index (those are already
+	// tracked with unique indexes), so don't bother adding them.
+	// NB: This should stay consistent with opt_catalog.go.
+	if !withoutIndex {
+		return
+	}
 	cols := make([]int, len(columns))
 	for i, c := range columns {
 		cols[i] = tt.FindOrdinal(string(c.Column))
@@ -506,6 +517,10 @@ func (tt *Table) addUniqueConstraint(
 		columnOrdinals: cols,
 		withoutIndex:   withoutIndex,
 		validated:      true,
+	}
+	// Add partial unique constraint predicate.
+	if predicate != nil {
+		u.predicate = tree.Serialize(predicate)
 	}
 	tt.uniqueConstraints = append(tt.uniqueConstraints, u)
 }
@@ -580,7 +595,7 @@ func (tt *Table) addIndexWithVersion(
 ) *Index {
 	// Add a unique constraint if this is a primary or unique index.
 	if typ != nonUniqueIndex {
-		tt.addUniqueConstraint(def.Name, def.Columns, false /* withoutIndex */)
+		tt.addUniqueConstraint(def.Name, def.Columns, def.Predicate, false /* withoutIndex */)
 	}
 
 	idx := &Index{
@@ -590,10 +605,6 @@ func (tt *Table) addIndexWithVersion(
 		IdxZone:  &zonepb.ZoneConfig{},
 		table:    tt,
 		version:  version,
-	}
-
-	if def.PartitionByIndex != nil {
-		idx.partitionBy = def.PartitionByIndex.PartitionBy
 	}
 
 	// Look for name suffixes indicating this is a mutation index.
@@ -647,6 +658,44 @@ func (tt *Table) addIndexWithVersion(
 						LevelMod: 1,
 						MaxCells: 3,
 					}},
+				}
+			}
+		}
+	}
+
+	// Add partitions.
+	var partitionBy *tree.PartitionBy
+	if def.PartitionByIndex != nil {
+		partitionBy = def.PartitionByIndex.PartitionBy
+	} else if typ == primaryIndex {
+		partitionBy = tt.partitionBy
+	}
+	if partitionBy != nil {
+		ctx := context.Background()
+		semaCtx := tree.MakeSemaContext()
+		evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+
+		if len(partitionBy.List) > 0 {
+			idx.partitions = make([]Partition, len(partitionBy.List))
+			for i := range partitionBy.Fields {
+				if i >= len(idx.Columns) || partitionBy.Fields[i] != idx.Columns[i].ColName() {
+					panic("partition by columns must be a prefix of the index columns")
+				}
+			}
+			for i := range partitionBy.List {
+				p := &partitionBy.List[i]
+				idx.partitions[i] = Partition{
+					name:   string(p.Name),
+					zone:   &zonepb.ZoneConfig{},
+					datums: make([]tree.Datums, 0, len(p.Exprs)),
+				}
+
+				// Get the partition values.
+				for _, e := range p.Exprs {
+					d := idx.partitionByListExprToDatums(ctx, &evalCtx, &semaCtx, e)
+					if d != nil {
+						idx.partitions[i].datums = append(idx.partitions[i].datums, d)
+					}
 				}
 			}
 		}
@@ -933,6 +982,47 @@ func (tt *Table) addPrimaryColumnIndex(colName string) {
 		Columns: tree.IndexElemList{{Column: tree.Name(colName), Direction: tree.Ascending}},
 	}
 	tt.addIndex(&def, primaryIndex)
+}
+
+// partitionByListExprToDatums converts an expression from a PARTITION BY LIST
+// clause to a list of datums.
+func (ti *Index) partitionByListExprToDatums(
+	ctx context.Context, evalCtx *tree.EvalContext, semaCtx *tree.SemaContext, e tree.Expr,
+) tree.Datums {
+	var vals []tree.Expr
+	switch t := e.(type) {
+	case *tree.Tuple:
+		vals = t.Exprs
+	default:
+		vals = []tree.Expr{e}
+	}
+
+	// Cut off at DEFAULT, if present.
+	for i := range vals {
+		if _, ok := vals[i].(tree.DefaultVal); ok {
+			vals = vals[:i]
+		}
+	}
+	if len(vals) == 0 {
+		return nil
+	}
+	d := make(tree.Datums, len(vals))
+	for i := range vals {
+		c := tree.CastExpr{Expr: vals[i], Type: ti.Columns[i].DatumType()}
+		cTyped, err := c.TypeCheck(ctx, semaCtx, types.Any)
+		if err != nil {
+			panic(err)
+		}
+		d[i], err = cTyped.Eval(evalCtx)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// TODO(radu): split into multiple prefixes if Subpartition is also by list.
+	// Note that this functionality should be kept in sync with the real catalog
+	// implementation (opt_catalog.go).
+	return d
 }
 
 func extractInaccessibleColumn(def *tree.ColumnTableDef) (name tree.Name, ok bool) {

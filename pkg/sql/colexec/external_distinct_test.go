@@ -19,7 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -65,20 +67,21 @@ func TestExternalDistinct(t *testing.T) {
 		for tcIdx, tc := range distinctTestCases {
 			log.Infof(context.Background(), "spillForced=%t/%d", spillForced, tcIdx)
 			var semsToCheck []semaphore.Semaphore
-			runTestsWithTyps(
+			colexectestutils.RunTestsWithTyps(
 				t,
-				[]tuples{tc.tuples},
+				testAllocator,
+				[]colexectestutils.Tuples{tc.tuples},
 				[][]*types.T{tc.typs},
 				tc.expected,
 				// We're using an unordered verifier because the in-memory
 				// unordered distinct is free to change the order of the tuples
 				// when exporting them into an external distinct.
-				unorderedVerifier,
-				func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+				colexectestutils.UnorderedVerifier,
+				func(input []colexecop.Operator) (colexecop.Operator, error) {
 					// A sorter should never exceed ExternalSorterMinPartitions, even
 					// during repartitioning. A panic will happen if a sorter requests
 					// more than this number of file descriptors.
-					sem := colexecbase.NewTestingSemaphore(ExternalSorterMinPartitions)
+					sem := colexecop.NewTestingSemaphore(colexecop.ExternalSorterMinPartitions)
 					semsToCheck = append(semsToCheck, sem)
 					var outputOrdering execinfrapb.Ordering
 					if tc.isOrderedOnDistinctCols {
@@ -173,7 +176,7 @@ func TestExternalDistinctSpilling(t *testing.T) {
 	if nTuples > maxNumTuples {
 		// If we happen to set a large value for coldata.BatchSize() and a small
 		// value for newTupleProbability, we might end up with huge number of
-		// tuples. Then, when runTests test harness uses small batch size, the
+		// tuples. Then, when RunTests test harness uses small batch size, the
 		// test might take a while, so we'll limit the number of tuples.
 		nTuples = maxNumTuples
 		// Since we have limited the number of tuples, it is possible that the
@@ -188,19 +191,20 @@ func TestExternalDistinctSpilling(t *testing.T) {
 	var numRuns, numSpills int
 	var semsToCheck []semaphore.Semaphore
 	numForcedRepartitions := rng.Intn(5)
-	runTestsWithoutAllNullsInjection(
+	colexectestutils.RunTestsWithoutAllNullsInjection(
 		t,
-		[]tuples{tups},
+		testAllocator,
+		[]colexectestutils.Tuples{tups},
 		[][]*types.T{typs},
 		expected,
 		// tups and expected are in an arbitrary order, so we use an unordered
 		// verifier.
-		unorderedVerifier,
-		func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+		colexectestutils.UnorderedVerifier,
+		func(input []colexecop.Operator) (colexecop.Operator, error) {
 			// Since we're giving very low memory limit to the operator, in
 			// order to make the test run faster, we'll use an unlimited number
 			// of file descriptors.
-			sem := colexecbase.NewTestingSemaphore(0 /* limit */)
+			sem := colexecop.NewTestingSemaphore(0 /* limit */)
 			semsToCheck = append(semsToCheck, sem)
 			var outputOrdering execinfrapb.Ordering
 			distinct, newAccounts, newMonitors, closers, err := createExternalDistinct(
@@ -239,10 +243,10 @@ func TestExternalDistinctSpilling(t *testing.T) {
 // shuffled whereas the latter is not).
 func generateRandomDataForUnorderedDistinct(
 	rng *rand.Rand, nTups, nDistinctCols int, newTupleProbability float64,
-) (tups, expected tuples) {
-	tups = make(tuples, nTups)
-	expected = make(tuples, 1, nTups)
-	tups[0] = make(tuple, nDistinctCols)
+) (tups, expected colexectestutils.Tuples) {
+	tups = make(colexectestutils.Tuples, nTups)
+	expected = make(colexectestutils.Tuples, 1, nTups)
+	tups[0] = make(colexectestutils.Tuple, nDistinctCols)
 	for j := 0; j < nDistinctCols; j++ {
 		tups[0][j] = 0
 	}
@@ -252,7 +256,7 @@ func generateRandomDataForUnorderedDistinct(
 	// that duplicate tuples are distributed randomly and not consequently.
 	newValueProbability := getNewValueProbabilityForDistinct(newTupleProbability, nDistinctCols)
 	for i := 1; i < nTups; i++ {
-		tups[i] = make(tuple, nDistinctCols)
+		tups[i] = make(colexectestutils.Tuple, nDistinctCols)
 		isDuplicate := true
 		for j := range tups[i] {
 			tups[i][j] = tups[i-1][j].(int)
@@ -314,14 +318,14 @@ func BenchmarkExternalDistinct(b *testing.B) {
 			runDistinctBenchmarks(
 				ctx,
 				b,
-				func(allocator *colmem.Allocator, input colexecbase.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecbase.Operator, error) {
+				func(allocator *colmem.Allocator, input colexecop.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecop.Operator, error) {
 					var outputOrdering execinfrapb.Ordering
 					if maintainOrdering {
 						outputOrdering = convertDistinctColsToOrdering(distinctCols)
 					}
 					op, accs, mons, _, err := createExternalDistinct(
-						ctx, flowCtx, []colexecbase.Operator{input}, typs,
-						distinctCols, outputOrdering, queueCfg, &colexecbase.TestingSemaphore{},
+						ctx, flowCtx, []colexecop.Operator{input}, typs,
+						distinctCols, outputOrdering, queueCfg, &colexecop.TestingSemaphore{},
 						nil /* spillingCallbackFn */, 0, /* numForcedRepartitions */
 					)
 					memAccounts = append(memAccounts, accs...)
@@ -351,7 +355,7 @@ func BenchmarkExternalDistinct(b *testing.B) {
 func createExternalDistinct(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
-	input []colexecbase.Operator,
+	input []colexecop.Operator,
 	typs []*types.T,
 	distinctCols []uint32,
 	outputOrdering execinfrapb.Ordering,
@@ -359,7 +363,7 @@ func createExternalDistinct(
 	testingSemaphore semaphore.Semaphore,
 	spillingCallbackFn func(),
 	numForcedRepartitions int,
-) (colexecbase.Operator, []*mon.BoundAccount, []*mon.BytesMonitor, []colexecbase.Closer, error) {
+) (colexecop.Operator, []*mon.BoundAccount, []*mon.BytesMonitor, []colexecop.Closer, error) {
 	distinctSpec := &execinfrapb.DistinctSpec{
 		DistinctColumns: distinctCols,
 		OutputOrdering:  outputOrdering,
@@ -372,7 +376,7 @@ func createExternalDistinct(
 		Post:        execinfrapb.PostProcessSpec{},
 		ResultTypes: typs,
 	}
-	args := &NewColOperatorArgs{
+	args := &colexecargs.NewColOperatorArgs{
 		Spec:                spec,
 		Inputs:              input,
 		StreamingMemAccount: testMemAcc,
@@ -384,6 +388,6 @@ func createExternalDistinct(
 	// External sorter relies on different memory accounts to
 	// understand when to start a new partition, so we will not use
 	// the streaming memory account.
-	result, err := TestNewColOperator(ctx, flowCtx, args)
+	result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
 	return result.Op, result.OpAccounts, result.OpMonitors, result.ToClose, err
 }

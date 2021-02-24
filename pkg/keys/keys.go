@@ -271,6 +271,12 @@ func RangeLeaseKey(rangeID roachpb.RangeID) roachpb.Key {
 	return MakeRangeIDPrefixBuf(rangeID).RangeLeaseKey()
 }
 
+// RangePriorReadSummaryKey returns a system-local key for a range's prior read
+// summary.
+func RangePriorReadSummaryKey(rangeID roachpb.RangeID) roachpb.Key {
+	return MakeRangeIDPrefixBuf(rangeID).RangePriorReadSummaryKey()
+}
+
 // RangeStatsLegacyKey returns the key for accessing the MVCCStats struct for
 // the specified Range ID. The key is no longer written to. Its responsibility
 // has been subsumed by the RangeAppliedStateKey.
@@ -414,8 +420,9 @@ func QueueLastProcessedKey(key roachpb.RKey, queue string) roachpb.Key {
 }
 
 // LockTableSingleKey creates a key under which all single-key locks for the
-// given key can be found. buf is used as scratch-space to avoid allocations
-// -- its contents will be overwritten and not appended to.
+// given key can be found. buf is used as scratch-space, up to its capacity,
+// to avoid allocations -- its contents will be overwritten and not appended
+// to.
 // Note that there can be multiple locks for the given key, but those are
 // distinguished using the "version" which is not in scope of the keys
 // package.
@@ -949,6 +956,12 @@ func (b RangeIDPrefixBuf) RaftTruncatedStateLegacyKey() roachpb.Key {
 // RangeLeaseKey returns a system-local key for a range lease.
 func (b RangeIDPrefixBuf) RangeLeaseKey() roachpb.Key {
 	return append(b.replicatedPrefix(), LocalRangeLeaseSuffix...)
+}
+
+// RangePriorReadSummaryKey returns a system-local key for a range's prior read
+// summary.
+func (b RangeIDPrefixBuf) RangePriorReadSummaryKey() roachpb.Key {
+	return append(b.replicatedPrefix(), LocalRangePriorReadSummarySuffix...)
 }
 
 // RangeStatsLegacyKey returns the key for accessing the MVCCStats struct

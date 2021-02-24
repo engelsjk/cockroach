@@ -14,8 +14,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -45,22 +45,23 @@ const (
 // chunk into a coldata.Batch column by column.
 type Columnarizer struct {
 	execinfra.ProcessorBase
-	NonExplainable
+	colexecop.NonExplainable
 
 	mode       columnarizerMode
 	allocator  *colmem.Allocator
 	input      execinfra.RowSource
 	da         rowenc.DatumAlloc
-	initStatus OperatorInitStatus
+	initStatus colexecop.OperatorInitStatus
 
 	buffered        rowenc.EncDatumRows
 	batch           coldata.Batch
+	maxBatchMemSize int64
 	accumulatedMeta []execinfrapb.ProducerMetadata
 	ctx             context.Context
 	typs            []*types.T
 }
 
-var _ colexecbase.Operator = &Columnarizer{}
+var _ colexecop.Operator = &Columnarizer{}
 
 // NewBufferingColumnarizer returns a new Columnarizer that will be buffering up
 // rows before emitting them as output batches.
@@ -102,10 +103,11 @@ func newColumnarizer(
 		return nil, errors.AssertionFailedf("unexpected columnarizerMode %d", mode)
 	}
 	c := &Columnarizer{
-		allocator: allocator,
-		input:     input,
-		ctx:       ctx,
-		mode:      mode,
+		allocator:       allocator,
+		input:           input,
+		maxBatchMemSize: execinfra.GetWorkMemLimit(flowCtx.Cfg),
+		ctx:             ctx,
+		mode:            mode,
 	}
 	if err = c.ProcessorBase.Init(
 		nil,
@@ -128,10 +130,10 @@ func (c *Columnarizer) Init() {
 	// We don't want to call Start on the input to columnarizer and allocating
 	// internal objects several times if Init method is called more than once, so
 	// we have this check in place.
-	if c.initStatus == OperatorNotInitialized {
+	if c.initStatus == colexecop.OperatorNotInitialized {
 		c.accumulatedMeta = make([]execinfrapb.ProducerMetadata, 0, 1)
 		c.input.Start(c.ctx)
-		c.initStatus = OperatorInitialized
+		c.initStatus = colexecop.OperatorInitialized
 	}
 }
 
@@ -140,7 +142,9 @@ func (c *Columnarizer) Next(context.Context) coldata.Batch {
 	var reallocated bool
 	switch c.mode {
 	case columnarizerBufferingMode:
-		c.batch, reallocated = c.allocator.ResetMaybeReallocate(c.typs, c.batch, 1 /* minCapacity */)
+		c.batch, reallocated = c.allocator.ResetMaybeReallocate(
+			c.typs, c.batch, 1 /* minCapacity */, c.maxBatchMemSize,
+		)
 	case columnarizerStreamingMode:
 		// Note that we're not using ResetMaybeReallocate because we will
 		// always have at most one tuple in the batch.
@@ -211,9 +215,9 @@ func (c *Columnarizer) Run(context.Context) {
 }
 
 var (
-	_ colexecbase.Operator       = &Columnarizer{}
+	_ colexecop.Operator         = &Columnarizer{}
 	_ execinfrapb.MetadataSource = &Columnarizer{}
-	_ colexecbase.Closer         = &Columnarizer{}
+	_ colexecop.Closer           = &Columnarizer{}
 )
 
 // DrainMeta is part of the MetadataSource interface.
