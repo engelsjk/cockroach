@@ -146,11 +146,6 @@ func (idp *readImportDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Pro
 	}, nil
 }
 
-// ConsumerDone is part of the RowSource interface.
-func (idp *readImportDataProcessor) ConsumerDone() {
-	idp.MoveToDraining(nil /* err */)
-}
-
 // ConsumerClosed is part of the RowSource interface.
 func (idp *readImportDataProcessor) ConsumerClosed() {
 	// The consumer is done, Next() will not be called again.
@@ -177,7 +172,7 @@ func makeInputConverter(
 	var singleTableTargetCols tree.NameList
 	if len(spec.Tables) == 1 {
 		for _, table := range spec.Tables {
-			singleTable = tabledesc.NewImmutable(*table.Desc)
+			singleTable = tabledesc.NewBuilder(table.Desc).BuildImmutableTable()
 			singleTableTargetCols = make(tree.NameList, len(table.TargetCols))
 			for i, colName := range table.TargetCols {
 				singleTableTargetCols[i] = tree.Name(colName)

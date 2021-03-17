@@ -72,6 +72,7 @@ func makeClusterWideZipRequests(
 // Tables containing cluster-wide info that are collected using SQL
 // into a debug zip.
 var debugZipTablesPerCluster = []string{
+	"crdb_internal.cluster_contention_events",
 	"crdb_internal.cluster_database_privileges",
 	"crdb_internal.cluster_queries",
 	"crdb_internal.cluster_sessions",
@@ -83,6 +84,7 @@ var debugZipTablesPerCluster = []string{
 	"system.descriptor", // descriptors also contain job-like mutation state.
 	"system.namespace",
 	"system.namespace2", // TODO(sqlexec): consider removing in 20.2 or later.
+	"system.scheduled_jobs",
 
 	"crdb_internal.kv_node_status",
 	"crdb_internal.kv_store_status",
@@ -108,11 +110,11 @@ func (zc *debugZipContext) collectClusterData(
 	}
 
 	for _, table := range debugZipTablesPerCluster {
-		selectClause, ok := customSelectClause[table]
-		if !ok {
-			selectClause = "*"
+		query := fmt.Sprintf(`SELECT * FROM %s`, table)
+		if override, ok := customQuery[table]; ok {
+			query = override
 		}
-		if err := zc.dumpTableDataForZip(zc.firstNodeSQLConn, debugBase, table, selectClause); err != nil {
+		if err := zc.dumpTableDataForZip(zc.firstNodeSQLConn, debugBase, table, query); err != nil {
 			return nil, nil, errors.Wrapf(err, "fetching %s", table)
 		}
 	}

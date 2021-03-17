@@ -41,14 +41,18 @@ import (
 const verboseTracingBaggageKey = "sb"
 
 const (
-	// maxLogsPerSpan limits the number of logs in a Span; use a comfortable
-	// limit.
-	maxLogsPerSpan = 1000
-	// maxStructuredEventsPerSpan limits the number of structured events in a
-	// span; use a comfortable limit.
-	maxStructuredEventsPerSpan = 50
+	// maxRecordedBytesPerSpan limits the size of logs and structured in a span;
+	// use a comfortable limit.
+	maxLogBytesPerSpan        = 256 * (1 << 10) // 256 KiB
+	maxStructuredBytesPerSpan = 10 * (1 << 10)  // 10 KiB
 	// maxChildrenPerSpan limits the number of (direct) child spans in a Span.
 	maxChildrenPerSpan = 1000
+	// maxSpanRegistrySize limits the number of local root spans tracked in
+	// a Tracer's registry.
+	maxSpanRegistrySize = 5000
+	// maxLogsPerSpanExternal limits the number of logs in a Span for external
+	// tracers (net/trace, lightstep); use a comfortable limit.
+	maxLogsPerSpanExternal = 1000
 )
 
 // These constants are used to form keys to represent tracing context
@@ -66,42 +70,6 @@ const (
 	fieldNameShadowType = prefixTracerState + "shadowtype"
 )
 
-type mode int32
-
-const (
-	modeLegacy mode = iota
-	modeBackground
-)
-
-// tracingMode informs the creation of noop spans and the default recording mode
-// of created spans.
-//
-// If set to 'background', trace spans will be created for all operations, but
-// these will record sparse structured information, unless an operation
-// explicitly requests the verbose from. It's optimized for low overhead, and
-// powers fine-grained statistics and alerts.
-//
-// If set to 'legacy', trace spans will not be created by default. This is
-// unless an internal code path explicitly requests for it, or if an auxiliary
-// tracer (such as lightstep or zipkin) is configured. This tracing mode always
-// records in the verbose form. Using this mode has two effects: the
-// observability of the cluster may be degraded (as most trace spans are elided)
-// and where trace spans are created, they may consume large amounts of memory.
-//
-// Note that regardless of this setting, configuring an auxiliary trace sink
-// will cause verbose traces to be created for all operations, which may lead to
-// high memory consumption. It is not currently possible to send non-verbose
-// traces to auxiliary sinks.
-var tracingMode = settings.RegisterEnumSetting(
-	"trace.mode",
-	"if set to 'background', traces will be created for all operations (in"+
-		"'legacy' mode it's created when explicitly requested or when auxiliary tracers are configured)",
-	"legacy",
-	map[int64]string{
-		int64(modeLegacy):     "legacy",
-		int64(modeBackground): "background",
-	})
-
 var enableNetTrace = settings.RegisterBoolSetting(
 	"trace.debug.enable",
 	"if set, traces for recent requests can be seen at https://<ui>/debug/requests",
@@ -114,10 +82,27 @@ var lightstepToken = settings.RegisterStringSetting(
 	envutil.EnvOrDefaultString("COCKROACH_TEST_LIGHTSTEP_TOKEN", ""),
 ).WithPublic()
 
-var zipkinCollector = settings.RegisterStringSetting(
+// ZipkinCollector is the cluster setting that specifies the Zipkin instance
+// to send traces to, if any.
+var ZipkinCollector = settings.RegisterStringSetting(
 	"trace.zipkin.collector",
-	"if set, traces go to the given Zipkin instance (example: '127.0.0.1:9411'); ignored if trace.lightstep.token is set",
+	"if set, traces go to the given Zipkin instance (example: '127.0.0.1:9411'). "+
+		"Only one tracer can be configured at a time.",
 	envutil.EnvOrDefaultString("COCKROACH_TEST_ZIPKIN_COLLECTOR", ""),
+).WithPublic()
+
+var dataDogAgentAddr = settings.RegisterStringSetting(
+	"trace.datadog.agent",
+	"if set, traces will be sent to this DataDog agent; use <host>:<port> or \"default\" for localhost:8126. "+
+		"Only one tracer can be configured at a time.",
+	envutil.EnvOrDefaultString("COCKROACH_DATADOG_AGENT", ""),
+).WithPublic()
+
+var dataDogProjectName = settings.RegisterStringSetting(
+	"trace.datadog.project",
+	"the project under which traces will be reported to the DataDog agent if trace.datadog.agent is set. "+
+		"Only one tracer can be configured at a time.",
+	envutil.EnvOrDefaultString("COCKROACH_DATADOG_PROJECT", "CockroachDB"),
 ).WithPublic()
 
 // Tracer is our own custom implementation of opentracing.Tracer. It supports:
@@ -143,8 +128,6 @@ type Tracer struct {
 	// x/net/trace or lightstep and we are not recording.
 	noopSpan *Span
 
-	_mode int32 // modeLegacy or modeBackground, accessed atomically
-
 	// True if tracing to the debug/requests endpoint. Accessed via t.useNetTrace().
 	_useNetTrace int32 // updated atomically
 
@@ -153,7 +136,6 @@ type Tracer struct {
 
 	// activeSpans is a map that references all non-Finish'ed local root spans,
 	// i.e. those for which no WithLocalParent(<non-nil>) option was supplied.
-	// It also elides spans created using WithBypassRegistry.
 	// The map is keyed on the span ID, which is deterministically unique.
 	//
 	// In normal operation, a local root Span is inserted on creation and
@@ -179,6 +161,8 @@ type Tracer struct {
 	TracingVerbosityIndependentSemanticsIsActive func() bool
 
 	includeAsyncSpansInRecordings bool // see TestingIncludeAsyncSpansInRecordings
+
+	testing *testingKnob
 }
 
 // NewTracer creates a Tracer. It initially tries to run with minimal overhead
@@ -198,11 +182,12 @@ func NewTracer() *Tracer {
 // it updated if they change).
 func (t *Tracer) Configure(sv *settings.Values) {
 	reconfigure := func() {
-		atomic.StoreInt32(&t._mode, int32(tracingMode.Get(sv)))
 		if lsToken := lightstepToken.Get(sv); lsToken != "" {
 			t.setShadowTracer(createLightStepTracer(lsToken))
-		} else if zipkinAddr := zipkinCollector.Get(sv); zipkinAddr != "" {
+		} else if zipkinAddr := ZipkinCollector.Get(sv); zipkinAddr != "" {
 			t.setShadowTracer(createZipkinTracer(zipkinAddr))
+		} else if ddAddr := dataDogAgentAddr.Get(sv); ddAddr != "" {
+			t.setShadowTracer(createDataDogTracer(ddAddr, dataDogProjectName.Get(sv)))
 		} else {
 			t.setShadowTracer(nil, nil)
 		}
@@ -217,7 +202,15 @@ func (t *Tracer) Configure(sv *settings.Values) {
 
 	enableNetTrace.SetOnChange(sv, reconfigure)
 	lightstepToken.SetOnChange(sv, reconfigure)
-	zipkinCollector.SetOnChange(sv, reconfigure)
+	ZipkinCollector.SetOnChange(sv, reconfigure)
+	dataDogAgentAddr.SetOnChange(sv, reconfigure)
+	dataDogProjectName.SetOnChange(sv, reconfigure)
+}
+
+// HasExternalSink returns whether the tracer is configured to report
+// to an external tracing collector.
+func (t *Tracer) HasExternalSink() bool {
+	return t.getShadowTracer() != nil || t.useNetTrace()
 }
 
 func (t *Tracer) useNetTrace() bool {
@@ -232,7 +225,7 @@ func (t *Tracer) Close() {
 
 func (t *Tracer) setShadowTracer(manager shadowTracerManager, tr opentracing.Tracer) {
 	var shadow *shadowTracer
-	if manager != nil {
+	if manager != nil && tr != nil {
 		shadow = &shadowTracer{
 			Tracer:  tr,
 			manager: manager,
@@ -272,10 +265,6 @@ func (t *Tracer) StartSpanCtx(
 	return t.startSpanGeneric(ctx, operationName, opts)
 }
 
-func (t *Tracer) mode() mode {
-	return mode(atomic.LoadInt32(&t._mode))
-}
-
 // AlwaysTrace returns true if operations should be traced regardless of the
 // context.
 func (t *Tracer) AlwaysTrace() bool {
@@ -299,9 +288,6 @@ func (t *Tracer) startSpanGeneric(
 		}
 	}
 
-	if t.mode() == modeBackground {
-		opts.ForceRealSpan = true
-	}
 	if opts.LogTags == nil {
 		opts.LogTags = logtags.FromContext(ctx)
 	}
@@ -356,7 +342,7 @@ func (t *Tracer) startSpanGeneric(
 	var netTr trace.Trace
 	if t.useNetTrace() {
 		netTr = trace.New("tracing", opName)
-		netTr.SetMaxEvents(maxLogsPerSpan)
+		netTr.SetMaxEvents(maxLogsPerSpanExternal)
 
 		// If LogTags are given, pass them as tags to the shadow span.
 		// Regular tags are populated later, via the top-level Span.
@@ -402,8 +388,10 @@ func (t *Tracer) startSpanGeneric(
 		mu: crdbSpanMu{
 			duration: -1, // unfinished
 		},
+		testing: t.testing,
 	}
-	helper.crdbSpan.mu.structured.Reserve(maxStructuredEventsPerSpan)
+	helper.crdbSpan.mu.recording.logs = newSizeLimitedBuffer(maxLogBytesPerSpan)
+	helper.crdbSpan.mu.recording.structured = newSizeLimitedBuffer(maxStructuredBytesPerSpan)
 	helper.span.i = spanInner{
 		tracer: t,
 		crdb:   &helper.crdbSpan,
@@ -447,13 +435,25 @@ func (t *Tracer) startSpanGeneric(
 			opts.Parent.i.crdb.mu.Unlock()
 		}
 	} else {
-		if !opts.BypassRegistry {
-			// Local root span - put it into the registry of active local root
-			// spans. `Span.Finish` takes care of deleting it again.
-			t.activeSpans.Lock()
-			t.activeSpans.m[spanID] = s
-			t.activeSpans.Unlock()
+		// Local root span - put it into the registry of active local root
+		// spans. `Span.Finish` takes care of deleting it again.
+		t.activeSpans.Lock()
+
+		// Ensure that the registry does not grow unboundedly in case there
+		// is a leak. When the registry reaches max size, each new span added
+		// kicks out some old span. We rely on map iteration order here to
+		// make this cheap.
+		if toDelete := len(t.activeSpans.m) - maxSpanRegistrySize + 1; toDelete > 0 {
+			for k := range t.activeSpans.m {
+				delete(t.activeSpans.m, k)
+				toDelete--
+				if toDelete <= 0 {
+					break
+				}
+			}
 		}
+		t.activeSpans.m[spanID] = s
+		t.activeSpans.Unlock()
 
 		if opts.RemoteParent != nil {
 			for k, v := range opts.RemoteParent.Baggage {

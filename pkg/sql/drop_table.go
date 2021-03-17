@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -133,6 +134,7 @@ func (n *dropTableNode) startExec(params runParams) error {
 			droppedDesc,
 			false, /* droppingDatabase */
 			tree.AsStringWithFQNames(n.n, params.Ann()),
+			n.n.DropBehavior,
 		)
 		if err != nil {
 			return err
@@ -270,7 +272,11 @@ func (p *planner) removeInterleave(ctx context.Context, ref descpb.ForeignKeyRef
 // dropped due to `cascade` behavior. droppingParent indicates whether this
 // table's parent (either database or schema) is being dropped
 func (p *planner) dropTableImpl(
-	ctx context.Context, tableDesc *tabledesc.Mutable, droppingParent bool, jobDesc string,
+	ctx context.Context,
+	tableDesc *tabledesc.Mutable,
+	droppingParent bool,
+	jobDesc string,
+	behavior tree.DropBehavior,
 ) ([]string, error) {
 	var droppedViews []string
 
@@ -322,7 +328,7 @@ func (p *planner) dropTableImpl(
 
 	// Drop sequences that the columns of the table own.
 	for _, col := range tableDesc.Columns {
-		if err := p.dropSequencesOwnedByCol(ctx, &col, !droppingParent); err != nil {
+		if err := p.dropSequencesOwnedByCol(ctx, &col, !droppingParent, behavior); err != nil {
 			return droppedViews, err
 		}
 	}
@@ -333,7 +339,7 @@ func (p *planner) dropTableImpl(
 	dependedOnBy := append([]descpb.TableDescriptor_Reference(nil), tableDesc.DependedOnBy...)
 	for _, ref := range dependedOnBy {
 		viewDesc, err := p.getViewDescForCascade(
-			ctx, tableDesc.TypeName(), tableDesc.Name, tableDesc.ParentID, ref.ID, tree.DropCascade,
+			ctx, string(tableDesc.DescriptorType()), tableDesc.Name, tableDesc.ParentID, ref.ID, tree.DropCascade,
 		)
 		if err != nil {
 			return droppedViews, err
@@ -465,7 +471,7 @@ func (p *planner) initiateDropTable(
 	// Also, changes made here do not affect schema change jobs created in this
 	// transaction with no mutation ID; they remain in the cache, and will be
 	// updated when writing the job record to drop the table.
-	jobIDs := make(map[int64]struct{})
+	jobIDs := make(map[jobspb.JobID]struct{})
 	var id descpb.MutationID
 	for _, m := range tableDesc.Mutations {
 		if id != m.MutationID {

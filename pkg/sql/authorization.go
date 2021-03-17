@@ -130,7 +130,7 @@ func (p *planner) CheckPrivilegeForUser(
 	}
 	return pgerror.Newf(pgcode.InsufficientPrivilege,
 		"user %s does not have %s privilege on %s %s",
-		user, privilege, descriptor.TypeName(), descriptor.GetName())
+		user, privilege, descriptor.DescriptorType(), descriptor.GetName())
 }
 
 // CheckPrivilege implements the AuthorizationAccessor interface.
@@ -233,7 +233,7 @@ func (p *planner) CheckAnyPrivilege(ctx context.Context, descriptor catalog.Desc
 
 	return pgerror.Newf(pgcode.InsufficientPrivilege,
 		"user %s has no privileges on %s %s",
-		p.SessionData().User(), descriptor.TypeName(), descriptor.GetName())
+		p.SessionData().User(), descriptor.DescriptorType(), descriptor.GetName())
 }
 
 // UserHasAdminRole implements the AuthorizationAccessor interface.
@@ -385,14 +385,16 @@ func (p *planner) resolveMemberOfWithAdminOption(
 		}
 		visited[m] = struct{}{}
 
-		rows, err := p.ExecCfg().InternalExecutor.Query(
+		it, err := p.ExecCfg().InternalExecutor.QueryIterator(
 			ctx, "expand-roles", txn, lookupRolesStmt, m.Normalized(),
 		)
 		if err != nil {
 			return nil, err
 		}
 
-		for _, row := range rows {
+		var ok bool
+		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+			row := it.Cur()
 			roleName := tree.MustBeDString(row[0])
 			isAdmin := row[1].(*tree.DBool)
 
@@ -402,6 +404,9 @@ func (p *planner) resolveMemberOfWithAdminOption(
 
 			// We need to expand this role. Let the "pop" worry about already-visited elements.
 			toVisit = append(toVisit, role)
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -431,7 +436,7 @@ func (p *planner) HasRoleOption(ctx context.Context, roleOption roleoption.Optio
 		return true, nil
 	}
 
-	hasRolePrivilege, err := p.ExecCfg().InternalExecutor.QueryEx(
+	hasRolePrivilege, err := p.ExecCfg().InternalExecutor.QueryRowEx(
 		ctx, "has-role-option", p.Txn(),
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		fmt.Sprintf(
@@ -570,7 +575,7 @@ func (p *planner) checkCanAlterToNewOwner(
 	ctx context.Context, desc catalog.MutableDescriptor, newOwner security.SQLUsername,
 ) error {
 	// Make sure the newOwner exists.
-	roleExists, err := p.RoleExists(ctx, newOwner)
+	roleExists, err := RoleExists(ctx, p.ExecCfg(), p.Txn(), newOwner)
 	if err != nil {
 		return err
 	}

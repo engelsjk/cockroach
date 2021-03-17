@@ -183,7 +183,7 @@ type Collection struct {
 	//
 	// TODO(ajwerner): This cache may be problematic in clusters with very large
 	// numbers of descriptors.
-	allDescriptors []catalog.Descriptor
+	allDescriptors allDescriptors
 
 	// allDatabaseDescriptors is a slice of all available database descriptors.
 	// These are purged at the same time as allDescriptors.
@@ -217,13 +217,54 @@ type Collection struct {
 	// a mutable descriptor by name or ID when a matching synthetic descriptor
 	// exists is illegal.
 	syntheticDescriptors []catalog.Descriptor
+
+	// skipValidationOnWrite should only be set to true during forced descriptor
+	// repairs.
+	skipValidationOnWrite bool
+}
+
+// allDescriptors is an abstraction to capture the complete set of descriptors
+// read from the store. It is used to accelerate repeated invocations of virtual
+// tables which utilize descriptors. It tends to get used to build a
+// sql.internalLookupCtx.
+//
+// TODO(ajwerner): Memory monitoring.
+// TODO(ajwerner): Unify this struct with the uncommittedDescriptors set.
+// TODO(ajwerner): Unify the sql.internalLookupCtx with the descs.Collection.
+type allDescriptors struct {
+	descs []catalog.Descriptor
+	byID  map[descpb.ID]int
+}
+
+func (d *allDescriptors) init(descriptors []catalog.Descriptor) {
+	d.descs = descriptors
+	d.byID = make(map[descpb.ID]int, len(descriptors))
+	for i, desc := range descriptors {
+		d.byID[desc.GetID()] = i
+	}
+}
+
+func (d *allDescriptors) clear() {
+	d.descs = nil
+	d.byID = nil
+}
+
+func (d *allDescriptors) isEmpty() bool {
+	return d.descs == nil
+}
+
+func (d *allDescriptors) contains(id descpb.ID) bool {
+	_, exists := d.byID[id]
+	return exists
 }
 
 // getLeasedDescriptorByName return a leased descriptor valid for the
-// transaction, acquiring one if necessary.
+// transaction, acquiring one if necessary. Due to a bug in lease acquisition
+// for dropped descriptors, the descriptor may have to be read from the store,
+// in which case shouldReadFromStore will be true.
 func (tc *Collection) getLeasedDescriptorByName(
 	ctx context.Context, txn *kv.Txn, parentID descpb.ID, parentSchemaID descpb.ID, name string,
-) (desc catalog.Descriptor, err error) {
+) (desc catalog.Descriptor, shouldReadFromStore bool, err error) {
 	// First, look to see if we already have the descriptor.
 	// This ensures that, once a SQL transaction resolved name N to id X, it will
 	// continue to use N to refer to X even if N is renamed during the
@@ -232,15 +273,22 @@ func (tc *Collection) getLeasedDescriptorByName(
 		if log.V(2) {
 			log.Eventf(ctx, "found descriptor in collection for '%s'", name)
 		}
-		return desc, nil
+		return desc, false, nil
 	}
 
 	readTimestamp := txn.ReadTimestamp()
 	desc, expiration, err := tc.leaseMgr.AcquireByName(ctx, readTimestamp, parentID, parentSchemaID, name)
 	if err != nil {
+		// Read the descriptor from the store in the face of some specific errors
+		// because of a known limitation of AcquireByName. See the known
+		// limitations of AcquireByName for details.
+		if catalog.HasInactiveDescriptorError(err) ||
+			errors.Is(err, catalog.ErrDescriptorNotFound) {
+			return nil, true, nil
+		}
 		// Lease acquisition failed with some other error. This we don't
 		// know how to deal with, so propagate the error.
-		return nil, err
+		return nil, false, err
 	}
 
 	if expiration.LessEq(readTimestamp) {
@@ -257,7 +305,7 @@ func (tc *Collection) getLeasedDescriptorByName(
 	// timestamp, so we need to set a deadline on the transaction to prevent it
 	// from committing beyond the version's expiration time.
 	txn.UpdateDeadlineMaybe(ctx, expiration)
-	return desc, nil
+	return desc, false, nil
 }
 
 // getLeasedDescriptorByID return a leased descriptor valid for the transaction,
@@ -309,7 +357,8 @@ func (tc *Collection) getDescriptorFromStore(
 ) (found bool, desc catalog.Descriptor, err error) {
 	// Bypass the namespace lookup from the store for system tables.
 	descID := bootstrap.LookupSystemTableDescriptorID(ctx, tc.settings, tc.codec(), parentID, name)
-	if descID == descpb.InvalidID {
+	isSystemDescriptor := descID != descpb.InvalidID
+	if !isSystemDescriptor {
 		var found bool
 		var err error
 		found, descID, err = catalogkv.LookupObjectID(ctx, txn, codec, parentID, parentSchemaID, name)
@@ -318,9 +367,13 @@ func (tc *Collection) getDescriptorFromStore(
 		}
 	}
 	// Always pick up a mutable copy so it can be cached.
-	desc, err = catalogkv.GetAnyDescriptorByID(ctx, txn, codec, descID, catalogkv.Mutable)
+	desc, err = catalogkv.GetMutableDescriptorByID(ctx, txn, codec, descID)
 	if err != nil {
 		return false, nil, err
+	} else if desc == nil && isSystemDescriptor {
+		// This can happen during startup because we're not actually looking up the
+		// system descriptor IDs in KV.
+		return false, nil, errors.Wrapf(catalog.ErrDescriptorNotFound, "descriptor %d not found", descID)
 	} else if desc == nil {
 		// Having done the namespace lookup, the descriptor must exist.
 		return false, nil, errors.AssertionFailedf("descriptor %d not found", descID)
@@ -379,8 +432,7 @@ func (tc *Collection) getDatabaseByName(
 		// that callers of this method will check the privileges on the descriptor
 		// (like any other database) and return an error.
 		if mutable {
-			return true, dbdesc.NewExistingMutable(
-				*systemschema.MakeSystemDatabaseDesc().DatabaseDesc()), nil
+			return true, dbdesc.NewBuilder(systemschema.MakeSystemDatabaseDesc().DatabaseDesc()).BuildExistingMutableDatabase(), nil
 		}
 		return true, systemschema.MakeSystemDatabaseDesc(), nil
 	}
@@ -400,14 +452,14 @@ func (tc *Collection) getDatabaseByName(
 				ctx, txn, tc.codec(), keys.RootNamespaceID, keys.RootNamespaceID, name, mutable)
 		}
 
-		desc, err := tc.getLeasedDescriptorByName(
+		desc, shouldReadFromStore, err := tc.getLeasedDescriptorByName(
 			ctx, txn, keys.RootNamespaceID, keys.RootNamespaceID, name)
 		if err != nil {
-			if errors.Is(err, catalog.ErrDescriptorNotFound) ||
-				errors.Is(err, catalog.ErrDescriptorDropped) {
-				err = nil
-			}
 			return false, nil, err
+		}
+		if shouldReadFromStore {
+			return tc.getDescriptorFromStore(
+				ctx, txn, tc.codec(), keys.RootNamespaceID, keys.RootNamespaceID, name, mutable)
 		}
 		return true, desc, nil
 	}
@@ -502,14 +554,14 @@ func (tc *Collection) getObjectByName(
 			ctx, txn, tc.codec(), dbID, schemaID, objectName, mutable)
 	}
 
-	desc, err := tc.getLeasedDescriptorByName(
+	desc, shouldReadFromStore, err := tc.getLeasedDescriptorByName(
 		ctx, txn, dbID, schemaID, objectName)
 	if err != nil {
-		if errors.Is(err, catalog.ErrDescriptorNotFound) ||
-			errors.Is(err, catalog.ErrDescriptorDropped) {
-			err = nil
-		}
 		return false, nil, err
+	}
+	if shouldReadFromStore {
+		return tc.getDescriptorFromStore(
+			ctx, txn, tc.codec(), dbID, schemaID, objectName, mutable)
 	}
 	return true, desc, nil
 }
@@ -953,6 +1005,12 @@ func (tc *Collection) getDescriptorByID(
 		ctx, txn, id, flags, mutable, false /* setTxnDeadline */)
 }
 
+// SkipValidationOnWrite avoids validating uncommitted descriptors prior to
+// a transaction commit.
+func (tc *Collection) SkipValidationOnWrite() {
+	tc.skipValidationOnWrite = true
+}
+
 // getDescriptorByIDMaybeSetTxnDeadline returns a descriptor according to the
 // provided lookup flags. Note that flags.Required is ignored, and an error is
 // always returned if no descriptor with the ID exists.
@@ -963,6 +1021,23 @@ func (tc *Collection) getDescriptorByIDMaybeSetTxnDeadline(
 	flags tree.CommonLookupFlags,
 	mutable, setTxnDeadline bool,
 ) (catalog.Descriptor, error) {
+	readFromStore := func() (catalog.Descriptor, error) {
+		// Always pick up a mutable copy so it can be cached.
+		// TODO (lucy): If the descriptor doesn't exist, should we generate our
+		// own error here instead of using the one from catalogkv?
+		desc, err := catalogkv.MustGetMutableDescriptorByID(ctx, txn, tc.codec(), id)
+		if err != nil {
+			return nil, err
+		}
+		ud, err := tc.addUncommittedDescriptor(desc)
+		if err != nil {
+			return nil, err
+		}
+		if !mutable {
+			return ud.immutable, nil
+		}
+		return desc, nil
+	}
 	getDescriptorByID := func() (catalog.Descriptor, error) {
 		if found, sd := tc.getSyntheticDescriptorByID(id); found {
 			if mutable {
@@ -979,26 +1054,23 @@ func (tc *Collection) getDescriptorByIDMaybeSetTxnDeadline(
 		}
 
 		if flags.AvoidCached || mutable || lease.TestingTableLeasesAreDisabled() {
-			// Always pick up a mutable copy so it can be cached.
-			// TODO (lucy): If the descriptor doesn't exist, should we generate our
-			// own error here instead of using the one from catalogkv?
-			desc, err := catalogkv.GetDescriptorByID(ctx, txn, tc.codec(), id,
-				catalogkv.Mutable, catalogkv.AnyDescriptorKind, true /* required */)
-			if err != nil {
-				return nil, err
-			}
-			ud, err := tc.addUncommittedDescriptor(desc.(catalog.MutableDescriptor))
-			if err != nil {
-				return nil, err
-			}
-			if !mutable {
-				desc = ud.immutable
-			}
-			return desc, nil
+			return readFromStore()
+		}
+
+		// If we have already read all of the descriptor, use it as a negative
+		// cache to short-circuit a lookup we know will be doomed to fail.
+		//
+		// TODO(ajwerner): More generally leverage this set of read descriptors on
+		// the resolution path.
+		if !tc.allDescriptors.isEmpty() && !tc.allDescriptors.contains(id) {
+			return nil, catalog.ErrDescriptorNotFound
 		}
 
 		desc, err := tc.getLeasedDescriptorByID(ctx, txn, id, setTxnDeadline)
 		if err != nil {
+			if errors.Is(err, catalog.ErrDescriptorNotFound) || catalog.HasInactiveDescriptorError(err) {
+				return readFromStore()
+			}
 			return nil, err
 		}
 		return desc, nil
@@ -1070,6 +1142,16 @@ func (tc *Collection) GetMutableDescriptorByIDWithFlags(
 		return nil, err
 	}
 	return desc.(catalog.MutableDescriptor), nil
+}
+
+// GetImmutableDescriptorByID returns an immmutable implementation of the
+// descriptor with the requested id. An error is returned if no descriptor exists.
+// Deprecated in favor of GetMutableDescriptorByIDWithFlags.
+func (tc *Collection) GetImmutableDescriptorByID(
+	ctx context.Context, txn *kv.Txn, id descpb.ID, flags tree.CommonLookupFlags,
+) (catalog.Descriptor, error) {
+	log.VEventf(ctx, 2, "planner getting immutable descriptor for id %d", id)
+	return tc.getDescriptorByID(ctx, txn, id, flags, false /* mutable */)
 }
 
 // GetMutableSchemaByID returns a ResolvedSchema wrapping a mutable
@@ -1233,7 +1315,10 @@ func (tc *Collection) hydrateTypesInTableDesc(
 		if err := typedesc.HydrateTypesInTableDescriptor(ctx, descBase, getType); err != nil {
 			return nil, err
 		}
-		return tabledesc.NewImmutableWithIsUncommittedVersion(*descBase, t.IsUncommittedVersion()), nil
+		if t.IsUncommittedVersion() {
+			return tabledesc.NewBuilderForUncommittedVersion(descBase).BuildImmutableTable(), nil
+		}
+		return tabledesc.NewBuilder(descBase).BuildImmutableTable(), nil
 	default:
 		return desc, nil
 	}
@@ -1377,8 +1462,8 @@ func (tc *Collection) WriteDescToBatch(
 	ctx context.Context, kvTrace bool, desc catalog.MutableDescriptor, b *kv.Batch,
 ) error {
 	desc.MaybeIncrementVersion()
-	if ValidateOnWriteEnabled.Get(&tc.settings.SV) {
-		if err := desc.ValidateSelf(ctx); err != nil {
+	if !tc.skipValidationOnWrite && ValidateOnWriteEnabled.Get(&tc.settings.SV) {
+		if err := catalog.ValidateSelf(desc); err != nil {
 			return err
 		}
 	}
@@ -1425,41 +1510,25 @@ func (tc *Collection) GetUncommittedTables() (tables []catalog.TableDescriptor) 
 	return tables
 }
 
-type collectionDescGetter struct {
-	tc  *Collection
-	txn *kv.Txn
-}
-
-var _ catalog.DescGetter = collectionDescGetter{}
-
-func (cdg collectionDescGetter) GetDesc(
-	ctx context.Context, id descpb.ID,
-) (catalog.Descriptor, error) {
-	flags := tree.CommonLookupFlags{
-		Required: true,
-		// Include everything, we want to cast the net as wide as we can.
-		IncludeOffline: true,
-		IncludeDropped: true,
-		// Avoid leased descriptors, if we're leasing the previous version then this
-		// older version may be returned and this may cause validation to fail.
-		AvoidCached: true,
-	}
-	return cdg.tc.getDescriptorByID(ctx, cdg.txn, id, flags, false /* mutable */)
-}
-
-// ValidateUncommittedDescriptors validates all uncommitted descriptors
+// ValidateUncommittedDescriptors validates all uncommitted descriptors.
+// Validation includes cross-reference checks. Referenced descriptors are
+// read from the store unless they happen to also be part of the uncommitted
+// descriptor set. We purposefully avoid using leased descriptors as those may
+// be one version behind, in which case it's possible (and legitimate) that
+// those are missing back-references which would cause validation to fail.
 func (tc *Collection) ValidateUncommittedDescriptors(ctx context.Context, txn *kv.Txn) error {
-	if !ValidateOnWriteEnabled.Get(&tc.settings.SV) {
+	if tc.skipValidationOnWrite || !ValidateOnWriteEnabled.Get(&tc.settings.SV) {
 		return nil
 	}
-	cdg := collectionDescGetter{tc: tc, txn: txn}
-	for i, n := 0, len(tc.uncommittedDescriptors); i < n; i++ {
-		desc := tc.uncommittedDescriptors[i].immutable
-		if err := desc.ValidateTxnCommit(ctx, cdg); err != nil {
-			return err
-		}
+	descs := make([]catalog.Descriptor, len(tc.uncommittedDescriptors))
+	for i, ud := range tc.uncommittedDescriptors {
+		descs[i] = ud.immutable
 	}
-	return nil
+	if len(descs) == 0 {
+		return nil
+	}
+	bdg := catalogkv.NewOneLevelUncachedDescGetter(txn, tc.codec())
+	return catalog.Validate(ctx, bdg, catalog.ValidationLevelAllPreTxnCommit, descs...).CombinedError()
 }
 
 // User defined type accessors.
@@ -1641,7 +1710,7 @@ func (tc *Collection) getUncommittedDescriptorByID(id descpb.ID) *uncommittedDes
 func (tc *Collection) GetAllDescriptors(
 	ctx context.Context, txn *kv.Txn,
 ) ([]catalog.Descriptor, error) {
-	if tc.allDescriptors == nil {
+	if tc.allDescriptors.isEmpty() {
 		descs, err := catalogkv.GetAllDescriptors(ctx, txn, tc.codec())
 		if err != nil {
 			return nil, err
@@ -1655,9 +1724,9 @@ func (tc *Collection) GetAllDescriptors(
 			log.Errorf(ctx, "%s", err.Error())
 		}
 
-		tc.allDescriptors = descs
+		tc.allDescriptors.init(descs)
 	}
-	return tc.allDescriptors, nil
+	return tc.allDescriptors.descs, nil
 }
 
 // HydrateGivenDescriptors installs type metadata in the types present for all
@@ -1877,7 +1946,7 @@ func (tc *Collection) GetObjectNames(
 // releaseAllDescriptors releases the cached slice of all descriptors
 // held by Collection.
 func (tc *Collection) releaseAllDescriptors() {
-	tc.allDescriptors = nil
+	tc.allDescriptors.clear()
 	tc.allDatabaseDescriptors = nil
 	tc.allSchemasForDatabase = nil
 }

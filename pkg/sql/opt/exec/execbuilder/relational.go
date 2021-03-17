@@ -332,18 +332,14 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	// In test builds, assert that the exec plan output columns match the opt
 	// plan output columns.
 	if util.CrdbTestBuild {
-		// TODO(sumeer): paired inverted joins produce extra columns unknown to the
-		// optimizer.
-		if e.Op() != opt.InvertedJoinOp {
-			optCols := e.Relational().OutputCols
-			var execCols opt.ColSet
-			ep.outputCols.ForEach(func(key, val int) {
-				execCols.Add(opt.ColumnID(key))
-			})
-			if !execCols.Equals(optCols) {
-				return execPlan{}, errors.AssertionFailedf(
-					"exec columns do not match opt columns: expected %v, got %v. op: %T", optCols, execCols, e)
-			}
+		optCols := e.Relational().OutputCols
+		var execCols opt.ColSet
+		ep.outputCols.ForEach(func(key, val int) {
+			execCols.Add(opt.ColumnID(key))
+		})
+		if !execCols.Equals(optCols) {
+			return execPlan{}, errors.AssertionFailedf(
+				"exec columns do not match opt columns: expected %v, got %v. op: %T", optCols, execCols, e)
 		}
 	}
 
@@ -357,9 +353,15 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 			Cost:                float64(e.Cost()),
 		}
 		if scan, ok := e.(*memo.ScanExpr); ok {
-			tableStats, ok := b.mem.GetCachedTableStatistics(scan.Table)
-			if ok {
-				val.TableRowCount = tableStats.RowCount
+			tab := b.mem.Metadata().Table(scan.Table)
+			if tab.StatisticCount() > 0 {
+				// The first stat is the most recent one.
+				stat := tab.Statistic(0)
+				val.TableStatsRowCount = stat.RowCount()
+				if val.TableStatsRowCount == 0 {
+					val.TableStatsRowCount = 1
+				}
+				val.TableStatsCreatedAt = stat.CreatedAt()
 			}
 		}
 		ef.AnnotateNode(ep.root, exec.EstimatedStatsID, &val)
@@ -569,6 +571,7 @@ func (b *Builder) scanParams(
 		Parallelize:       parallelize,
 		Locking:           locking,
 		EstimatedRowCount: rowCount,
+		LocalityOptimized: scan.LocalityOptimized,
 	}, outputMap, nil
 }
 
@@ -597,7 +600,7 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 
 	// Save if we planned a full table/index scan on the builder so that the
 	// planner can be made aware later. We only do this for non-virtual tables.
-	if !tab.IsVirtualTable() && scan.Constraint == nil && scan.InvertedConstraint == nil {
+	if !tab.IsVirtualTable() && scan.Constraint == nil && scan.InvertedConstraint == nil && !scan.HardLimit.IsSet() {
 		if scan.Index == cat.PrimaryIndex {
 			b.ContainsFullTableScan = true
 		} else {
@@ -1314,7 +1317,7 @@ func (b *Builder) buildSetOp(set memo.RelExpr) (execPlan, error) {
 	switch set.Op() {
 	case opt.UnionOp:
 		typ, all = tree.UnionOp, false
-	case opt.UnionAllOp:
+	case opt.UnionAllOp, opt.LocalityOptimizedSearchOp:
 		typ, all = tree.UnionOp, true
 	case opt.IntersectOp:
 		typ, all = tree.IntersectOp, false
@@ -1328,7 +1331,21 @@ func (b *Builder) buildSetOp(set memo.RelExpr) (execPlan, error) {
 		panic(errors.AssertionFailedf("invalid operator %s", log.Safe(set.Op())))
 	}
 
-	node, err := b.factory.ConstructSetOp(typ, all, left.root, right.root)
+	hardLimit := uint64(0)
+	if set.Op() == opt.LocalityOptimizedSearchOp {
+		// If we are performing locality optimized search, set a limit equal to
+		// the maximum possible number of rows. This will tell the execution engine
+		// not to execute the right child if the limit is reached by the left
+		// child.
+		// TODO(rytaft): Store the limit in the expression.
+		hardLimit = uint64(set.Relational().Cardinality.Max)
+		if hardLimit > 1 {
+			panic(errors.AssertionFailedf(
+				"locality optimized search is not yet supported for more than one row at a time",
+			))
+		}
+	}
+	node, err := b.factory.ConstructSetOp(typ, all, left.root, right.root, hardLimit)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -2196,7 +2213,7 @@ func (b *Builder) buildSequenceSelect(seqSel *memo.SequenceSelectExpr) (execPlan
 func (b *Builder) applySaveTable(
 	input execPlan, e memo.RelExpr, saveTableName string,
 ) (execPlan, error) {
-	name := tree.NewTableName(tree.Name(opt.SaveTablesDatabase), tree.Name(saveTableName))
+	name := tree.NewTableNameWithSchema(tree.Name(opt.SaveTablesDatabase), tree.PublicSchemaName, tree.Name(saveTableName))
 
 	// Ensure that the column names are unique and match the names used by the
 	// opttester.

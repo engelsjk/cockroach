@@ -12,10 +12,10 @@ load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 # Load go bazel tools. This gives us access to the go bazel SDK/toolchains.
 http_archive(
     name = "io_bazel_rules_go",
-    sha256 = "81eff5df9077783b18e93d0c7ff990d8ad7a3b8b3ca5b785e1c483aacdb342d7",
+    sha256 = "7c10271940c6bce577d51a075ae77728964db285dac0a46614a7934dc34303e6",
     urls = [
-        "https://mirror.bazel.build/github.com/bazelbuild/rules_go/releases/download/v0.24.9/rules_go-v0.24.9.tar.gz",
-        "https://github.com/bazelbuild/rules_go/releases/download/v0.24.9/rules_go-v0.24.9.tar.gz",
+        "https://mirror.bazel.build/github.com/bazelbuild/rules_go/releases/download/v0.26.0/rules_go-v0.26.0.tar.gz",
+        "https://github.com/bazelbuild/rules_go/releases/download/v0.26.0/rules_go-v0.26.0.tar.gz",
     ],
 )
 
@@ -48,8 +48,8 @@ go_repository(
     name = "org_golang_x_sys",
     build_file_proto_mode = "disable_global",
     importpath = "golang.org/x/sys",
-    sum = "h1:2/QtM1mL37YmcsT8HaDNHDgTqqFVw+zr8UzMiBVLzYU=",
-    version = "v0.0.0-20210217105451-b926d437f341",
+    sum = "h1:70qalHWW1n9yoI8B8zEQxFJO/D6NUWIX8SNmJO+rvNw=",
+    version = "v0.0.0-20210316092937-0b90fd5c4c48",
 )
 
 go_repository(
@@ -133,6 +133,31 @@ load("@com_google_protobuf//:protobuf_deps.bzl", "protobuf_deps")
 
 protobuf_deps()
 
+# Load up the pinned clang toolchain.
+
+http_archive(
+    name = "com_grail_bazel_toolchain",
+    sha256 = "b924b102adc0c3368d38a19bd971cb4fa75362a27bc363d0084b90ca6877d3f0",
+    strip_prefix = "bazel-toolchain-0.5.7",
+    urls = ["https://github.com/grailbio/bazel-toolchain/archive/0.5.7.tar.gz"],
+)
+
+load("@com_grail_bazel_toolchain//toolchain:deps.bzl", "bazel_toolchain_dependencies")
+
+bazel_toolchain_dependencies()
+
+load("@com_grail_bazel_toolchain//toolchain:rules.bzl", "llvm_toolchain")
+
+llvm_toolchain(
+    name = "llvm_toolchain",
+    absolute_paths = True,
+    llvm_version = "10.0.0",
+)
+
+load("@llvm_toolchain//:toolchains.bzl", "llvm_register_toolchains")
+
+llvm_register_toolchains()
+
 # Load up cockroachdb's go dependencies (the ones listed under go.mod). The
 # `DEPS.bzl` file is kept up to date using the `update-repos` Gazelle command
 # (see `make bazel-generate`).
@@ -148,15 +173,15 @@ load("//c-deps:REPOSITORIES.bzl", "c_deps")
 c_deps()
 
 # Load the bazel utility that lets us build C/C++ projects using
-# cmake/make/etc. We point our fork which adds autoconf support
-# (https://github.com/bazelbuild/rules_foreign_cc/pull/432) and BSD support
-# (https://github.com/bazelbuild/rules_foreign_cc/pull/387).
+# cmake/make/etc. We point to our fork which adds BSD support
+# (https://github.com/bazelbuild/rules_foreign_cc/pull/387) and sysroot
+# support (https://github.com/bazelbuild/rules_foreign_cc/pull/532).
 #
 # TODO(irfansharif): Point to an upstream SHA once maintainers pick up the
 # aforementioned PRs.
 git_repository(
     name = "rules_foreign_cc",
-    commit = "8fdca4480f3fa9c084f4a73749a46fa17996beb1",
+    commit = "6127817283221408069d4ae6765f2d8144f09b9f",
     remote = "https://github.com/cockroachdb/rules_foreign_cc",
 )
 

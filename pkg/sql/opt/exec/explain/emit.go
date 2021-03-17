@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/dustin/go-humanize"
 )
@@ -332,7 +333,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 	if stats, ok := n.annotations[exec.ExecutionStatsID]; ok {
 		s := stats.(*exec.ExecutionStats)
 		if len(s.Nodes) > 0 {
-			e.ob.AddNonDeterministicField("cluster nodes", strings.Join(s.Nodes, ", "))
+			e.ob.AddRedactableField(RedactNodes, "cluster nodes", strings.Join(s.Nodes, ", "))
 		}
 		if s.RowCount.HasValue() {
 			e.ob.AddField("actual row count", humanizeutil.Count(s.RowCount.Value()))
@@ -348,15 +349,12 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 	if stats, ok := n.annotations[exec.EstimatedStatsID]; ok {
 		s := stats.(*exec.EstimatedStats)
 
-		// In verbose mode, we show the estimated row count for all nodes (except
-		// Values, where it is redundant). In non-verbose mode, we only show it for
-		// scans (and when it is based on real statistics), where it is most useful
-		// and accurate.
-		if n.op != valuesOp && (e.ob.flags.Verbose || n.op == scanOp) {
+		// Show the estimated row count (except Values, where it is redundant).
+		if n.op != valuesOp {
 			count := uint64(math.Round(s.RowCount))
 			if s.TableStatsAvailable {
-				if n.op == scanOp && s.TableRowCount != 0 {
-					percentage := s.RowCount / s.TableRowCount * 100
+				if n.op == scanOp && s.TableStatsRowCount != 0 {
+					percentage := s.RowCount / float64(s.TableStatsRowCount) * 100
 					// We want to print the percentage in a user-friendly way; we include
 					// decimals depending on how small the value is.
 					var percentageStr string
@@ -371,8 +369,20 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 						percentageStr = "<0.01"
 					}
 
+					var duration string
+					if e.ob.flags.Redact.Has(RedactVolatile) {
+						duration = "<hidden>"
+					} else {
+						timeSinceStats := timeutil.Since(s.TableStatsCreatedAt)
+						if timeSinceStats < 0 {
+							timeSinceStats = 0
+						}
+						duration = humanizeutil.LongDuration(timeSinceStats)
+					}
 					e.ob.AddField("estimated row count", fmt.Sprintf(
-						"%s (%s%% of the table)", humanizeutil.Count(count), percentageStr,
+						"%s (%s%% of the table; stats collected %s ago)",
+						humanizeutil.Count(count), percentageStr,
+						duration,
 					))
 				} else {
 					e.ob.AddField("estimated row count", humanizeutil.Count(count))
@@ -381,10 +391,10 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 				// No stats available.
 				if e.ob.flags.Verbose {
 					e.ob.Attrf("estimated row count", "%s (missing stats)", humanizeutil.Count(count))
-				} else {
+				} else if n.op == scanOp {
 					// In non-verbose mode, don't show the row count (which is not based
-					// on reality); only show a "missing stats" field. Don't show it for
-					// virtual tables though, where we expect no stats.
+					// on reality); only show a "missing stats" field for scans. Don't
+					// show it for virtual tables though, where we expect no stats.
 					if !n.args.(*scanArgs).Table.IsVirtualTable() {
 						e.ob.AddField("missing stats", "")
 					}
@@ -445,6 +455,12 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		ob.Attr("order", colinfo.ColumnOrdering(a.Ordering).String(n.Columns()))
 		if p := a.AlreadyOrderedPrefix; p > 0 {
 			ob.Attr("already ordered", colinfo.ColumnOrdering(a.Ordering[:p]).String(n.Columns()))
+		}
+
+	case setOpOp:
+		a := n.args.(*setOpArgs)
+		if a.HardLimit > 0 {
+			ob.Attr("limit", a.HardLimit)
 		}
 
 	case indexJoinOp:
@@ -655,7 +671,9 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 				"FK check", fmt.Sprintf("%s@%s", fk.ReferencedTable.Name(), fk.ReferencedIndex.Name()),
 			)
 		}
-		e.emitTuples(a.Rows, len(a.Rows[0]))
+		if len(a.Rows) > 0 {
+			e.emitTuples(a.Rows, len(a.Rows[0]))
+		}
 
 	case upsertOp:
 		a := n.args.(*upsertArgs)
@@ -720,7 +738,6 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 
 	case simpleProjectOp,
 		serializingProjectOp,
-		setOpOp,
 		ordinalityOp,
 		max1RowOp,
 		explainOptOp,

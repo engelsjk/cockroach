@@ -262,9 +262,12 @@ type ObjectNameExistingResolver interface {
 }
 
 // QualifiedNameResolver is the helper interface to resolve qualified
-// table names given an ID and the required table kind.
+// table names given an ID and the required table kind, as well as the
+// current database to determine whether or not to include the
+// database in the qualification.
 type QualifiedNameResolver interface {
 	GetQualifiedTableNameByID(ctx context.Context, id int64, requiredType RequiredTableKind) (*TableName, error)
+	CurrentDatabase() string
 }
 
 // NameResolutionResult is an opaque reference returned by LookupObject().
@@ -343,7 +346,8 @@ func ResolveExisting(
 	// This is a naked table name. Use the search path.
 	iter := searchPath.Iter()
 	for next, ok := iter.Next(); ok; next, ok = iter.Next() {
-		if found, objMeta, err := r.LookupObject(ctx, lookupFlags, curDb, next, u.Object()); found || err != nil {
+		if found, objMeta, err := r.LookupObject(ctx, lookupFlags, curDb, next,
+			u.Object()); found || err != nil {
 			if err == nil {
 				namePrefix.CatalogName = Name(curDb)
 				namePrefix.SchemaName = Name(next)

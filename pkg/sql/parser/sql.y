@@ -605,7 +605,7 @@ func (u *sqlSymUnion) objectNamePrefixList() tree.ObjectNamePrefixList {
 // below; search this file for "Keyword category lists".
 
 // Ordinary key words in alphabetical order.
-%token <str> ABORT ACCESS ACTION ADD ADMIN AFFINITY AFTER AGGREGATE
+%token <str> ABORT ACCESS ACTION ADD ADMIN AFTER AGGREGATE
 %token <str> ALL ALTER ALWAYS ANALYSE ANALYZE AND AND_AND ANY ANNOTATE_TYPE ARRAY AS ASC
 %token <str> ASYMMETRIC AT ATTRIBUTE AUTHORIZATION AUTOMATIC AVAILABILITY
 
@@ -635,7 +635,7 @@ func (u *sqlSymUnion) objectNamePrefixList() tree.ObjectNamePrefixList {
 
 %token <str> FAILURE FALSE FAMILY FETCH FETCHVAL FETCHTEXT FETCHVAL_PATH FETCHTEXT_PATH
 %token <str> FILES FILTER
-%token <str> FIRST FLOAT FLOAT4 FLOAT8 FLOORDIV FOLLOWING FOR FORCE_INDEX FOREIGN FROM FULL FUNCTION
+%token <str> FIRST FLOAT FLOAT4 FLOAT8 FLOORDIV FOLLOWING FOR FORCE FORCE_INDEX FOREIGN FROM FULL FUNCTION
 
 %token <str> GENERATED GEOGRAPHY GEOMETRY GEOMETRYM GEOMETRYZ GEOMETRYZM
 %token <str> GEOMETRYCOLLECTION GEOMETRYCOLLECTIONM GEOMETRYCOLLECTIONZ GEOMETRYCOLLECTIONZM
@@ -2431,7 +2431,7 @@ backup_options:
 // %Category: CCL
 // %Text:
 // CREATE SCHEDULE [<description>]
-// FOR BACKUP [<targets>] TO <location...>
+// FOR BACKUP [<targets>] INTO <location...>
 // [WITH <backup_option>[=<value>] [, ...]]
 // RECURRING [crontab|NEVER] [FULL BACKUP <crontab|ALWAYS>]
 // [WITH EXPERIMENTAL SCHEDULE OPTIONS <schedule_option>[= <value>] [, ...] ]
@@ -2639,11 +2639,12 @@ restore_stmt:
       Options: *($8.restoreOptions()),
     }
   }
-| RESTORE targets FROM REPLICATION STREAM FROM string_or_placeholder_opt_list
+| RESTORE targets FROM REPLICATION STREAM FROM string_or_placeholder_opt_list opt_as_of_clause
   {
    $$.val = &tree.StreamIngestion{
      Targets: $2.targetList(),
      From: $7.stringOrPlaceholderOptList(),
+     AsOf: $8.asOfClause(),
    }
   }
 | RESTORE error // SHOW HELP: RESTORE
@@ -4489,7 +4490,7 @@ zone_value:
 // SHOW ROLES, SHOW SCHEMAS, SHOW SEQUENCES, SHOW SESSION, SHOW SESSIONS,
 // SHOW STATISTICS, SHOW SYNTAX, SHOW TABLES, SHOW TRACE, SHOW TRANSACTION,
 // SHOW TRANSACTIONS, SHOW TYPES, SHOW USERS, SHOW LAST QUERY STATISTICS, SHOW SCHEDULES,
-// SHOW LOCALITY
+// SHOW LOCALITY, SHOW ZONE CONFIGURATION
 show_stmt:
   show_backup_stmt          // EXTEND WITH HELP: SHOW BACKUP
 | show_columns_stmt         // EXTEND WITH HELP: SHOW COLUMNS
@@ -4525,7 +4526,7 @@ show_stmt:
 | show_transaction_stmt     // EXTEND WITH HELP: SHOW TRANSACTION
 | show_transactions_stmt    // EXTEND WITH HELP: SHOW TRANSACTIONS
 | show_users_stmt           // EXTEND WITH HELP: SHOW USERS
-| show_zone_stmt
+| show_zone_stmt            // EXTEND WITH HELP: SHOW ZONE CONFIGURATION
 | SHOW error                // SHOW HELP: SHOW
 | show_last_query_stats_stmt
 
@@ -5225,6 +5226,12 @@ show_roles_stmt:
   }
 | SHOW ROLES error // SHOW HELP: SHOW ROLES
 
+// %Help: SHOW ZONE CONFIGURATION - display current zone configuration
+// %Category: Cfg
+// %Text: SHOW ZONE CONFIGURATION FROM [ RANGE | DATABASE | TABLE | INDEX ] <name>
+// SHOW ZONE CONFIGURATION FROM PARTITION OF [ INDEX | TABLE ] <name>
+// SHOW [ALL] ZONE CONFIGURATIONS
+// %SeeAlso: WEBDOCS/show-zone-configurations.html
 show_zone_stmt:
   SHOW ZONE CONFIGURATION from_with_implicit_for_alias RANGE zone_name
   {
@@ -5264,14 +5271,17 @@ show_zone_stmt:
       Partition: tree.Name($6),
     }}
   }
+| SHOW ZONE CONFIGURATION error // SHOW HELP: SHOW ZONE CONFIGURATION
 | SHOW ZONE CONFIGURATIONS
   {
     $$.val = &tree.ShowZoneConfig{}
   }
+| SHOW ZONE CONFIGURATIONS error // SHOW HELP: SHOW ZONE CONFIGURATION
 | SHOW ALL ZONE CONFIGURATIONS
   {
     $$.val = &tree.ShowZoneConfig{}
   }
+| SHOW ALL ZONE CONFIGURATIONS error // SHOW HELP: SHOW ZONE CONFIGURATION
 
 from_with_implicit_for_alias:
   FROM
@@ -7398,6 +7408,25 @@ locality:
       LocalityLevel: tree.LocalityLevelTable,
     }
   }
+| LOCALITY REGIONAL IN region_name
+  {
+    $$.val = &tree.Locality{
+      TableRegion: tree.Name($4),
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| LOCALITY REGIONAL IN PRIMARY REGION
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
+| LOCALITY REGIONAL
+  {
+    $$.val = &tree.Locality{
+      LocalityLevel: tree.LocalityLevelTable,
+    }
+  }
 | LOCALITY REGIONAL BY ROW
   {
     $$.val = &tree.Locality{
@@ -7405,102 +7434,6 @@ locality:
     }
   }
 | LOCALITY REGIONAL BY ROW AS name
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelRow,
-      RegionalByRowColumn: tree.Name($6),
-    }
-  }
-| REGIONAL AFFINITY TO NONE
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelGlobal,
-    }
-  }
-| REGIONAL AFFINITY TO region_name
-  {
-    $$.val = &tree.Locality{
-      TableRegion: tree.Name($4),
-      LocalityLevel: tree.LocalityLevelTable,
-    }
-  }
-| REGIONAL AFFINITY TO PRIMARY REGION
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelTable,
-    }
-  }
-| REGIONAL AFFINITY AT ROW LEVEL
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelRow,
-    }
-  }
-|  REGIONAL AFFINITY AT ROW LEVEL AS name
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelRow,
-      RegionalByRowColumn: tree.Name($7),
-    }
-  }
-| REGIONAL AFFINITY NONE
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelGlobal,
-    }
-  }
-| REGIONAL AFFINITY region_name
-  {
-    $$.val = &tree.Locality{
-      TableRegion: tree.Name($3),
-      LocalityLevel: tree.LocalityLevelTable,
-    }
-  }
-| REGIONAL AFFINITY PRIMARY REGION
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelTable,
-    }
-  }
-| REGIONAL AFFINITY ROW LEVEL
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelRow,
-    }
-  }
-| REGIONAL AFFINITY ROW LEVEL AS name
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelRow,
-      RegionalByRowColumn: tree.Name($6),
-    }
-  }
-| NO REGIONAL AFFINITY
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelGlobal,
-    }
-  }
-| TABLE LEVEL REGIONAL AFFINITY TO region_name
-  {
-    $$.val = &tree.Locality{
-      TableRegion: tree.Name($6),
-      LocalityLevel: tree.LocalityLevelTable,
-    }
-  }
-| TABLE LEVEL REGIONAL AFFINITY TO PRIMARY REGION
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelTable,
-    }
-  }
-| ROW LEVEL REGIONAL AFFINITY
-  {
-    $$.val = &tree.Locality{
-      LocalityLevel: tree.LocalityLevelRow,
-    }
-  }
-| ROW LEVEL REGIONAL AFFINITY AS name
   {
     $$.val = &tree.Locality{
       LocalityLevel: tree.LocalityLevelRow,
@@ -7748,7 +7681,7 @@ resume_jobs_stmt:
 // RESUME SCHEDULES <selectclause>
 //  selectclause: select statement returning schedule IDs to resume.
 //
-// RESUME SCHEDULES <jobid>
+// RESUME SCHEDULE <scheduleID>
 //
 // %SeeAlso: PAUSE SCHEDULES, SHOW JOBS, RESUME JOBS
 resume_schedules_stmt:
@@ -7777,7 +7710,7 @@ resume_schedules_stmt:
 // DROP SCHEDULES <selectclause>
 //  selectclause: select statement returning schedule IDs to resume.
 //
-// DROP SCHEDULE <scheduleid>
+// DROP SCHEDULE <scheduleID>
 //
 // %SeeAlso: PAUSE SCHEDULES, SHOW JOBS, CANCEL JOBS
 drop_schedule_stmt:
@@ -12322,7 +12255,6 @@ unreserved_keyword:
 | ACCESS
 | ADD
 | ADMIN
-| AFFINITY
 | AFTER
 | AGGREGATE
 | ALTER
@@ -12412,6 +12344,7 @@ unreserved_keyword:
 | FILTER
 | FIRST
 | FOLLOWING
+| FORCE
 | FORCE_INDEX
 | FUNCTION
 | GENERATED

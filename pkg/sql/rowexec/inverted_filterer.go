@@ -101,7 +101,7 @@ func newInvertedFilterer(
 		ifr, post, outputColTypes, flowCtx, processorID, output, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ifr.input},
-			TrailingMetaCallback: func(ctx context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				ifr.close()
 				return nil
 			},
@@ -113,7 +113,7 @@ func newInvertedFilterer(
 	ctx := flowCtx.EvalCtx.Ctx()
 	// Initialize memory monitor and row container for input rows.
 	ifr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx.Cfg, "inverter-filterer-limited")
-	ifr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.Cfg.DiskMonitor, "inverted-filterer-disk")
+	ifr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, "inverted-filterer-disk")
 	ifr.rc = rowcontainer.NewDiskBackedNumberedRowContainer(
 		true, /* deDup */
 		rcColTypes,
@@ -288,12 +288,8 @@ func (ifr *invertedFilterer) emitRow() (
 
 // Start is part of the RowSource interface.
 func (ifr *invertedFilterer) Start(ctx context.Context) {
-	ifr.input.Start(ctx)
 	ctx = ifr.StartInternal(ctx, invertedFiltererProcName)
-	// Go around "this value of ctx is never used" linter error. We do it this
-	// way instead of omitting the assignment to ctx above so that if in the
-	// future other initialization is added, the correct ctx is used.
-	_ = ctx
+	ifr.input.Start(ctx)
 	ifr.runningState = ifrReadingInput
 }
 

@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
+	"github.com/cockroachdb/cockroach/pkg/ccl/testutilsccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -33,43 +35,127 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// REGIONAL BY ROW tests are defined in multiregionccl as REGIONAL BY ROW
-// requires CCL to operate.
+// TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill tests that
+// the zone configurations are properly set up before the LOCALITY REGIONAL BY ROW
+// backfill begins.
+func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-// createTestMultiRegionCluster creates a test cluster with numServers number of
-// nodes with the provided testing knobs applied to each of the nodes. Every
-// node is placed in its own locality, named "us-east1", "us-east2", and so on.
-func createTestMultiRegionCluster(
-	t *testing.T, numServers int, knobs base.TestingKnobs,
-) (serverutils.TestClusterInterface, *gosql.DB, func()) {
-	serverArgs := make(map[int]base.TestServerArgs)
-	regionNames := make([]string, numServers)
-	for i := 0; i < numServers; i++ {
-		// "us-east1", "us-east2"...
-		regionNames[i] = fmt.Sprintf("us-east%d", i+1)
-	}
-
-	for i := 0; i < numServers; i++ {
-		serverArgs[i] = base.TestServerArgs{
-			Knobs: knobs,
-			Locality: roachpb.Locality{
-				Tiers: []roachpb.Tier{{Key: "region", Value: regionNames[i]}},
+	testCases := []testutilsccl.AlterPrimaryKeyCorrectZoneConfigTestCase{
+		{
+			Desc:       "REGIONAL BY TABLE to REGIONAL BY ROW",
+			SetupQuery: `CREATE TABLE t.test (k INT NOT NULL, v INT) LOCALITY REGIONAL BY TABLE`,
+			AlterQuery: `ALTER TABLE t.test SET LOCALITY REGIONAL BY ROW`,
+			ExpectedIntermediateZoneConfigs: []testutilsccl.AlterPrimaryKeyCorrectZoneConfigIntermediateZoneConfig{
+				{
+					ShowConfigStatement: `SHOW ZONE CONFIGURATION FOR TABLE t.test`,
+					ExpectedTarget:      `DATABASE t`,
+					ExpectedSQL: `ALTER DATABASE t CONFIGURE ZONE USING
+	range_min_bytes = 134217728,
+	range_max_bytes = 536870912,
+	gc.ttlseconds = 90000,
+	num_replicas = 3,
+	num_voters = 3,
+	constraints = '{+region=ajstorm-1: 1}',
+	voter_constraints = '[+region=ajstorm-1]',
+	lease_preferences = '[[+region=ajstorm-1]]'`,
+				},
+				{
+					ShowConfigStatement: `SHOW ZONE CONFIGURATION FOR PARTITION "ajstorm-1" OF INDEX t.test@new_primary_key`,
+					ExpectedTarget:      `PARTITION "ajstorm-1" OF INDEX t.public.test@new_primary_key`,
+					ExpectedSQL: `ALTER PARTITION "ajstorm-1" OF INDEX t.public.test@new_primary_key CONFIGURE ZONE USING
+	range_min_bytes = 134217728,
+	range_max_bytes = 536870912,
+	gc.ttlseconds = 90000,
+	num_replicas = 3,
+	num_voters = 3,
+	constraints = '{+region=ajstorm-1: 1}',
+	voter_constraints = '[+region=ajstorm-1]',
+	lease_preferences = '[[+region=ajstorm-1]]'`,
+				},
 			},
-		}
+		},
+		{
+			Desc:       "GLOBAL to REGIONAL BY ROW",
+			SetupQuery: `CREATE TABLE t.test (k INT NOT NULL, v INT) LOCALITY GLOBAL`,
+			AlterQuery: `ALTER TABLE t.test SET LOCALITY REGIONAL BY ROW`,
+			ExpectedIntermediateZoneConfigs: []testutilsccl.AlterPrimaryKeyCorrectZoneConfigIntermediateZoneConfig{
+				{
+					ShowConfigStatement: `SHOW ZONE CONFIGURATION FOR TABLE t.test`,
+					ExpectedTarget:      `TABLE t.public.test`,
+					ExpectedSQL: `ALTER TABLE t.public.test CONFIGURE ZONE USING
+	range_min_bytes = 134217728,
+	range_max_bytes = 536870912,
+	gc.ttlseconds = 90000,
+	global_reads = true,
+	num_replicas = 3,
+	num_voters = 3,
+	constraints = '{+region=ajstorm-1: 1}',
+	voter_constraints = '[+region=ajstorm-1]',
+	lease_preferences = '[[+region=ajstorm-1]]'`,
+				},
+				{
+					ShowConfigStatement: `SHOW ZONE CONFIGURATION FOR PARTITION "ajstorm-1" OF INDEX t.test@new_primary_key`,
+					ExpectedTarget:      `PARTITION "ajstorm-1" OF INDEX t.public.test@new_primary_key`,
+					ExpectedSQL: `ALTER PARTITION "ajstorm-1" OF INDEX t.public.test@new_primary_key CONFIGURE ZONE USING
+	range_min_bytes = 134217728,
+	range_max_bytes = 536870912,
+	gc.ttlseconds = 90000,
+	num_replicas = 3,
+	num_voters = 3,
+	constraints = '{+region=ajstorm-1: 1}',
+	voter_constraints = '[+region=ajstorm-1]',
+	lease_preferences = '[[+region=ajstorm-1]]'`,
+				},
+			},
+		},
+		{
+			Desc:       "REGIONAL BY ROW to REGIONAL BY TABLE",
+			SetupQuery: `CREATE TABLE t.test (k INT NOT NULL, v INT) LOCALITY REGIONAL BY ROW`,
+			AlterQuery: `ALTER TABLE t.test SET LOCALITY REGIONAL BY TABLE`,
+			ExpectedIntermediateZoneConfigs: []testutilsccl.AlterPrimaryKeyCorrectZoneConfigIntermediateZoneConfig{
+				{
+					ShowConfigStatement: `SHOW ZONE CONFIGURATION FOR TABLE t.test`,
+					ExpectedTarget:      `DATABASE t`,
+					ExpectedSQL: `ALTER DATABASE t CONFIGURE ZONE USING
+	range_min_bytes = 134217728,
+	range_max_bytes = 536870912,
+	gc.ttlseconds = 90000,
+	num_replicas = 3,
+	num_voters = 3,
+	constraints = '{+region=ajstorm-1: 1}',
+	voter_constraints = '[+region=ajstorm-1]',
+	lease_preferences = '[[+region=ajstorm-1]]'`,
+				},
+			},
+		},
+		{
+			Desc:       "REGIONAL BY ROW to GLOBAL",
+			SetupQuery: `CREATE TABLE t.test (k INT NOT NULL, v INT) LOCALITY REGIONAL BY ROW`,
+			AlterQuery: `ALTER TABLE t.test SET LOCALITY GLOBAL`,
+			ExpectedIntermediateZoneConfigs: []testutilsccl.AlterPrimaryKeyCorrectZoneConfigIntermediateZoneConfig{
+				{
+					ShowConfigStatement: `SHOW ZONE CONFIGURATION FOR TABLE t.test`,
+					ExpectedTarget:      `DATABASE t`,
+					ExpectedSQL: `ALTER DATABASE t CONFIGURE ZONE USING
+	range_min_bytes = 134217728,
+	range_max_bytes = 536870912,
+	gc.ttlseconds = 90000,
+	num_replicas = 3,
+	num_voters = 3,
+	constraints = '{+region=ajstorm-1: 1}',
+	voter_constraints = '[+region=ajstorm-1]',
+	lease_preferences = '[[+region=ajstorm-1]]'`,
+				},
+			},
+		},
 	}
-
-	tc := serverutils.StartNewTestCluster(t, numServers, base.TestClusterArgs{
-		ServerArgsPerNode: serverArgs,
-	})
-
-	ctx := context.Background()
-	cleanup := func() {
-		tc.Stopper().Stop(ctx)
-	}
-
-	sqlDB := tc.ServerConn(0)
-
-	return tc, sqlDB, cleanup
+	testutilsccl.AlterPrimaryKeyCorrectZoneConfigTest(
+		t,
+		`CREATE DATABASE t PRIMARY REGION "ajstorm-1"`,
+		testCases,
+	)
 }
 
 // TestAlterTableLocalityRegionalByRowError tests an alteration involving
@@ -98,7 +184,11 @@ func TestAlterTableLocalityRegionalByRowError(t *testing.T) {
 	ctx := context.Background()
 
 	const showCreateTableStringSQL = `SELECT create_statement FROM [SHOW CREATE TABLE t.test]`
-	const showZoneConfigurationSQL = `SHOW ZONE CONFIGURATION FROM TABLE t.test`
+	const zoneConfigureSQLStatements = `
+		SELECT coalesce(string_agg(raw_config_sql, ';' ORDER BY raw_config_sql), 'NULL')
+		FROM crdb_internal.zones
+		WHERE database_name = 't' AND table_name = 'test'
+	`
 
 	// alterState is a struct that contains an action for a base test case
 	// to execute ALTER TABLE t.test SET LOCALITY <locality> against.
@@ -275,6 +365,15 @@ func TestAlterTableLocalityRegionalByRowError(t *testing.T) {
 							// TTL into the system with AddImmediateGCZoneConfig.
 							defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
 
+							// Drop the closed timestamp target lead for GLOBAL tables.
+							// The test passes with it configured to its default, but it
+							// is very slow due to #61444 (2.5s vs. 35s).
+							// TODO(nvanbenschoten): We can remove this when that issue
+							// is addressed.
+							if _, err := sqlDB.Exec(`SET CLUSTER SETTING kv.closed_timestamp.lead_for_global_reads_override = '5ms'`); err != nil {
+								t.Fatal(err)
+							}
+
 							if _, err := sqlDB.Exec(fmt.Sprintf(`
 CREATE DATABASE t PRIMARY REGION "ajstorm-1";
 USE t;
@@ -300,7 +399,7 @@ USE t;
 							require.Error(t, err)
 							require.Contains(t, err.Error(), errorMode.errorContains)
 
-							// Grab a copy of SHOW CREATE TABLE and SHOW ZONE CONFIGURATION before we run
+							// Grab a copy of SHOW CREATE TABLE and zone configuration data before we run
 							// any ALTER query. The result should match if the operation fails.
 							var originalCreateTableOutput string
 							require.NoError(
@@ -308,10 +407,10 @@ USE t;
 								sqlDB.QueryRow(showCreateTableStringSQL).Scan(&originalCreateTableOutput),
 							)
 
-							var originalTarget, originalZoneConfig string
+							var originalZoneConfig string
 							require.NoError(
 								t,
-								sqlDB.QueryRow(showZoneConfigurationSQL).Scan(&originalTarget, &originalZoneConfig),
+								sqlDB.QueryRow(zoneConfigureSQLStatements).Scan(&originalZoneConfig),
 							)
 
 							// Ensure that the mutations corresponding to the primary key change are cleaned up and
@@ -320,10 +419,10 @@ USE t;
 								tableDesc := catalogkv.TestingGetTableDescriptor(
 									kvDB, keys.SystemSQLCodec, "t", "test",
 								)
-								if len(tableDesc.GetMutations()) != 0 {
+								if len(tableDesc.AllMutations()) != 0 {
 									return errors.Errorf(
 										"expected 0 mutations after cancellation, found %d",
-										len(tableDesc.GetMutations()),
+										len(tableDesc.AllMutations()),
 									)
 								}
 								if tableDesc.GetPrimaryIndex().NumColumns() != len(testCase.originalPKCols) {
@@ -354,16 +453,14 @@ USE t;
 								}
 
 								// Ensure SHOW ZONE CONFIGURATION has not changed.
-								var target, zoneConfig string
+								var zoneConfig string
 								require.NoError(
 									t,
-									sqlDB.QueryRow(showZoneConfigurationSQL).Scan(&target, &zoneConfig),
+									sqlDB.QueryRow(zoneConfigureSQLStatements).Scan(&zoneConfig),
 								)
-								if !(target == originalTarget && zoneConfig == originalZoneConfig) {
+								if zoneConfig != originalZoneConfig {
 									return errors.Errorf(
-										"expected zone configuration to not have changed, got %s/%s, sql %s/%s",
-										originalTarget,
-										target,
+										"expected zone configuration statements to not have changed, got %s, sql %s",
 										originalZoneConfig,
 										zoneConfig,
 									)
@@ -400,8 +497,6 @@ func TestRepartitionFailureRollback(t *testing.T) {
 	// Decrease the adopt loop interval so that retries happen quickly.
 	defer sqltestutils.SetTestJobsAdoptInterval()()
 
-	numServers := 3
-
 	var mu syncutil.Mutex
 	errorReturned := false
 	knobs := base.TestingKnobs{
@@ -417,7 +512,9 @@ func TestRepartitionFailureRollback(t *testing.T) {
 			},
 		},
 	}
-	_, sqlDB, cleanup := createTestMultiRegionCluster(t, numServers, knobs)
+	_, sqlDB, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
+		t, 3 /* numServers */, knobs, nil, /* baseDir */
+	)
 	defer cleanup()
 
 	_, err := sqlDB.Exec(
@@ -428,20 +525,146 @@ CREATE TABLE db.t(k INT PRIMARY KEY) LOCALITY REGIONAL BY ROW`)
 		t.Error(err)
 	}
 
+	// Overriding this operation until we get a fix for #60620. When that fix is
+	// ready, we can construct the view of the zone config as it was at the
+	// beginning of the transaction, and the checks for override should work
+	// again, and we won't require an explicit override here.
 	_, err = sqlDB.Exec(`BEGIN;
+SET override_multi_region_zone_config = true;
 ALTER DATABASE db ADD REGION "us-east3";
 ALTER DATABASE db DROP REGION "us-east2";
+SET override_multi_region_zone_config = false;
 COMMIT;`)
 	require.Error(t, err, "boom")
 
 	// The cleanup job should kick in and revert the changes that happened to the
 	// type descriptor in the user txn. We should eventually be able to add
 	// "us-east3" and remove "us-east2".
+	// Overriding this operation until we get a fix for #60620. When that fix is
+	// ready, we can construct the view of the zone config as it was at the
+	// beginning of the transaction, and the checks for override should work
+	// again, and we won't require an explicit override here.
 	testutils.SucceedsSoon(t, func() error {
 		_, err = sqlDB.Exec(`BEGIN;
+	SET override_multi_region_zone_config = true;
 	ALTER DATABASE db ADD REGION "us-east3";
 	ALTER DATABASE db DROP REGION "us-east2";
+	SET override_multi_region_zone_config = false;
 	COMMIT;`)
 		return err
 	})
+}
+
+// TestIndexCleanupAfterAlterFromRegionalByRow ensures that old indexes for
+// REGIONAL BY ROW transitions get cleaned up correctly.
+func TestIndexCleanupAfterAlterFromRegionalByRow(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Decrease the adopt loop interval so that retries happen quickly.
+	defer sqltestutils.SetTestJobsAdoptInterval()()
+
+	_, sqlDB, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
+		t, 3 /* numServers */, base.TestingKnobs{}, nil, /* baseDir */
+	)
+	defer cleanup()
+
+	_, err := sqlDB.Exec(
+		`CREATE DATABASE "mr-zone-configs" WITH PRIMARY REGION "us-east1" REGIONS "us-east2", "us-east3";
+USE "mr-zone-configs";
+CREATE TABLE regional_by_row (
+  pk INT PRIMARY KEY,
+  i INT,
+  INDEX(i),
+  FAMILY (pk, i)
+) LOCALITY REGIONAL BY ROW`)
+	require.NoError(t, err)
+
+	// Alter the table to REGIONAL BY TABLE, and then back to REGIONAL BY ROW, to
+	// create some indexes that need cleaning up.
+	_, err = sqlDB.Exec(`ALTER TABLE regional_by_row SET LOCALITY REGIONAL BY TABLE;
+ALTER TABLE regional_by_row SET LOCALITY REGIONAL BY ROW`)
+	require.NoError(t, err)
+
+	// Validate that the indexes requiring cleanup exist.
+	type row struct {
+		status  string
+		details string
+	}
+
+	for {
+		// First confirm that the schema change job has completed
+		res := sqlDB.QueryRow(`WITH jobs AS (
+      SELECT status, crdb_internal.pb_to_json(
+			'cockroach.sql.jobs.jobspb.Payload',
+			payload,
+			false
+		) AS job
+		FROM system.jobs
+		)
+    SELECT count(*)
+    FROM jobs
+    WHERE (job->>'schemaChange') IS NOT NULL AND status = 'running'`)
+
+		require.NoError(t, res.Err())
+
+		numJobs := 0
+		err = res.Scan(&numJobs)
+		require.NoError(t, err)
+		if numJobs == 0 {
+			break
+		}
+	}
+
+	queryIndexGCJobsAndValidateCount := func(status string, expectedCount int) error {
+		query := `WITH jobs AS (
+      SELECT status, crdb_internal.pb_to_json(
+			'cockroach.sql.jobs.jobspb.Payload',
+			payload,
+			false
+		) AS job
+		FROM system.jobs
+		)
+    SELECT status, job->'schemaChangeGC' as details
+    FROM jobs
+    WHERE (job->>'schemaChangeGC') IS NOT NULL AND status = '%s'`
+
+		res, err := sqlDB.Query(fmt.Sprintf(query, status))
+		require.NoError(t, err)
+
+		var rows []row
+		for res.Next() {
+			r := row{}
+			err = res.Scan(&r.status, &r.details)
+			require.NoError(t, err)
+			rows = append(rows, r)
+		}
+		actualCount := len(rows)
+		if actualCount != expectedCount {
+			return errors.Newf("expected %d jobs with status %q, found %d. Jobs found: %v",
+				expectedCount,
+				status,
+				actualCount,
+				rows)
+		}
+		return nil
+	}
+
+	// Now check that we have the right number of index GC jobs pending.
+	err = queryIndexGCJobsAndValidateCount(`running`, 4)
+	require.NoError(t, err)
+	err = queryIndexGCJobsAndValidateCount(`succeeded`, 0)
+	require.NoError(t, err)
+
+	// Change gc.ttlseconds to speed up the cleanup.
+	_, err = sqlDB.Exec(`ALTER TABLE regional_by_row CONFIGURE ZONE USING gc.ttlseconds = 1`)
+	require.NoError(t, err)
+
+	// Validate that indexes are cleaned up.
+	queryAndEnsureThatFourIndexGCJobsSucceeded := func() error {
+		return queryIndexGCJobsAndValidateCount(`succeeded`, 4)
+	}
+	testutils.SucceedsSoon(t, queryAndEnsureThatFourIndexGCJobsSucceeded)
+	err = queryIndexGCJobsAndValidateCount(`running`, 0)
+	require.NoError(t, err)
 }

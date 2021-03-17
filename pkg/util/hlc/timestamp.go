@@ -168,7 +168,11 @@ func ParseTimestamp(str string) (_ Timestamp, err error) {
 
 // AsOfSystemTime returns a string to be used in an AS OF SYSTEM TIME query.
 func (t Timestamp) AsOfSystemTime() string {
-	return fmt.Sprintf("%d.%010d", t.WallTime, t.Logical)
+	syn := ""
+	if t.Synthetic {
+		syn = "?"
+	}
+	return fmt.Sprintf("%d.%010d%s", t.WallTime, t.Logical, syn)
 }
 
 // IsEmpty retruns true if t is an empty Timestamp.
@@ -270,6 +274,15 @@ func (t Timestamp) FloorPrev() Timestamp {
 	panic("cannot take the previous value to a zero timestamp")
 }
 
+// WallPrev subtracts 1 from the WallTime and resets Logical.
+func (t Timestamp) WallPrev() Timestamp {
+	return Timestamp{
+		WallTime:  t.WallTime - 1,
+		Logical:   0,
+		Synthetic: t.Synthetic,
+	}
+}
+
 // Forward replaces the receiver with the argument, if that moves it forwards in
 // time. Returns true if the timestamp was adjusted to a larger time and false
 // otherwise.
@@ -361,15 +374,6 @@ func (t Timestamp) TryToClockTimestamp() (ClockTimestamp, bool) {
 // method should only be used in tests.
 func (t Timestamp) UnsafeToClockTimestamp() ClockTimestamp {
 	t.Synthetic = false
-	return ClockTimestamp(t)
-}
-
-// MustToClockTimestamp casts a Timestamp to a ClockTimestamp. Panics if the
-// timestamp is synthetic. See TryToClockTimestamp if you don't want to panic.
-func (t Timestamp) MustToClockTimestamp() ClockTimestamp {
-	if t.Synthetic {
-		panic(fmt.Sprintf("can't convert synthetic timestamp to ClockTimestamp: %s", t))
-	}
 	return ClockTimestamp(t)
 }
 

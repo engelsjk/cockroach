@@ -23,6 +23,8 @@ type SQLStatusServer interface {
 	ListLocalSessions(context.Context, *ListSessionsRequest) (*ListSessionsResponse, error)
 	CancelQuery(context.Context, *CancelQueryRequest) (*CancelQueryResponse, error)
 	CancelSession(context.Context, *CancelSessionRequest) (*CancelSessionResponse, error)
+	ListContentionEvents(context.Context, *ListContentionEventsRequest) (*ListContentionEventsResponse, error)
+	ListLocalContentionEvents(context.Context, *ListContentionEventsRequest) (*ListContentionEventsResponse, error)
 }
 
 // OptionalNodesStatusServer is a StatusServer that is only optionally present
@@ -47,6 +49,7 @@ func MakeOptionalNodesStatusServer(s NodesStatusServer) OptionalNodesStatusServe
 // by the SQL subsystem but is unavailable to tenants.
 type NodesStatusServer interface {
 	Nodes(context.Context, *NodesRequest) (*NodesResponse, error)
+	GenerateJoinToken(context.Context) (string, error)
 }
 
 // OptionalNodesStatusServer returns the wrapped NodesStatusServer, if it is

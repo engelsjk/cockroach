@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
@@ -47,7 +48,7 @@ func TestInsertBeforeOldColumnIsDropped(t *testing.T) {
 	var doOnce sync.Once
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			RunBeforeResume: func(jobID int64) error {
+			RunBeforeResume: func(jobID jobspb.JobID) error {
 				// Block in the job to drop old indexes, which has mutation ID 2.
 				scJob, err := s.JobRegistry().(*jobs.Registry).LoadJob(ctx, jobID)
 				if err != nil {
@@ -122,7 +123,7 @@ func TestInsertBeforeOldColumnIsDroppedUsingExpr(t *testing.T) {
 	var doOnce sync.Once
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			RunBeforeResume: func(jobID int64) error {
+			RunBeforeResume: func(jobID jobspb.JobID) error {
 				// Block in the job to drop old indexes, which has mutation ID 2.
 				scJob, err := s.JobRegistry().(*jobs.Registry).LoadJob(ctx, jobID)
 				if err != nil {
@@ -277,7 +278,7 @@ ALTER TABLE t.test ALTER COLUMN x TYPE INT;
 	// Ensure that the add column and column swap mutations are cleaned up.
 	testutils.SucceedsSoon(t, func() error {
 		desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(desc.GetMutations()) != 0 {
+		if len(desc.AllMutations()) != 0 {
 			return errors.New("expected no mutations on TableDescriptor")
 		}
 		return nil
@@ -403,7 +404,7 @@ ALTER TABLE t.test ALTER COLUMN x TYPE STRING;
 
 	<-childJobStartNotification
 
-	expected := "pq: unimplemented: cannot perform a schema change operation while an ALTER COLUMN TYPE schema change is in progress"
+	expected := `pq: relation "test" \(53\): unimplemented: cannot perform a schema change operation while an ALTER COLUMN TYPE schema change is in progress`
 	sqlDB.ExpectErr(t, expected, `
 ALTER TABLE t.test ADD COLUMN y INT;
 	`)

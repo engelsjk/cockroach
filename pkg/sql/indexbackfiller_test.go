@@ -186,6 +186,7 @@ func queryPairs(t *testing.T, sqlDB *gosql.DB, query string) []pair {
 // and ensures that the data was backfilled properly.
 func TestIndexBackfillerComputedAndGeneratedColumns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// A test case exists to exercise the behavior of an index backfill.
 	// The case gets to do arbitrary things to the table (which is created with
@@ -436,13 +437,13 @@ INSERT INTO foo VALUES (1), (10), (100);
 		// the index backfill.
 		blockChan := make(chan struct{})
 		var jobToBlock atomic.Value
-		jobToBlock.Store(int64(0))
+		jobToBlock.Store(jobspb.InvalidJobID)
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-						RunBeforeResume: func(jobID int64) error {
-							if jobID == jobToBlock.Load().(int64) {
+						RunBeforeResume: func(jobID jobspb.JobID) error {
+							if jobID == jobToBlock.Load().(jobspb.JobID) {
 								<-blockChan
 								return errors.New("boom")
 							}
@@ -506,7 +507,7 @@ INSERT INTO foo VALUES (1), (10), (100);
 				return err
 			}
 			mut.MutationJobs = append(mut.MutationJobs, descpb.TableDescriptor_MutationJob{
-				JobID:      jobID,
+				JobID:      int64(jobID),
 				MutationID: 1,
 			})
 			jobToBlock.Store(jobID)
@@ -522,9 +523,8 @@ INSERT INTO foo VALUES (1), (10), (100);
 			tableID, 1, execCfg.NodeID.SQLInstanceID(), s0.DB(), lm, jr, &execCfg, settings)
 		changer.SetJob(j)
 		spans := []roachpb.Span{table.IndexSpan(keys.SystemSQLCodec, test.indexToBackfill)}
-		require.NoError(t, changer.TestingDistIndexBackfill(
-			ctx, table.GetVersion(), spans, []descpb.IndexID{test.indexToBackfill}, backfill.IndexMutationFilter, 10,
-		))
+		require.NoError(t, changer.TestingDistIndexBackfill(ctx, table.GetVersion(), spans,
+			[]descpb.IndexID{test.indexToBackfill}, backfill.IndexMutationFilter))
 
 		// Make the mutation complete, then read the index and validate that it
 		// has the expected contents.

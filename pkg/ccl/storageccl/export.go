@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -101,13 +102,10 @@ func evalExport(
 	}
 
 	if makeExternalStorage {
-		// TODO(dt): this blanket ban means we must do all uploads from the caller
-		// which is nice and simple but imposes extra copies/overhead/cost. We might
-		// want to instead allow *some* forms of external storage for *some* tenants
-		// e.g. allow some tenants to dial out to s3 directly -- if we do though we
-		// would need to continue to restrict unsafe ones like userfile here.
 		if _, ok := roachpb.TenantFromContext(ctx); ok {
-			return result.Result{}, errors.Errorf("requests on behalf of tenants are not allowed to contact external storage")
+			if args.Storage.Provider == roachpb.ExternalStorageProvider_FileTable {
+				return result.Result{}, errors.Errorf("requests to userfile on behalf of tenants must be made by the tenant's SQL process")
+			}
 		}
 	}
 
@@ -189,8 +187,12 @@ func evalExport(
 		}
 
 		if args.Encryption != nil {
-			// TODO(dt): cluster version gate use EncryptFileChunked.
-			data, err = EncryptFile(data, args.Encryption.Key)
+			// NonVotingReplicas was minted after chunked encryption reader merged.
+			if cArgs.EvalCtx.ClusterSettings().Version.IsActive(ctx, clusterversion.NonVotingReplicas) {
+				data, err = EncryptFileChunked(data, args.Encryption.Key)
+			} else {
+				data, err = EncryptFile(data, args.Encryption.Key)
+			}
 			if err != nil {
 				return result.Result{}, err
 			}

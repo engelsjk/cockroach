@@ -741,7 +741,7 @@ func TestBehaviorDuringLeaseTransfer(t *testing.T) {
 			return nil
 		}
 		transferSem := make(chan struct{})
-		tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
+		tsc.TestingKnobs.EvalKnobs.TestingPostEvalFilter =
 			func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
 				if _, ok := filterArgs.Req.(*roachpb.TransferLeaseRequest); ok {
 					// Notify the test that the transfer has been trapped.
@@ -1919,6 +1919,15 @@ func gcArgs(startKey []byte, endKey []byte, keys ...roachpb.GCRequest_GCKey) roa
 			EndKey: endKey,
 		},
 		Keys: keys,
+	}
+}
+
+func clearRangeArgs(startKey, endKey roachpb.Key) roachpb.ClearRangeRequest {
+	return roachpb.ClearRangeRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key:    startKey,
+			EndKey: endKey,
+		},
 	}
 }
 

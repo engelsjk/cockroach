@@ -138,6 +138,11 @@ const (
 	// plan that could satisfy the hints.
 	hugeCost memo.Cost = 1e100
 
+	// fullScanRowCountPenalty adds a penalty to full table scans. This is especially
+	// useful for empty or very small tables, where we would get plans that are
+	// surprising to users (like full scans instead of point lookups).
+	fullScanRowCountPenalty = 10
+
 	// preferLookupJoinFactor is a scale factor for the cost of a lookup join when
 	// we have a hint for preferring a lookup join.
 	preferLookupJoinFactor = 1e-6
@@ -433,7 +438,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		cost = c.computeScanCost(candidate.(*memo.ScanExpr), required)
 
 	case opt.SelectOp:
-		cost = c.computeSelectCost(candidate.(*memo.SelectExpr))
+		cost = c.computeSelectCost(candidate.(*memo.SelectExpr), required)
 
 	case opt.ProjectOp:
 		cost = c.computeProjectCost(candidate.(*memo.ProjectExpr))
@@ -466,7 +471,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		cost = c.computeZigzagJoinCost(candidate.(*memo.ZigzagJoinExpr))
 
 	case opt.UnionOp, opt.IntersectOp, opt.ExceptOp,
-		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp:
+		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp, opt.LocalityOptimizedSearchOp:
 		cost = c.computeSetCost(candidate)
 
 	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.EnsureDistinctOnOp,
@@ -579,17 +584,6 @@ func (c *coster) computeScanCost(scan *memo.ScanExpr, required *physical.Require
 	rowCount := scan.Relational().Stats.RowCount
 	perRowCost := c.rowScanCost(scan.Table, scan.Index, scan.Cols.Len())
 
-	if required.LimitHint != 0 {
-		rowCount = math.Min(rowCount, required.LimitHint*scanSoftLimitMultiplier)
-	}
-
-	if ordering.ScanIsReverse(scan, &required.Ordering) {
-		if rowCount > 1 {
-			// Need to do binary search to seek to the previous row.
-			perRowCost += memo.Cost(math.Log2(rowCount)) * cpuCostFactor
-		}
-	}
-
 	numSpans := 1
 	if scan.Constraint != nil {
 		numSpans = scan.Constraint.Spans.Count()
@@ -603,18 +597,58 @@ func (c *coster) computeScanCost(scan *memo.ScanExpr, required *physical.Require
 		baseCost += virtualScanTableDescriptorFetchCost
 	}
 
-	// Add a small cost if the scan is unconstrained, so all else being equal, we
-	// will prefer a constrained scan. This is important if our row count
-	// estimate turns out to be smaller than the actual row count.
+	// Add a penalty to full table scans. All else being equal, we prefer a
+	// constrained scan. Adding a few rows worth of cost helps prevent surprising
+	// plans for very small tables.
 	if scan.IsUnfiltered(c.mem.Metadata()) {
-		baseCost += cpuCostFactor
+		rowCount += fullScanRowCountPenalty
+
+		// For tables with multiple partitions, add the cost of visiting each
+		// partition.
+		// TODO(rytaft): In the future we should take latency into account here.
+		index := c.mem.Metadata().Table(scan.Table).Index(scan.Index)
+		if partitionCount := index.PartitionCount(); partitionCount > 1 {
+			// Subtract 1 since we already accounted for the first partition when
+			// counting spans.
+			baseCost += memo.Cost(partitionCount-1) * randIOCostFactor
+		}
 	}
-	return baseCost + memo.Cost(rowCount)*(seqIOCostFactor+perRowCost)
+
+	if required.LimitHint != 0 {
+		rowCount = math.Min(rowCount, required.LimitHint*scanSoftLimitMultiplier)
+	}
+
+	if ordering.ScanIsReverse(scan, &required.Ordering) {
+		if rowCount > 1 {
+			// Need to do binary search to seek to the previous row.
+			perRowCost += memo.Cost(math.Log2(rowCount)) * cpuCostFactor
+		}
+	}
+
+	cost := baseCost + memo.Cost(rowCount)*(seqIOCostFactor+perRowCost)
+
+	// If this scan is locality optimized, divide the cost in two in order to make
+	// the total cost of the two scans in the locality optimized plan less then
+	// the cost of the single scan in the non-locality optimized plan.
+	// TODO(rytaft): This is hacky. We should really be making this determination
+	// based on the latency between regions.
+	if scan.LocalityOptimized {
+		cost /= 2
+	}
+	return cost
 }
 
-func (c *coster) computeSelectCost(sel *memo.SelectExpr) memo.Cost {
-	// The filter has to be evaluated on each input row.
+func (c *coster) computeSelectCost(sel *memo.SelectExpr, required *physical.Required) memo.Cost {
+	// Typically the filter has to be evaluated on each input row.
 	inputRowCount := sel.Input.Relational().Stats.RowCount
+
+	// If there is a LimitHint, n, it is expected that the filter will only be
+	// evaluated on the number of rows required to produce n rows.
+	if required.LimitHint != 0 {
+		selectivity := sel.Relational().Stats.Selectivity.AsFloat()
+		inputRowCount = math.Min(inputRowCount, required.LimitHint/selectivity)
+	}
+
 	filterSetup, filterPerRow := c.computeFiltersCost(sel.Filters, util.FastIntMap{})
 	cost := memo.Cost(inputRowCount) * filterPerRow
 	cost += filterSetup

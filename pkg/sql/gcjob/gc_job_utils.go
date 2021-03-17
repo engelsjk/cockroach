@@ -59,7 +59,7 @@ func markIndexGCed(
 // initDetailsAndProgress sets up the job progress if not already populated and
 // validates that the job details is properly formatted.
 func initDetailsAndProgress(
-	ctx context.Context, execCfg *sql.ExecutorConfig, jobID int64,
+	ctx context.Context, execCfg *sql.ExecutorConfig, jobID jobspb.JobID,
 ) (*jobspb.SchemaChangeGCDetails, *jobspb.SchemaChangeGCProgress, error) {
 	var details jobspb.SchemaChangeGCDetails
 	var progress *jobspb.SchemaChangeGCProgress
@@ -91,7 +91,7 @@ func initDetailsAndProgress(
 func initializeProgress(
 	ctx context.Context,
 	execCfg *sql.ExecutorConfig,
-	jobID int64,
+	jobID jobspb.JobID,
 	details *jobspb.SchemaChangeGCDetails,
 	progress *jobspb.SchemaChangeGCProgress,
 ) error {
@@ -117,8 +117,7 @@ func initializeProgress(
 			if err != nil {
 				return err
 			}
-			// TODO: This job update should possibly use the txn (#60690).
-			return job.SetProgress(ctx, nil /* txn */, *progress)
+			return job.SetProgress(ctx, txn, *progress)
 		}); err != nil {
 			return err
 		}
@@ -252,7 +251,7 @@ func validateDetails(details *jobspb.SchemaChangeGCDetails) error {
 func persistProgress(
 	ctx context.Context,
 	execCfg *sql.ExecutorConfig,
-	jobID int64,
+	jobID jobspb.JobID,
 	progress *jobspb.SchemaChangeGCProgress,
 	runningStatus jobs.RunningStatus,
 ) {
@@ -261,12 +260,11 @@ func persistProgress(
 		if err != nil {
 			return err
 		}
-		// TODO: This job update should possibly use the txn (#60690).
-		if err := job.SetProgress(ctx, nil /* txn */, *progress); err != nil {
+		if err := job.SetProgress(ctx, txn, *progress); err != nil {
 			return err
 		}
 		log.Infof(ctx, "updated progress payload: %+v", progress)
-		err = job.RunningStatus(ctx, nil /* txn */, func(_ context.Context, _ jobspb.Details) (jobs.RunningStatus, error) {
+		err = job.RunningStatus(ctx, txn, func(_ context.Context, _ jobspb.Details) (jobs.RunningStatus, error) {
 			return runningStatus, nil
 		})
 		if err != nil {

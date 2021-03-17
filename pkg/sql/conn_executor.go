@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -823,6 +822,22 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 		if err := ex.machine.ApplyWithPayload(ctx, ev, payload); err != nil {
 			log.Warningf(ctx, "error while cleaning up connExecutor: %s", err)
 		}
+		switch t := ex.machine.CurState().(type) {
+		case stateNoTxn:
+			// No txn to finish.
+		case stateAborted:
+			// A non-retriable error with IsCommit set to true causes the transaction
+			// to be cleaned up.
+		case stateCommitWait:
+			ex.state.finishSQLTxn()
+		default:
+			if util.CrdbTestBuild {
+				panic(errors.AssertionFailedf("unexpected state in conn executor after ApplyWithPayload %T", t))
+			}
+		}
+		if util.CrdbTestBuild && ex.state.Ctx != nil {
+			panic(errors.AssertionFailedf("txn span not closed in state %s", ex.machine.CurState()))
+		}
 	} else if closeType == externalTxnClose {
 		ex.state.finishExternalTxn()
 	}
@@ -985,6 +1000,17 @@ type connExecutor struct {
 		// transaction. This is simply the summation of number of rows observed by
 		// comprising statements.
 		numRows int
+
+		// txnCounter keeps track of how many SQL txns have been open since
+		// the start of the session. This is used for logging, to
+		// distinguish statements that belong to separate SQL transactions.
+		// A txn unique key can be obtained by grouping this counter with
+		// the session ID.
+		//
+		// Note that a single SQL txn can use multiple KV txns under the
+		// hood with multiple KV txn UUIDs, so the KV UUID is not a good
+		// txn identifier for SQL logging.
+		txnCounter int
 
 		// txnRewindPos is the position within stmtBuf to which we'll rewind when
 		// performing automatic retries. This is more or less the position where the
@@ -1312,13 +1338,6 @@ func (ex *connExecutor) Ctx() context.Context {
 	if _, ok := ex.machine.CurState().(stateInternalError); ok {
 		ctx = ex.ctxHolder.ctx()
 	}
-	return ex.DescriptorValidationContext(ctx)
-}
-
-func (ex *connExecutor) DescriptorValidationContext(ctx context.Context) context.Context {
-	if ex.server.cfg.TestingKnobs.TestingDescriptorValidation {
-		return context.WithValue(ctx, tabledesc.PerformTestingDescriptorValidation, true)
-	}
 	return ctx
 }
 
@@ -1444,12 +1463,16 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 		return err // err could be io.EOF
 	}
 
+	// Ensure that every statement has a tracing span set up.
 	ctx, sp := tracing.EnsureChildSpan(
 		ctx, ex.server.cfg.AmbientCtx.Tracer,
 		// We print the type of command, not the String() which includes long
 		// statements.
 		cmd.command())
 	defer sp.Finish()
+	// We expect that the span is not used directly, so we'll overwrite the
+	// local variable.
+	sp = nil
 
 	if log.ExpensiveLogEnabled(ctx, 2) || ex.eventLog != nil {
 		ex.sessionEventf(ctx, "[%s pos:%d] executing %s",
@@ -2299,6 +2322,9 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 	case txnStart:
 		ex.extraTxnState.autoRetryCounter = 0
 		ex.extraTxnState.onTxnFinish, ex.extraTxnState.onTxnRestart = ex.recordTransactionStart()
+		// Bump the txn counter for logging.
+		ex.extraTxnState.txnCounter++
+
 	case txnCommit:
 		if res.Err() != nil {
 			err := errorutil.UnexpectedWithIssueErrorf(

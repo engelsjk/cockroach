@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-// Note that there's also lease_internal_test.go, in package sql.
+// Note that there's also lease_internal_test.go, in package lease.
 
 package lease_test
 
@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -547,7 +548,7 @@ func TestCantLeaseDeletedTable(testingT *testing.T) {
 			},
 		},
 		// Disable GC job.
-		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { select {} }},
+		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error { select {} }},
 	}
 
 	t := newLeaseTest(testingT, params)
@@ -625,7 +626,7 @@ func TestLeasesOnDeletedTableAreReleasedImmediately(t *testing.T) {
 			},
 		},
 		// Disable GC job.
-		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { select {} }},
+		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error { select {} }},
 	}
 	s, db, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
@@ -1693,7 +1694,7 @@ CREATE TABLE t.test0 (k CHAR PRIMARY KEY, v CHAR);
 				t.Fatalf("error while reading proto: %v", err)
 			}
 			// Look at the descriptor that comes back from the database.
-			dbTable := descpb.TableFromDescriptor(dbDesc, ts)
+			dbTable, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(dbDesc, ts)
 
 			if dbTable.Version != table.GetVersion() || dbTable.ModificationTime != table.GetModificationTime() {
 				t.Fatalf("db has version %d at ts %s, expected version %d at ts %s",
@@ -1928,9 +1929,8 @@ INSERT INTO t.kv VALUES ('a', 'b');
 	}
 
 	// Not sure whether run in the past and so sees clock uncertainty push.
-	// Must be a DDL as a regular DML would use the lease and not get pushed.
 	if _, err := tx1.Exec(`
-ALTER TABLE t.kv RENAME COLUMN v TO vv;
+INSERT INTO t.kv VALUES ('c', 'd');
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -2322,8 +2322,8 @@ func TestLeaseWithOfflineTables(t *testing.T) {
 	var lmKnobs lease.ManagerTestingKnobs
 	blockDescRefreshed := make(chan struct{}, 1)
 	lmKnobs.TestingDescriptorRefreshedEvent = func(desc *descpb.Descriptor) {
-		t := descpb.TableFromDescriptor(desc, hlc.Timestamp{})
-		if t != nil && testTableID() == t.ID {
+		tbl, _, _, _ := descpb.FromDescriptor(desc)
+		if tbl != nil && testTableID() == tbl.ID {
 			blockDescRefreshed <- struct{}{}
 		}
 	}
@@ -2460,6 +2460,49 @@ func TestOutstandingLeasesMetric(t *testing.T) {
 	}
 }
 
+// TestHistoricalAcquireDroppedDescriptor ensures that a historical transaction
+// can read an old descriptor.
+func TestHistoricalAcquireDroppedDescriptor(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const typeName = "foo"
+	seenDrop := make(chan error)
+	recvSeenDrop := seenDrop
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				SQLLeaseManager: &lease.ManagerTestingKnobs{
+					TestingDescriptorRefreshedEvent: func(descriptor *descpb.Descriptor) {
+						name := descpb.GetDescriptorName(descriptor)
+						if name != typeName || seenDrop == nil {
+							return
+						}
+						state := descpb.GetDescriptorState(descriptor)
+						if state == descpb.DescriptorState_DROP {
+							close(seenDrop)
+							seenDrop = nil
+						}
+					},
+				},
+			},
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb.Exec(t, "CREATE TYPE "+typeName+" AS ENUM ('a')")
+	var now string
+	tdb.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&now)
+	tdb.CheckQueryResults(t, `WITH a AS (SELECT 'a'::`+typeName+`) SELECT * FROM a`, [][]string{{"a"}})
+	tdb.CheckQueryResults(t, `WITH a AS (SELECT 'a'::`+typeName+`) SELECT * FROM a AS OF SYSTEM TIME `+now, [][]string{{"a"}})
+	tdb.Exec(t, "DROP TYPE foo")
+	// Make sure that the leases on the old version get dropped.
+	<-recvSeenDrop
+	// This should still work.
+	tdb.CheckQueryResults(t, `WITH a AS (SELECT 'a'::`+typeName+`) SELECT * FROM a AS OF SYSTEM TIME `+now, [][]string{{"a"}})
+}
+
 // Test that attempts to use a descriptor at a timestamp that precedes when
 // a descriptor is dropped but follows the notification that that descriptor
 // was dropped will successfully acquire the lease.
@@ -2553,4 +2596,116 @@ func TestLeaseAcquireAfterDropWithEarlierTimestamp(t *testing.T) {
 	// query returns the exact same error.
 	tdb.ExpectErr(t, `relation "sc.foo" does not exist`,
 		"SELECT * FROM sc.foo AS OF SYSTEM TIME "+ev.ts.AsOfSystemTime())
+}
+
+func TestDropDescriptorRacesWithAcquisition(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// We want to have a transaction to acquire a descriptor on one
+	// node that starts and reads version 1. Then we'll write a new
+	// version of the descriptor and then we'll let the acquisition
+	// finish. Before the commit which added this test, that acquired
+	// lease would not be dropped when it was not in use anymore because
+	// it would think it was the latest.
+
+	const tableName = "foo"
+	leaseAcquiredEventCh := make(chan chan struct{}, 1)
+	var seenUpdatesAtVersion2 int64
+	leaseRefreshedForVersion2 := make(chan struct{})
+	recvLeaseRefreshedForVersion2 := leaseRefreshedForVersion2
+	testingKnobs := base.TestingKnobs{
+		SQLLeaseManager: &lease.ManagerTestingKnobs{
+			TestingDescriptorUpdateEvent: func(descriptor *descpb.Descriptor) error {
+				_, version, name, _ := descpb.GetDescriptorMetadata(descriptor)
+				if name != tableName {
+					return nil
+				}
+				// Just so we don't get blocked on the refresh below.
+				if version != 2 {
+					return errors.New("swallowed")
+				}
+				if atomic.AddInt64(&seenUpdatesAtVersion2, 1) != 1 {
+					return errors.New("swallowed")
+				}
+				return nil
+			},
+			TestingDescriptorRefreshedEvent: func(descriptor *descpb.Descriptor) {
+				_, version, name, _ := descpb.GetDescriptorMetadata(descriptor)
+				if name != tableName || version != 2 {
+					return
+				}
+				// Just so we don't get blocked on the refresh below.
+				if leaseRefreshedForVersion2 != nil {
+					close(leaseRefreshedForVersion2)
+					leaseRefreshedForVersion2 = nil
+				}
+			},
+			LeaseStoreTestingKnobs: lease.StorageTestingKnobs{
+				RemoveOnceDereferenced: true,
+				LeaseAcquiredEvent: func(desc catalog.Descriptor, _ error) {
+					if desc.GetName() != tableName {
+						return
+					}
+					unblock := make(chan struct{})
+					select {
+					case leaseAcquiredEventCh <- unblock:
+					default:
+						return
+					}
+					<-unblock
+				},
+			},
+		},
+	}
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: testingKnobs,
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+	db := tc.ServerConn(0)
+
+	// Create our table. This will not acquire a lease.
+	{
+		_, err := db.Exec("CREATE TABLE foo ()")
+		require.NoError(t, err)
+	}
+
+	// Attempt to acquire the lease; it will block.
+	readFromFooErr := make(chan error, 1)
+	go func() {
+		_, err := db.Exec("SELECT rowid FROM foo")
+		readFromFooErr <- err
+	}()
+
+	var unblockLeaseRefresh chan<- struct{}
+	select {
+	case unblockLeaseRefresh = <-leaseAcquiredEventCh:
+	case <-readFromFooErr:
+		t.Fatal("expected this to be blocked on lease acquisition")
+	}
+
+	// This will create a version 2 which is dropped and then will wait
+	// to drain the name.
+	dropErrChan := make(chan error, 1)
+	go func() {
+		_, err := db.Exec("DROP TABLE foo")
+		dropErrChan <- err
+	}()
+	// Detect that the drop was noticed by the lease manager (note that this
+	// precedes the older version being seen).
+	<-recvLeaseRefreshedForVersion2
+
+	// Now let the read proceed.
+	close(unblockLeaseRefresh)
+	require.NoError(t, <-readFromFooErr)
+	require.NoError(t, <-dropErrChan)
+
+	tc.Server(0).LeaseManager().(*lease.Manager).VisitLeases(func(
+		desc catalog.Descriptor, takenOffline bool, refCount int, expiration tree.DTimestamp,
+	) (wantMore bool) {
+		t.Log(desc, takenOffline, refCount, expiration)
+		return true
+	})
 }

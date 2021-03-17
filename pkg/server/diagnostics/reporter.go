@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
-	"runtime"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -36,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/util/cloudinfo"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
@@ -46,10 +44,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/mitchellh/reflectwalk"
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/host"
-	"github.com/shirou/gopsutil/load"
-	"github.com/shirou/gopsutil/mem"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -193,21 +187,28 @@ func (r *Reporter) CreateReport(
 	// Read the system.settings table to determine the settings for which we have
 	// explicitly set values -- the in-memory SV has the set and default values
 	// flattened for quick reads, but we'd rather only report the non-defaults.
-	if datums, err := r.InternalExec.QueryEx(
+	if it, err := r.InternalExec.QueryIteratorEx(
 		ctx, "read-setting", nil, /* txn */
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		"SELECT name FROM system.settings",
 	); err != nil {
 		log.Warningf(ctx, "failed to read settings: %s", err)
 	} else {
-		info.AlteredSettings = make(map[string]string, len(datums))
-		for _, row := range datums {
+		info.AlteredSettings = make(map[string]string)
+		var ok bool
+		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+			row := it.Cur()
 			name := string(tree.MustBeDString(row[0]))
 			info.AlteredSettings[name] = settings.RedactedValue(name, &r.Settings.SV)
 		}
+		if err != nil {
+			// No need to clear AlteredSettings map since we only make best
+			// effort to populate it.
+			log.Warningf(ctx, "failed to read settings: %s", err)
+		}
 	}
 
-	if datums, err := r.InternalExec.QueryEx(
+	if it, err := r.InternalExec.QueryIteratorEx(
 		ctx,
 		"read-zone-configs",
 		nil, /* txn */
@@ -217,7 +218,9 @@ func (r *Reporter) CreateReport(
 		log.Warningf(ctx, "%v", err)
 	} else {
 		info.ZoneConfigs = make(map[int64]zonepb.ZoneConfig)
-		for _, row := range datums {
+		var ok bool
+		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+			row := it.Cur()
 			id := int64(tree.MustBeDInt(row[0]))
 			var zone zonepb.ZoneConfig
 			if bytes, ok := row[1].(*tree.DBytes); !ok {
@@ -231,6 +234,11 @@ func (r *Reporter) CreateReport(
 			var anonymizedZone zonepb.ZoneConfig
 			anonymizeZoneConfig(&anonymizedZone, zone, secret)
 			info.ZoneConfigs[id] = anonymizedZone
+		}
+		if err != nil {
+			// No need to clear ZoneConfigs map since we only make best effort
+			// to populate it.
+			log.Warningf(ctx, "%v", err)
 		}
 	}
 
@@ -302,7 +310,8 @@ func (r *Reporter) collectSchemaInfo(ctx context.Context) ([]descpb.TableDescrip
 		if err := kv.ValueProto(&desc); err != nil {
 			return nil, errors.Wrapf(err, "%s: unable to unmarshal SQL descriptor", kv.Key)
 		}
-		if t := descpb.TableFromDescriptor(&desc, kv.Value.Timestamp); t != nil && t.ID > keys.MaxReservedDescID {
+		t, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, kv.Value.Timestamp)
+		if t != nil && t.ID > keys.MaxReservedDescID {
 			if err := reflectwalk.Walk(t, redactor); err != nil {
 				panic(err) // stringRedactor never returns a non-nil err
 			}
@@ -336,42 +345,6 @@ func getLicenseType(ctx context.Context, settings *cluster.Settings) string {
 		return ""
 	}
 	return licenseType
-}
-
-// populateHardwareInfo populates OS, CPU, memory, etc. information about the
-// environment in which CRDB is running.
-func populateHardwareInfo(ctx context.Context, e *diagnosticspb.Environment) {
-	if platform, family, version, err := host.PlatformInformation(); err == nil {
-		e.Os.Family = family
-		e.Os.Platform = platform
-		e.Os.Version = version
-	}
-
-	if virt, role, err := host.Virtualization(); err == nil && role == "guest" {
-		e.Hardware.Virtualization = virt
-	}
-
-	if m, err := mem.VirtualMemory(); err == nil {
-		e.Hardware.Mem.Available = m.Available
-		e.Hardware.Mem.Total = m.Total
-	}
-
-	e.Hardware.Cpu.Numcpu = int32(runtime.NumCPU())
-	if cpus, err := cpu.InfoWithContext(ctx); err == nil && len(cpus) > 0 {
-		e.Hardware.Cpu.Sockets = int32(len(cpus))
-		c := cpus[0]
-		e.Hardware.Cpu.Cores = c.Cores
-		e.Hardware.Cpu.Model = c.ModelName
-		e.Hardware.Cpu.Mhz = float32(c.Mhz)
-		e.Hardware.Cpu.Features = c.Flags
-	}
-
-	if l, err := load.AvgWithContext(ctx); err == nil {
-		e.Hardware.Loadavg15 = float32(l.Load15)
-	}
-
-	e.Hardware.Provider, e.Hardware.InstanceClass = cloudinfo.GetInstanceClass(ctx)
-	e.Topology.Provider, e.Topology.Region = cloudinfo.GetInstanceRegion(ctx)
 }
 
 func anonymizeZoneConfig(dst *zonepb.ZoneConfig, src zonepb.ZoneConfig, secret string) {

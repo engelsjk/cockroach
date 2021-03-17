@@ -44,7 +44,7 @@ func TestMysqldumpDataReader(t *testing.T) {
 	files := getMysqldumpTestdata(t)
 
 	ctx := context.Background()
-	table := descForTable(ctx, t, `CREATE TABLE simple (i INT PRIMARY KEY, s text, b bytea)`, 10, 20, NoFKs)
+	table := descForTable(ctx, t, `CREATE TABLE simple (i INT PRIMARY KEY, s text, b bytea)`, 100, 200, NoFKs)
 	tables := map[string]*execinfrapb.ReadImportDataSpec_ImportTable{"simple": {Desc: table.TableDesc()}}
 	opts := roachpb.MysqldumpOptions{}
 
@@ -138,9 +138,9 @@ func TestMysqldumpSchemaReader(t *testing.T) {
 	referencedSimple := descForTable(ctx, t, readFile(t, `simple.cockroach-schema.sql`), expectedParent, 52, NoFKs)
 	fks := fkHandler{
 		allowed: true,
-		resolver: fkResolver(map[string]*tabledesc.Mutable{
-			referencedSimple.Name: referencedSimple,
-		}),
+		resolver: fkResolver{
+			tableNameToDesc: map[string]*tabledesc.Mutable{referencedSimple.Name: referencedSimple},
+			format:          mysqlDumpFormat()},
 	}
 
 	t.Run("simple", func(t *testing.T) {
@@ -169,7 +169,10 @@ func TestMysqldumpSchemaReader(t *testing.T) {
 	})
 
 	t.Run("third-in-multi", func(t *testing.T) {
-		skip := fkHandler{allowed: true, skip: true, resolver: make(fkResolver)}
+		skip := fkHandler{allowed: true, skip: true, resolver: fkResolver{
+			tableNameToDesc: make(map[string]*tabledesc.Mutable),
+			format:          mysqlDumpFormat(),
+		}}
 		expected := descForTable(ctx, t, readFile(t, `third.cockroach-schema.sql`), expectedParent, 52, skip)
 		got := readMysqlCreateFrom(t, files.wholeDB, "third", 51, skip)
 		compareTables(t, expected.TableDesc(), got)
@@ -218,13 +221,17 @@ func compareTables(t *testing.T, expected, got *descpb.TableDescriptor) {
 		ctx := context.Background()
 		semaCtx := tree.MakeSemaContext()
 		tableName := &descpb.AnonymousTable
-		expectedDesc := tabledesc.NewImmutable(*expected)
-		gotDesc := tabledesc.NewImmutable(*got)
-		e, err := catformat.IndexForDisplay(ctx, expectedDesc, tableName, &expected.Indexes[i], &semaCtx)
+		expectedDesc := tabledesc.NewBuilder(expected).BuildImmutableTable()
+		gotDesc := tabledesc.NewBuilder(got).BuildImmutableTable()
+		e, err := catformat.IndexForDisplay(
+			ctx, expectedDesc, tableName, &expected.Indexes[i], "" /* partition */, "" /* interleave */, &semaCtx,
+		)
 		if err != nil {
 			t.Fatalf("unexpected error: %s", err)
 		}
-		g, err := catformat.IndexForDisplay(ctx, gotDesc, tableName, &got.Indexes[i], &semaCtx)
+		g, err := catformat.IndexForDisplay(
+			ctx, gotDesc, tableName, &got.Indexes[i], "" /* partition */, "" /* interleave */, &semaCtx,
+		)
 		if err != nil {
 			t.Fatalf("unexpected error: %s", err)
 		}
@@ -272,10 +279,10 @@ func TestMysqlValueToDatum(t *testing.T) {
 		typ  *types.T
 		want tree.Datum
 	}{
-		{raw: mysql.NewStrVal([]byte("0000-00-00")), typ: types.Date, want: tree.DNull},
-		{raw: mysql.NewStrVal([]byte("2010-01-01")), typ: types.Date, want: date("2010-01-01")},
-		{raw: mysql.NewStrVal([]byte("0000-00-00 00:00:00")), typ: types.Timestamp, want: tree.DNull},
-		{raw: mysql.NewStrVal([]byte("2010-01-01 00:00:00")), typ: types.Timestamp, want: ts("2010-01-01 00:00:00")},
+		{raw: mysql.NewStrLiteral([]byte("0000-00-00")), typ: types.Date, want: tree.DNull},
+		{raw: mysql.NewStrLiteral([]byte("2010-01-01")), typ: types.Date, want: date("2010-01-01")},
+		{raw: mysql.NewStrLiteral([]byte("0000-00-00 00:00:00")), typ: types.Timestamp, want: tree.DNull},
+		{raw: mysql.NewStrLiteral([]byte("2010-01-01 00:00:00")), typ: types.Timestamp, want: ts("2010-01-01 00:00:00")},
 	}
 	evalContext := tree.NewTestingEvalContext(nil)
 	for _, tc := range tests {

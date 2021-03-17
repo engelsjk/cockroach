@@ -58,6 +58,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -2184,8 +2185,9 @@ var builtins = map[string]builtinDefinition{
 			},
 			Info: "Calculates the interval between `val` and the current time, normalized into years, months and days." + `
 
-			Note this may not be an accurate time span since years and months are normalized from days, and years and months are out of context.
-			To avoid normalizing days into months and years, use ` + "`now() - timestamptz`" + `.`,
+Note this may not be an accurate time span since years and months are normalized
+from days, and years and months are out of context. To avoid normalizing days into
+months and years, use ` + "`now() - timestamptz`" + `.`,
 			Volatility: tree.VolatilityStable,
 		},
 		tree.Overload{
@@ -2201,8 +2203,9 @@ var builtins = map[string]builtinDefinition{
 			},
 			Info: "Calculates the interval between `begin` and `end`, normalized into years, months and days." + `
 
-			Note this may not be an accurate time span since years and months are normalized from days, and years and months are out of context.
-			To avoid normalizing days into months and years, use the timestamptz subtraction operator.`,
+Note this may not be an accurate time span since years and months are normalized
+from days, and years and months are out of context. To avoid normalizing days into
+months and years, use the timestamptz subtraction operator.`,
 			Volatility: tree.VolatilityImmutable,
 		},
 	),
@@ -3161,6 +3164,10 @@ may increase either contention or retry errors, or both.`,
 
 	"jsonb_extract_path": makeBuiltin(jsonProps(), jsonExtractPathImpl),
 
+	"json_extract_path_text": makeBuiltin(jsonProps(), jsonExtractPathTextImpl),
+
+	"jsonb_extract_path_text": makeBuiltin(jsonProps(), jsonExtractPathTextImpl),
+
 	"json_set": makeBuiltin(jsonProps(), jsonSetImpl, jsonSetWithCreateMissingImpl),
 
 	"jsonb_set": makeBuiltin(jsonProps(), jsonSetImpl, jsonSetWithCreateMissingImpl),
@@ -3627,10 +3634,74 @@ may increase either contention or retry errors, or both.`,
 				if sp == nil {
 					return tree.DNull, nil
 				}
-				return tree.NewDInt(tree.DInt(sp.GetRecording()[0].TraceID)), nil
+
+				traceID := sp.TraceID()
+				if traceID == 0 {
+					return tree.DNull, nil
+				}
+				return tree.NewDInt(tree.DInt(traceID)), nil
 			},
 			Info: "Returns the current trace ID or an error if no trace is open.",
 			// NB: possibly this is or could be made stable, but it's not worth it.
+			Volatility: tree.VolatilityVolatile,
+		},
+	),
+
+	// Toggles all spans of the requested trace to verbose or non-verbose.
+	"crdb_internal.set_trace_verbose": makeBuiltin(
+		tree.FunctionProperties{Category: categorySystemInfo},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"trace_id", types.Int},
+				{"verbosity", types.Bool},
+			},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				// The user must be an admin to use this builtin.
+				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
+				if err != nil {
+					return nil, err
+				}
+				if !isAdmin {
+					if err := checkPrivilegedUser(ctx); err != nil {
+						return nil, err
+					}
+				}
+
+				traceID := uint64(*(args[0].(*tree.DInt)))
+				verbosity := bool(*(args[1].(*tree.DBool)))
+
+				const query = `SELECT span_id
+  	 									FROM crdb_internal.node_inflight_trace_spans
+ 		 									WHERE trace_id = $1
+											AND parent_span_id = 0`
+
+				ie := ctx.InternalExecutor.(sqlutil.InternalExecutor)
+				row, err := ie.QueryRowEx(
+					ctx.Ctx(),
+					"crdb_internal.set_trace_verbose",
+					ctx.Txn,
+					sessiondata.NoSessionDataOverride,
+					query,
+					traceID,
+				)
+				if err != nil {
+					return nil, err
+				}
+				if row == nil {
+					return tree.DBoolFalse, nil
+				}
+				rootSpanID := uint64(*row[0].(*tree.DInt))
+
+				rootSpan, found := ctx.Settings.Tracer.GetActiveSpanFromID(rootSpanID)
+				if !found {
+					return tree.DBoolFalse, nil
+				}
+
+				rootSpan.SetVerboseRecursively(verbosity)
+				return tree.DBoolTrue, nil
+			},
+			Info:       "Returns true if root span was found and verbosity was set, false otherwise.",
 			Volatility: tree.VolatilityVolatile,
 		},
 	),
@@ -4830,7 +4901,8 @@ may increase either contention or retry errors, or both.`,
 
 	"crdb_internal.complete_stream_ingestion_job": makeBuiltin(
 		tree.FunctionProperties{
-			Category: categoryStreamIngestion,
+			Category:         categoryStreamIngestion,
+			DistsqlBlocklist: true,
 		},
 		tree.Overload{
 			Types: tree.ArgTypes{
@@ -4842,6 +4914,9 @@ may increase either contention or retry errors, or both.`,
 				jobID := int(*args[0].(*tree.DInt))
 				cutoverTime := args[1].(*tree.DTimestampTZ).Time
 				cutoverTimestamp := hlc.Timestamp{WallTime: cutoverTime.UnixNano()}
+				if streaming.CompleteIngestionHook == nil {
+					return nil, errors.New("completing a stream ingestion job requires a CCL binary")
+				}
 				err := streaming.CompleteIngestionHook(evalCtx, evalCtx.Txn, jobID, cutoverTimestamp)
 				return tree.NewDInt(tree.DInt(jobID)), err
 			},
@@ -4928,40 +5003,22 @@ the locality flag on node startup. Returns an error if no region is set.`,
 		tree.FunctionProperties{Category: categoryMultiRegion},
 		stringOverload1(
 			func(evalCtx *tree.EvalContext, s string) (tree.Datum, error) {
-				r, err := evalCtx.InternalExecutor.QueryRow(
-					evalCtx.Ctx(),
-					DefaultToDatabasePrimaryRegionBuiltinName,
-					evalCtx.Txn,
-					`SELECT regions @> array[$1::string], primary_region
-				FROM crdb_internal.databases WHERE name = $2`,
-					s,
-					evalCtx.SessionData.Database,
-				)
+				regionConfig, err := evalCtx.Sequence.CurrentDatabaseRegionConfig()
 				if err != nil {
 					return nil, err
 				}
-				if len(r) == 0 {
+				if regionConfig.IsValidRegionNameString(s) {
+					return tree.NewDString(s), nil
+				}
+				primaryRegion := regionConfig.PrimaryRegionString()
+				if primaryRegion == "" {
 					return nil, pgerror.Newf(
 						pgcode.InvalidDatabaseDefinition,
-						"current database %s does not exist",
+						"current database %s is not multi-region enabled",
 						evalCtx.SessionData.Database,
 					)
 				}
-				// If region has been added to the database.
-				if *(r[0].(*tree.DBool)) {
-					return tree.NewDString(s), nil
-				}
-				// Otherwise, return the primary region if it exists.
-				if r[1] != tree.DNull {
-					return r[1], nil
-				}
-
-				// Not seeing any rows means the database is not multi-region enabled.
-				return nil, pgerror.Newf(
-					pgcode.InvalidDatabaseDefinition,
-					"current database %s is not multi-region enabled",
-					evalCtx.SessionData.Database,
-				)
+				return tree.NewDString(primaryRegion), nil
 			},
 			types.String,
 			`Returns the given region if the region has been added to the current database.
@@ -5004,21 +5061,6 @@ If the CONFIGURE ZONE statement can be inferred by the database's or
 table's zone configuration this will return NULL.`,
 			tree.VolatilityStable,
 		),
-	),
-
-	"crdb_internal.show_create_all_tables": makeBuiltin(
-		tree.FunctionProperties{},
-		tree.Overload{
-			Types: tree.ArgTypes{
-				{"dbName", types.String},
-			},
-			ReturnType: tree.FixedReturnType(types.String),
-			Fn:         showCreateAllTablesBuiltin,
-			Info: `Returns a flat log of CREATE table statements followed by
-ALTER table statements that add table constraints. The flat log can be used
-to recreate a database.'`,
-			Volatility: tree.VolatilityStable,
-		},
 	),
 }
 
@@ -5523,18 +5565,7 @@ var jsonExtractPathImpl = tree.Overload{
 	Types:      tree.VariadicType{FixedTypes: []*types.T{types.Jsonb}, VarType: types.String},
 	ReturnType: tree.FixedReturnType(types.Jsonb),
 	Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-		j := tree.MustBeDJSON(args[0])
-		path := make([]string, len(args)-1)
-		for i, v := range args {
-			if i == 0 {
-				continue
-			}
-			if v == tree.DNull {
-				return tree.DNull, nil
-			}
-			path[i-1] = string(tree.MustBeDString(v))
-		}
-		result, err := json.FetchPath(j.JSON, path)
+		result, err := jsonExtractPathHelper(args)
 		if err != nil {
 			return nil, err
 		}
@@ -5545,6 +5576,45 @@ var jsonExtractPathImpl = tree.Overload{
 	},
 	Info:       "Returns the JSON value pointed to by the variadic arguments.",
 	Volatility: tree.VolatilityImmutable,
+}
+
+var jsonExtractPathTextImpl = tree.Overload{
+	Types:      tree.VariadicType{FixedTypes: []*types.T{types.Jsonb}, VarType: types.String},
+	ReturnType: tree.FixedReturnType(types.String),
+	Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+		result, err := jsonExtractPathHelper(args)
+		if err != nil {
+			return nil, err
+		}
+		if result == nil {
+			return tree.DNull, nil
+		}
+		text, err := result.AsText()
+		if err != nil {
+			return nil, err
+		}
+		if text == nil {
+			return tree.DNull, nil
+		}
+		return tree.NewDString(*text), nil
+	},
+	Info:       "Returns the JSON value as text pointed to by the variadic arguments.",
+	Volatility: tree.VolatilityImmutable,
+}
+
+func jsonExtractPathHelper(args tree.Datums) (json.JSON, error) {
+	j := tree.MustBeDJSON(args[0])
+	path := make([]string, len(args)-1)
+	for i, v := range args {
+		if i == 0 {
+			continue
+		}
+		if v == tree.DNull {
+			return nil, nil
+		}
+		path[i-1] = string(tree.MustBeDString(v))
+	}
+	return json.FetchPath(j.JSON, path)
 }
 
 // darrayToStringSlice converts an array of string datums to a Go array of

@@ -270,7 +270,7 @@ memo (optimized, ~14KB, required=[presentation: i:1,f:2,s:3,b:4])
  ├── G2: (scan p,cols=(1-4))
  │    └── []
  │         ├── best: (scan p,cols=(1-4))
- │         └── cost: 1094.02
+ │         └── cost: 1104.91
  ├── G3: (filters G8 G9)
  ├── G4: (select G10 G11)
  │    └── []
@@ -314,16 +314,16 @@ memo (optimized, ~8KB, required=[presentation: i:1])
  ├── G1: (project G2 G3 i)
  │    └── [presentation: i:1]
  │         ├── best: (project G2 G3 i)
- │         └── cost: 1084.15
+ │         └── cost: 1094.84
  ├── G2: (select G4 G5)
  │    └── []
  │         ├── best: (select G4 G5)
- │         └── cost: 1084.04
+ │         └── cost: 1094.73
  ├── G3: (projections)
  ├── G4: (scan p,cols=(1,3))
  │    └── []
  │         ├── best: (scan p,cols=(1,3))
- │         └── cost: 1074.02
+ │         └── cost: 1084.71
  ├── G5: (filters G6)
  ├── G6: (eq G7 G8)
  ├── G7: (variable s)
@@ -422,7 +422,7 @@ memo (optimized, ~5KB, required=[presentation: k:1])
  ├── G2: (scan a,cols=(1)) (scan a@u,cols=(1)) (scan a@v,cols=(1))
  │    └── []
  │         ├── best: (scan a,cols=(1))
- │         └── cost: 1044.02
+ │         └── cost: 1054.41
  ├── G3: (filters G4)
  ├── G4: (eq G5 G6)
  ├── G5: (variable k)
@@ -456,7 +456,7 @@ memo (optimized, ~6KB, required=[presentation: k:1])
  ├── G4: (scan a,cols=(1,3)) (scan a@u,cols=(1,3)) (scan a@v,cols=(1,3))
  │    └── []
  │         ├── best: (scan a,cols=(1,3))
- │         └── cost: 1054.02
+ │         └── cost: 1064.51
  ├── G5: (filters G6)
  ├── G6: (gt G7 G8)
  ├── G7: (variable v)
@@ -493,7 +493,7 @@ memo (optimized, ~7KB, required=[presentation: k:1])
  ├── G4: (scan a,cols=(1,2)) (scan a@u,cols=(1,2)) (scan a@v,cols=(1,2))
  │    └── []
  │         ├── best: (scan a,cols=(1,2))
- │         └── cost: 1054.02
+ │         └── cost: 1064.51
  ├── G5: (filters G8 G9)
  ├── G6: (scan a,cols=(1,2),constrained)
  │    └── []
@@ -539,7 +539,7 @@ memo (optimized, ~8KB, required=[presentation: k:1])
  ├── G4: (scan a,cols=(1,2)) (scan a@u,cols=(1,2)) (scan a@v,cols=(1,2))
  │    └── []
  │         ├── best: (scan a,cols=(1,2))
- │         └── cost: 1054.02
+ │         └── cost: 1064.51
  ├── G5: (filters G8 G9)
  ├── G6: (scan a,cols=(1,2),constrained)
  │    └── []
@@ -591,7 +591,7 @@ memo (optimized, ~8KB, required=[presentation: k:1])
  ├── G4: (scan a,cols=(1-3)) (scan a@u,cols=(1-3)) (scan a@v,cols=(1-3))
  │    └── []
  │         ├── best: (scan a,cols=(1-3))
- │         └── cost: 1064.02
+ │         └── cost: 1074.61
  ├── G5: (filters G10 G11)
  ├── G6: (scan a@u,cols=(1-3),constrained)
  │    └── []
@@ -678,7 +678,7 @@ memo (optimized, ~5KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G2: (scan b,cols=(1-4))
  │    └── []
  │         ├── best: (scan b,cols=(1-4))
- │         └── cost: 1084.02
+ │         └── cost: 1094.81
  ├── G3: (filters G5)
  ├── G4: (scan b@v,cols=(1,3),constrained)
  │    └── []
@@ -740,7 +740,7 @@ memo (optimized, ~8KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G2: (scan b,cols=(1-4))
  │    └── []
  │         ├── best: (scan b,cols=(1-4))
- │         └── cost: 1084.02
+ │         └── cost: 1094.81
  ├── G3: (filters G7 G8)
  ├── G4: (scan b,cols=(1-4),constrained)
  │    └── []
@@ -838,7 +838,7 @@ memo (optimized, ~7KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G2: (scan b,cols=(1-4))
  │    └── []
  │         ├── best: (scan b,cols=(1-4))
- │         └── cost: 1084.02
+ │         └── cost: 1094.81
  ├── G3: (filters G6 G7)
  ├── G4: (index-join G8 b,cols=(1-4))
  │    └── []
@@ -902,7 +902,7 @@ memo (optimized, ~9KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G2: (scan b,cols=(1-4))
  │    └── []
  │         ├── best: (scan b,cols=(1-4))
- │         └── cost: 1084.02
+ │         └── cost: 1094.81
  ├── G3: (filters G8 G9 G10)
  ├── G4: (scan b,cols=(1-4),constrained)
  │    └── []
@@ -970,7 +970,7 @@ memo (optimized, ~7KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G2: (scan b,cols=(1-4))
  │    └── []
  │         ├── best: (scan b,cols=(1-4))
- │         └── cost: 1084.02
+ │         └── cost: 1094.81
  ├── G3: (filters G5 G6)
  ├── G4: (index-join G7 b,cols=(1-4))
  │    └── []
@@ -1131,10 +1131,10 @@ memo (optimized, ~6KB, required=[presentation: s:4,i:2,f:3] [ordering: +2 opt(4)
  ├── G2: (scan kifs,cols=(2-4)) (scan kifs@s_idx,cols=(2-4))
  │    ├── [ordering: +2 opt(4)]
  │    │    ├── best: (sort G2)
- │    │    └── cost: 1323.35
+ │    │    └── cost: 1334.04
  │    └── []
  │         ├── best: (scan kifs@s_idx,cols=(2-4))
- │         └── cost: 1074.02
+ │         └── cost: 1084.71
  ├── G3: (filters G5)
  ├── G4: (scan kifs@si_idx,cols=(1,2,4),constrained)
  │    ├── [ordering: +2 opt(4)]
@@ -1163,7 +1163,7 @@ memo (optimized, ~7KB, required=[presentation: j:5])
  ├── G4: (scan kifs,cols=(4,5)) (scan kifs@si_idx,cols=(4,5))
  │    └── []
  │         ├── best: (scan kifs@si_idx,cols=(4,5))
- │         └── cost: 1064.02
+ │         └── cost: 1074.61
  ├── G5: (filters G7)
  ├── G6: (scan kifs@s_idx,cols=(1,4),constrained)
  │    └── []
@@ -1189,7 +1189,7 @@ memo (optimized, ~6KB, required=[presentation: i:2,k:1])
  ├── G4: (scan kifs,cols=(1,2,4)) (scan kifs@s_idx,cols=(1,2,4)) (scan kifs@si_idx,cols=(1,2,4))
  │    └── []
  │         ├── best: (scan kifs@s_idx,cols=(1,2,4))
- │         └── cost: 1074.02
+ │         └── cost: 1084.71
  ├── G5: (filters G6)
  ├── G6: (ge G7 G8)
  ├── G7: (variable s)
@@ -1605,7 +1605,7 @@ memo (optimized, ~18KB, required=[presentation: i:1])
  ├── G6: (scan p,cols=(1,3))
  │    └── []
  │         ├── best: (scan p,cols=(1,3))
- │         └── cost: 1074.02
+ │         └── cost: 1084.71
  ├── G7: (filters G12 G13)
  ├── G8: (index-join G14 p,cols=(1,3))
  │    └── []
@@ -1661,16 +1661,16 @@ memo (optimized, ~7KB, required=[presentation: i:1])
  ├── G1: (project G2 G3 i)
  │    └── [presentation: i:1]
  │         ├── best: (project G2 G3 i)
- │         └── cost: 1084.07
+ │         └── cost: 1094.76
  ├── G2: (select G4 G5)
  │    └── []
  │         ├── best: (select G4 G5)
- │         └── cost: 1084.05
+ │         └── cost: 1094.74
  ├── G3: (projections)
  ├── G4: (scan p,cols=(1,3))
  │    └── []
  │         ├── best: (scan p,cols=(1,3))
- │         └── cost: 1074.02
+ │         └── cost: 1084.71
  ├── G5: (filters G6 G7)
  ├── G6: (eq G8 G9)
  ├── G7: (eq G10 G11)
@@ -1907,7 +1907,7 @@ memo (optimized, ~7KB, required=[presentation: k:1])
  ├── G5: (scan b,cols=(1,4))
  │    └── []
  │         ├── best: (scan b,cols=(1,4))
- │         └── cost: 1064.02
+ │         └── cost: 1074.61
  ├── G6: (filters G7)
  ├── G7: (contains G8 G9)
  ├── G8: (variable j)
@@ -2147,6 +2147,248 @@ index-join b
       ├── inverted constraint: /6/1
       │    └── spans: ["7a\x00\x02\x00\x03\x00\x03b\x00\x02c\x00\x02\x00\x03d\x00\x01\x12e\x00\x01", "7a\x00\x02\x00\x03\x00\x03b\x00\x02c\x00\x02\x00\x03d\x00\x01\x12e\x00\x01"]
       └── key: (1)
+
+# Query using the contained by operator.
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM b WHERE j <@ '1'
+----
+select
+ ├── columns: k:1!null u:2 v:3 j:4
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ ├── index-join b
+ │    ├── columns: k:1!null u:2 v:3 j:4
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ │    └── scan b@j_inv_idx
+ │         ├── columns: k:1!null
+ │         ├── inverted constraint: /6/1
+ │         │    └── spans: ["7\x00\x01*\x02\x00", "7\x00\x01*\x02\x00"]
+ │         └── key: (1)
+ └── filters
+      └── '1' @> j:4 [outer=(4), immutable]
+
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM b WHERE j <@ '{}'
+----
+select
+ ├── columns: k:1!null u:2 v:3 j:4
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ ├── index-join b
+ │    ├── columns: k:1!null u:2 v:3 j:4
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ │    └── scan b@j_inv_idx
+ │         ├── columns: k:1!null
+ │         ├── inverted constraint: /6/1
+ │         │    └── spans: ["7\x00\x019", "7\x00\x019"]
+ │         └── key: (1)
+ └── filters
+      └── '{}' @> j:4 [outer=(4), immutable]
+
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM b WHERE j <@ '[]'
+----
+select
+ ├── columns: k:1!null u:2 v:3 j:4
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ ├── index-join b
+ │    ├── columns: k:1!null u:2 v:3 j:4
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ │    └── scan b@j_inv_idx
+ │         ├── columns: k:1!null
+ │         ├── inverted constraint: /6/1
+ │         │    └── spans: ["7\x00\x018", "7\x00\x018"]
+ │         └── key: (1)
+ └── filters
+      └── '[]' @> j:4 [outer=(4), immutable]
+
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM b WHERE j <@ '{"a": []}'
+----
+select
+ ├── columns: k:1!null u:2 v:3 j:4
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ ├── index-join b
+ │    ├── columns: k:1!null u:2 v:3 j:4
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ │    └── inverted-filter
+ │         ├── columns: k:1!null
+ │         ├── inverted expression: /6
+ │         │    ├── tight: false, unique: false
+ │         │    └── union spans
+ │         │         ├── ["7\x00\x019", "7\x00\x019"]
+ │         │         └── ["7a\x00\x018", "7a\x00\x018"]
+ │         ├── key: (1)
+ │         └── scan b@j_inv_idx
+ │              ├── columns: k:1!null j_inverted_key:6!null
+ │              ├── inverted constraint: /6/1
+ │              │    └── spans
+ │              │         ├── ["7\x00\x019", "7\x00\x019"]
+ │              │         └── ["7a\x00\x018", "7a\x00\x018"]
+ │              ├── key: (1)
+ │              └── fd: (1)-->(6)
+ └── filters
+      └── '{"a": []}' @> j:4 [outer=(4), immutable]
+
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM b WHERE j <@ '[{"a": {"d": true}}, 1, "b"]'
+----
+select
+ ├── columns: k:1!null u:2 v:3 j:4
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ ├── index-join b
+ │    ├── columns: k:1!null u:2 v:3 j:4
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ │    └── inverted-filter
+ │         ├── columns: k:1!null
+ │         ├── inverted expression: /6
+ │         │    ├── tight: false, unique: false
+ │         │    └── union spans
+ │         │         ├── ["7\x00\x01\x12b\x00\x01", "7\x00\x01\x12b\x00\x01"]
+ │         │         ├── ["7\x00\x01*\x02\x00", "7\x00\x01*\x02\x00"]
+ │         │         ├── ["7\x00\x018", "7\x00\x018"]
+ │         │         ├── ["7\x00\x03\x00\x01\x12b\x00\x01", "7\x00\x03\x00\x01\x12b\x00\x01"]
+ │         │         ├── ["7\x00\x03\x00\x01*\x02\x00", "7\x00\x03\x00\x01*\x02\x00"]
+ │         │         ├── ["7\x00\x03\x00\x019", "7\x00\x03\x00\x019"]
+ │         │         ├── ["7\x00\x03a\x00\x019", "7\x00\x03a\x00\x019"]
+ │         │         ├── ["7\x00\x03a\x00\x02\x00\x019", "7\x00\x03a\x00\x02\x00\x019"]
+ │         │         └── ["7\x00\x03a\x00\x02d\x00\x01\n", "7\x00\x03a\x00\x02d\x00\x01\n"]
+ │         ├── key: (1)
+ │         └── scan b@j_inv_idx
+ │              ├── columns: k:1!null j_inverted_key:6!null
+ │              ├── inverted constraint: /6/1
+ │              │    └── spans
+ │              │         ├── ["7\x00\x01\x12b\x00\x01", "7\x00\x01\x12b\x00\x01"]
+ │              │         ├── ["7\x00\x01*\x02\x00", "7\x00\x01*\x02\x00"]
+ │              │         ├── ["7\x00\x018", "7\x00\x018"]
+ │              │         ├── ["7\x00\x03\x00\x01\x12b\x00\x01", "7\x00\x03\x00\x01\x12b\x00\x01"]
+ │              │         ├── ["7\x00\x03\x00\x01*\x02\x00", "7\x00\x03\x00\x01*\x02\x00"]
+ │              │         ├── ["7\x00\x03\x00\x019", "7\x00\x03\x00\x019"]
+ │              │         ├── ["7\x00\x03a\x00\x019", "7\x00\x03a\x00\x019"]
+ │              │         ├── ["7\x00\x03a\x00\x02\x00\x019", "7\x00\x03a\x00\x02\x00\x019"]
+ │              │         └── ["7\x00\x03a\x00\x02d\x00\x01\n", "7\x00\x03a\x00\x02d\x00\x01\n"]
+ │              ├── key: (1)
+ │              └── fd: (1)-->(6)
+ └── filters
+      └── '[{"a": {"d": true}}, 1, "b"]' @> j:4 [outer=(4), immutable]
+
+# Disjunction using the contained by operator.
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM b WHERE j <@ '{"a": [3]}' OR j <@ '[1, 2, 3]'
+----
+select
+ ├── columns: k:1!null u:2 v:3 j:4
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ ├── index-join b
+ │    ├── columns: k:1!null u:2 v:3 j:4
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ │    └── inverted-filter
+ │         ├── columns: k:1!null
+ │         ├── inverted expression: /6
+ │         │    ├── tight: false, unique: false
+ │         │    └── union spans
+ │         │         ├── ["7\x00\x01*\x02\x00", "7\x00\x01*\x02\x00"]
+ │         │         ├── ["7\x00\x01*\x04\x00", "7\x00\x01*\x04\x00"]
+ │         │         ├── ["7\x00\x01*\x06\x00", "7\x00\x01*\x06\x00"]
+ │         │         ├── ["7\x00\x018", "7\x00\x01:")
+ │         │         ├── ["7\x00\x03\x00\x01*\x02\x00", "7\x00\x03\x00\x01*\x02\x00"]
+ │         │         ├── ["7\x00\x03\x00\x01*\x04\x00", "7\x00\x03\x00\x01*\x04\x00"]
+ │         │         ├── ["7\x00\x03\x00\x01*\x06\x00", "7\x00\x03\x00\x01*\x06\x00"]
+ │         │         ├── ["7a\x00\x018", "7a\x00\x018"]
+ │         │         ├── ["7a\x00\x02\x00\x018", "7a\x00\x02\x00\x018"]
+ │         │         └── ["7a\x00\x02\x00\x03\x00\x01*\x06\x00", "7a\x00\x02\x00\x03\x00\x01*\x06\x00"]
+ │         ├── key: (1)
+ │         └── scan b@j_inv_idx
+ │              ├── columns: k:1!null j_inverted_key:6!null
+ │              ├── inverted constraint: /6/1
+ │              │    └── spans
+ │              │         ├── ["7\x00\x01*\x02\x00", "7\x00\x01*\x02\x00"]
+ │              │         ├── ["7\x00\x01*\x04\x00", "7\x00\x01*\x04\x00"]
+ │              │         ├── ["7\x00\x01*\x06\x00", "7\x00\x01*\x06\x00"]
+ │              │         ├── ["7\x00\x018", "7\x00\x01:")
+ │              │         ├── ["7\x00\x03\x00\x01*\x02\x00", "7\x00\x03\x00\x01*\x02\x00"]
+ │              │         ├── ["7\x00\x03\x00\x01*\x04\x00", "7\x00\x03\x00\x01*\x04\x00"]
+ │              │         ├── ["7\x00\x03\x00\x01*\x06\x00", "7\x00\x03\x00\x01*\x06\x00"]
+ │              │         ├── ["7a\x00\x018", "7a\x00\x018"]
+ │              │         ├── ["7a\x00\x02\x00\x018", "7a\x00\x02\x00\x018"]
+ │              │         └── ["7a\x00\x02\x00\x03\x00\x01*\x06\x00", "7a\x00\x02\x00\x03\x00\x01*\x06\x00"]
+ │              ├── key: (1)
+ │              └── fd: (1)-->(6)
+ └── filters
+      └── ('{"a": [3]}' @> j:4) OR ('[1, 2, 3]' @> j:4) [outer=(4), immutable]
+
+# Conjunction using the contained by operator.
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM b WHERE j <@ '{"a": [3]}' AND j <@ '[1, 2, 3]'
+----
+select
+ ├── columns: k:1!null u:2 v:3 j:4
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ ├── index-join b
+ │    ├── columns: k:1!null u:2 v:3 j:4
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
+ │    └── inverted-filter
+ │         ├── columns: k:1!null
+ │         ├── inverted expression: /6
+ │         │    ├── tight: false, unique: false
+ │         │    ├── union spans: empty
+ │         │    └── INTERSECTION
+ │         │         ├── span expression
+ │         │         │    ├── tight: false, unique: false
+ │         │         │    └── union spans
+ │         │         │         ├── ["7\x00\x019", "7\x00\x019"]
+ │         │         │         ├── ["7a\x00\x018", "7a\x00\x018"]
+ │         │         │         ├── ["7a\x00\x02\x00\x018", "7a\x00\x02\x00\x018"]
+ │         │         │         └── ["7a\x00\x02\x00\x03\x00\x01*\x06\x00", "7a\x00\x02\x00\x03\x00\x01*\x06\x00"]
+ │         │         └── span expression
+ │         │              ├── tight: false, unique: false
+ │         │              └── union spans
+ │         │                   ├── ["7\x00\x01*\x02\x00", "7\x00\x01*\x02\x00"]
+ │         │                   ├── ["7\x00\x01*\x04\x00", "7\x00\x01*\x04\x00"]
+ │         │                   ├── ["7\x00\x01*\x06\x00", "7\x00\x01*\x06\x00"]
+ │         │                   ├── ["7\x00\x018", "7\x00\x018"]
+ │         │                   ├── ["7\x00\x03\x00\x01*\x02\x00", "7\x00\x03\x00\x01*\x02\x00"]
+ │         │                   ├── ["7\x00\x03\x00\x01*\x04\x00", "7\x00\x03\x00\x01*\x04\x00"]
+ │         │                   └── ["7\x00\x03\x00\x01*\x06\x00", "7\x00\x03\x00\x01*\x06\x00"]
+ │         ├── key: (1)
+ │         └── scan b@j_inv_idx
+ │              ├── columns: k:1!null j_inverted_key:6!null
+ │              ├── inverted constraint: /6/1
+ │              │    └── spans
+ │              │         ├── ["7\x00\x01*\x02\x00", "7\x00\x01*\x02\x00"]
+ │              │         ├── ["7\x00\x01*\x04\x00", "7\x00\x01*\x04\x00"]
+ │              │         ├── ["7\x00\x01*\x06\x00", "7\x00\x01*\x06\x00"]
+ │              │         ├── ["7\x00\x018", "7\x00\x01:")
+ │              │         ├── ["7\x00\x03\x00\x01*\x02\x00", "7\x00\x03\x00\x01*\x02\x00"]
+ │              │         ├── ["7\x00\x03\x00\x01*\x04\x00", "7\x00\x03\x00\x01*\x04\x00"]
+ │              │         ├── ["7\x00\x03\x00\x01*\x06\x00", "7\x00\x03\x00\x01*\x06\x00"]
+ │              │         ├── ["7a\x00\x018", "7a\x00\x018"]
+ │              │         ├── ["7a\x00\x02\x00\x018", "7a\x00\x02\x00\x018"]
+ │              │         └── ["7a\x00\x02\x00\x03\x00\x01*\x06\x00", "7a\x00\x02\x00\x03\x00\x01*\x06\x00"]
+ │              ├── key: (1)
+ │              └── fd: (1)-->(6)
+ └── filters
+      ├── '{"a": [3]}' @> j:4 [outer=(4), immutable]
+      └── '[1, 2, 3]' @> j:4 [outer=(4), immutable]
 
 # Query using the fetch val and equality operators.
 opt expect=GenerateInvertedIndexScans
@@ -2440,6 +2682,145 @@ project
       └── filters
            └── a:2 IS NULL [outer=(2), constraints=(/2: [/NULL - /NULL]; tight), fd=()-->(2)]
 
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM c WHERE a <@ ARRAY[1]
+----
+select
+ ├── columns: k:1!null a:2 u:3
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2,3)
+ ├── index-join c
+ │    ├── columns: k:1!null a:2 u:3
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2,3)
+ │    └── inverted-filter
+ │         ├── columns: k:1!null
+ │         ├── inverted expression: /5
+ │         │    ├── tight: false, unique: false
+ │         │    └── union spans
+ │         │         ├── ["C", "C"]
+ │         │         └── ["\x89", "\x89"]
+ │         ├── key: (1)
+ │         └── scan c@a_inv_idx
+ │              ├── columns: k:1!null a_inverted_key:5!null
+ │              ├── inverted constraint: /5/1
+ │              │    └── spans
+ │              │         ├── ["C", "C"]
+ │              │         └── ["\x89", "\x89"]
+ │              ├── key: (1)
+ │              └── fd: (1)-->(5)
+ └── filters
+      └── ARRAY[1] @> a:2 [outer=(2), immutable]
+
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM c WHERE a <@ ARRAY[]::INT[]
+----
+select
+ ├── columns: k:1!null a:2 u:3
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2,3)
+ ├── index-join c
+ │    ├── columns: k:1!null a:2 u:3
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2,3)
+ │    └── scan c@a_inv_idx
+ │         ├── columns: k:1!null
+ │         ├── inverted constraint: /5/1
+ │         │    └── spans: ["C", "C"]
+ │         └── key: (1)
+ └── filters
+      └── ARRAY[] @> a:2 [outer=(2), immutable]
+
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM c WHERE a <@ ARRAY[NULL]::INT[]
+----
+select
+ ├── columns: k:1!null a:2 u:3
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2,3)
+ ├── index-join c
+ │    ├── columns: k:1!null a:2 u:3
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2,3)
+ │    └── scan c@a_inv_idx
+ │         ├── columns: k:1!null
+ │         ├── inverted constraint: /5/1
+ │         │    └── spans: ["C", "C"]
+ │         └── key: (1)
+ └── filters
+      └── ARRAY[NULL] @> a:2 [outer=(2), immutable]
+
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM c WHERE a <@ ARRAY[1] OR a <@ ARRAY[2]
+----
+select
+ ├── columns: k:1!null a:2 u:3
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2,3)
+ ├── index-join c
+ │    ├── columns: k:1!null a:2 u:3
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2,3)
+ │    └── inverted-filter
+ │         ├── columns: k:1!null
+ │         ├── inverted expression: /5
+ │         │    ├── tight: false, unique: false
+ │         │    └── union spans
+ │         │         ├── ["C", "C"]
+ │         │         └── ["\x89", "\x8b")
+ │         ├── key: (1)
+ │         └── scan c@a_inv_idx
+ │              ├── columns: k:1!null a_inverted_key:5!null
+ │              ├── inverted constraint: /5/1
+ │              │    └── spans
+ │              │         ├── ["C", "C"]
+ │              │         └── ["\x89", "\x8b")
+ │              ├── key: (1)
+ │              └── fd: (1)-->(5)
+ └── filters
+      └── (ARRAY[1] @> a:2) OR (ARRAY[2] @> a:2) [outer=(2), immutable]
+
+opt expect=GenerateInvertedIndexScans
+SELECT * FROM c WHERE a <@ ARRAY[1] AND a <@ ARRAY[2]
+----
+select
+ ├── columns: k:1!null a:2 u:3
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2,3)
+ ├── index-join c
+ │    ├── columns: k:1!null a:2 u:3
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2,3)
+ │    └── inverted-filter
+ │         ├── columns: k:1!null
+ │         ├── inverted expression: /5
+ │         │    ├── tight: false, unique: false
+ │         │    ├── union spans: ["C", "C"]
+ │         │    └── INTERSECTION
+ │         │         ├── span expression
+ │         │         │    ├── tight: false, unique: false
+ │         │         │    └── union spans: ["\x89", "\x89"]
+ │         │         └── span expression
+ │         │              ├── tight: false, unique: false
+ │         │              └── union spans: ["\x8a", "\x8a"]
+ │         ├── key: (1)
+ │         └── scan c@a_inv_idx
+ │              ├── columns: k:1!null a_inverted_key:5!null
+ │              ├── inverted constraint: /5/1
+ │              │    └── spans
+ │              │         ├── ["C", "C"]
+ │              │         └── ["\x89", "\x8b")
+ │              ├── key: (1)
+ │              └── fd: (1)-->(5)
+ └── filters
+      ├── ARRAY[1] @> a:2 [outer=(2), immutable]
+      └── ARRAY[2] @> a:2 [outer=(2), immutable]
+
 # Tests for indexes with older descriptor versions.
 
 exec-ddl
@@ -2518,6 +2899,23 @@ index-join b
            │         └── ["7\x00\x03", "7\x00\x03"]
            ├── key: (1)
            └── fd: (1)-->(7)
+
+# The inverted index will never be used for <@ expressions if the index version
+# does not have empty arrays in the inverted index.
+opt expect-not=GenerateInvertedIndexScans
+SELECT * FROM c WHERE a <@ '{2}'
+----
+select
+ ├── columns: k:1!null a:2 u:3
+ ├── immutable
+ ├── key: (1)
+ ├── fd: (1)-->(2,3)
+ ├── scan c
+ │    ├── columns: k:1!null a:2 u:3
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2,3)
+ └── filters
+      └── ARRAY[2] @> a:2 [outer=(2), immutable]
 
 exec-ddl
 DROP INDEX j_inv_idx
@@ -3524,7 +3922,7 @@ memo (optimized, ~11KB, required=[presentation: k:1,s:2,j:3])
  ├── G2: (scan pi,cols=(1-3))
  │    └── []
  │         ├── best: (scan pi,cols=(1-3))
- │         └── cost: 1064.02
+ │         └── cost: 1074.61
  ├── G3: (filters G7 G8)
  ├── G4: (index-join G9 pi,cols=(1-3))
  │    └── []
@@ -3568,11 +3966,11 @@ memo (optimized, ~7KB, required=[presentation: k:1,s:2,j:3])
  ├── G1: (select G2 G3)
  │    └── [presentation: k:1,s:2,j:3]
  │         ├── best: (select G2 G3)
- │         └── cost: 1074.05
+ │         └── cost: 1084.64
  ├── G2: (scan pi,cols=(1-3))
  │    └── []
  │         ├── best: (scan pi,cols=(1-3))
- │         └── cost: 1064.02
+ │         └── cost: 1074.61
  ├── G3: (filters G4 G5)
  ├── G4: (contains G6 G7)
  ├── G5: (eq G8 G9)
@@ -3989,11 +4387,11 @@ select
  ├── columns: k:1!null a:2!null b:3!null c:4 geom:5!null
  ├── immutable
  ├── key: (1)
- ├── fd: (1)-->(2-5)
+ ├── fd: (1)-->(2-5), (2)-->(4)
  ├── index-join mc
  │    ├── columns: k:1!null a:2!null b:3!null c:4 geom:5
  │    ├── key: (1)
- │    ├── fd: (1)-->(2-5)
+ │    ├── fd: (1)-->(2-5), (2)-->(4)
  │    └── inverted-filter
  │         ├── columns: k:1!null
  │         ├── inverted expression: /7
@@ -4037,11 +4435,11 @@ select
  ├── columns: k:1!null a:2!null b:3!null c:4 geom:5!null
  ├── immutable
  ├── key: (1)
- ├── fd: ()-->(2), (1)-->(3-5)
+ ├── fd: ()-->(2,4), (1)-->(3,5)
  ├── index-join mc
  │    ├── columns: k:1!null a:2!null b:3!null c:4 geom:5
  │    ├── key: (1)
- │    ├── fd: (1)-->(2-5)
+ │    ├── fd: (1)-->(2-5), (2)-->(4)
  │    └── inverted-filter
  │         ├── columns: k:1!null
  │         ├── inverted expression: /8
@@ -4086,11 +4484,11 @@ select
  ├── columns: k:1!null a:2!null b:3!null c:4 geom:5!null
  ├── immutable
  ├── key: (1)
- ├── fd: ()-->(2), (1)-->(3-5)
+ ├── fd: ()-->(2,4), (1)-->(3,5)
  ├── index-join mc
  │    ├── columns: k:1!null a:2!null b:3!null c:4 geom:5
  │    ├── key: (1)
- │    ├── fd: (1)-->(2-5)
+ │    ├── fd: (1)-->(2-5), (2)-->(4)
  │    └── inverted-filter
  │         ├── columns: k:1!null
  │         ├── inverted expression: /9
@@ -4125,11 +4523,11 @@ select
  ├── columns: k:1!null a:2!null b:3!null c:4 geom:5!null
  ├── immutable
  ├── key: (1)
- ├── fd: (1)-->(2-5)
+ ├── fd: (1)-->(2-5), (2)-->(4)
  ├── index-join mc
  │    ├── columns: k:1!null a:2!null b:3!null c:4 geom:5
  │    ├── key: (1)
- │    ├── fd: (1)-->(2-5)
+ │    ├── fd: (1)-->(2-5), (2)-->(4)
  │    └── inverted-filter
  │         ├── columns: k:1!null
  │         ├── inverted expression: /9
@@ -4262,7 +4660,7 @@ memo (optimized, ~13KB, required=[presentation: q:2,r:3])
  ├── G2: (scan pqr,cols=(2,3))
  │    └── []
  │         ├── best: (scan pqr,cols=(2,3))
- │         └── cost: 1074.02
+ │         └── cost: 1084.71
  ├── G3: (filters G9 G10)
  ├── G4: (index-join G11 pqr,cols=(2,3))
  │    └── []
@@ -4343,7 +4741,7 @@ memo (optimized, ~15KB, required=[presentation: q:2,r:3,s:4])
  ├── G2: (scan pqr,cols=(2-4))
  │    └── []
  │         ├── best: (scan pqr,cols=(2-4))
- │         └── cost: 1084.02
+ │         └── cost: 1094.81
  ├── G3: (filters G11 G12)
  ├── G4: (index-join G13 pqr,cols=(2-4))
  │    └── []
@@ -4408,7 +4806,7 @@ memo (optimized, ~11KB, required=[presentation: q:2,s:4])
  ├── G2: (scan pqr,cols=(2,4))
  │    └── []
  │         ├── best: (scan pqr,cols=(2,4))
- │         └── cost: 1074.02
+ │         └── cost: 1084.71
  ├── G3: (filters G8 G9)
  ├── G4: (index-join G10 pqr,cols=(2,4))
  │    └── []
@@ -4462,7 +4860,7 @@ memo (optimized, ~13KB, required=[presentation: r:3,t:5])
  ├── G2: (scan pqr,cols=(3,5))
  │    └── []
  │         ├── best: (scan pqr,cols=(3,5))
- │         └── cost: 1074.02
+ │         └── cost: 1084.71
  ├── G3: (filters G9 G10)
  ├── G4: (index-join G11 pqr,cols=(3,5))
  │    └── []
@@ -4864,7 +5262,7 @@ memo (optimized, ~31KB, required=[presentation: p:1,q:2,r:3,s:4])
  ├── G2: (scan pqr,cols=(1-4))
  │    └── []
  │         ├── best: (scan pqr,cols=(1-4))
- │         └── cost: 1094.02
+ │         └── cost: 1104.91
  ├── G3: (filters G14 G15 G16)
  ├── G4: (index-join G17 pqr,cols=(1-4))
  │    └── []
@@ -4956,7 +5354,7 @@ memo (optimized, ~9KB, required=[presentation: q:2,t:5])
  ├── G2: (scan pqr,cols=(2,5))
  │    └── []
  │         ├── best: (scan pqr,cols=(2,5))
- │         └── cost: 1074.02
+ │         └── cost: 1084.71
  ├── G3: (filters G8 G9)
  ├── G4: (index-join G10 pqr,cols=(2,5))
  │    └── []
@@ -5000,7 +5398,7 @@ memo (optimized, ~6KB, required=[presentation: c:3])
  ├── G4: (scan zz_redundant,cols=(2,3)) (scan zz_redundant@idx_u,cols=(2,3)) (scan zz_redundant@idx_v,cols=(2,3))
  │    └── []
  │         ├── best: (scan zz_redundant,cols=(2,3))
- │         └── cost: 1054.02
+ │         └── cost: 1064.51
  ├── G5: (filters G6)
  ├── G6: (eq G7 G8)
  ├── G7: (variable b)
@@ -6376,7 +6774,7 @@ project
 # memo when there is a partial index with a predicate identical to the
 # disjunction in the query filter.
 exec-ddl
-CREATE TABLE t (
+CREATE TABLE t58390 (
   k INT PRIMARY KEY,
   a INT,
   b INT,
@@ -6386,75 +6784,224 @@ CREATE TABLE t (
 ----
 
 memo
-SELECT * FROM t WHERE a > 1 OR b > 1
+SELECT * FROM t58390 WHERE a > 1 OR b > 1
 ----
 memo (optimized, ~18KB, required=[presentation: k:1,a:2,b:3,c:4])
- ├── G1: (select G2 G3) (index-join G4 t,cols=(1-4)) (distinct-on G5 G6 cols=(1))
+ ├── G1: (select G2 G3) (index-join G4 t58390,cols=(1-4)) (distinct-on G5 G6 cols=(1))
  │    └── [presentation: k:1,a:2,b:3,c:4]
  │         ├── best: (select G2 G3)
- │         └── cost: 1094.04
- ├── G2: (scan t,cols=(1-4))
+ │         └── cost: 1104.83
+ ├── G2: (scan t58390,cols=(1-4))
  │    └── []
- │         ├── best: (scan t,cols=(1-4))
- │         └── cost: 1084.02
+ │         ├── best: (scan t58390,cols=(1-4))
+ │         └── cost: 1094.81
  ├── G3: (filters G7)
- ├── G4: (scan t@secondary,partial,cols=(1,4))
+ ├── G4: (scan t58390@secondary,partial,cols=(1,4))
  │    └── []
- │         ├── best: (scan t@secondary,partial,cols=(1,4))
+ │         ├── best: (scan t58390@secondary,partial,cols=(1,4))
  │         └── cost: 350.68
  ├── G5: (union-all G8 G9)
  │    └── []
  │         ├── best: (union-all G8 G9)
- │         └── cost: 2194.76
+ │         └── cost: 2216.34
  ├── G6: (aggregations G10 G11 G12)
  ├── G7: (or G13 G14)
  ├── G8: (select G15 G16) (select G17 G16)
  │    └── []
  │         ├── best: (select G15 G16)
- │         └── cost: 1094.04
+ │         └── cost: 1104.83
  ├── G9: (select G18 G19) (select G20 G19)
  │    └── []
  │         ├── best: (select G18 G19)
- │         └── cost: 1094.04
+ │         └── cost: 1104.83
  ├── G10: (const-agg G21)
  ├── G11: (const-agg G22)
  ├── G12: (const-agg G23)
  ├── G13: (gt G21 G24)
  ├── G14: (gt G22 G24)
- ├── G15: (scan t,cols=(6-9))
+ ├── G15: (scan t58390,cols=(6-9))
  │    └── []
- │         ├── best: (scan t,cols=(6-9))
- │         └── cost: 1084.02
+ │         ├── best: (scan t58390,cols=(6-9))
+ │         └── cost: 1094.81
  ├── G16: (filters G25)
- ├── G17: (index-join G26 t,cols=(6-9))
+ ├── G17: (index-join G26 t58390,cols=(6-9))
  │    └── []
- │         ├── best: (index-join G26 t,cols=(6-9))
+ │         ├── best: (index-join G26 t58390,cols=(6-9))
  │         └── cost: 2374.02
- ├── G18: (scan t,cols=(11-14))
+ ├── G18: (scan t58390,cols=(11-14))
  │    └── []
- │         ├── best: (scan t,cols=(11-14))
- │         └── cost: 1084.02
+ │         ├── best: (scan t58390,cols=(11-14))
+ │         └── cost: 1094.81
  ├── G19: (filters G27)
- ├── G20: (index-join G28 t,cols=(11-14))
+ ├── G20: (index-join G28 t58390,cols=(11-14))
  │    └── []
- │         ├── best: (index-join G28 t,cols=(11-14))
+ │         ├── best: (index-join G28 t58390,cols=(11-14))
  │         └── cost: 2374.02
  ├── G21: (variable a)
  ├── G22: (variable b)
  ├── G23: (variable c)
  ├── G24: (const 1)
  ├── G25: (gt G29 G24)
- ├── G26: (scan t@secondary,partial,cols=(6,9))
+ ├── G26: (scan t58390@secondary,partial,cols=(6,9))
  │    └── []
- │         ├── best: (scan t@secondary,partial,cols=(6,9))
+ │         ├── best: (scan t58390@secondary,partial,cols=(6,9))
  │         └── cost: 350.68
  ├── G27: (gt G30 G24)
- ├── G28: (scan t@secondary,partial,cols=(11,14))
+ ├── G28: (scan t58390@secondary,partial,cols=(11,14))
  │    └── []
- │         ├── best: (scan t@secondary,partial,cols=(11,14))
+ │         ├── best: (scan t58390@secondary,partial,cols=(11,14))
  │         └── cost: 350.68
  ├── G29: (variable a)
  └── G30: (variable b)
+
+# Regression test for #61795. Equivalence dependencies are propagated to
+# UnionAll expressions generated by SplitDisjunction, preventing failed
+# test-build assertions in ordering.checkRequired that require that ordering
+# column groups contain columns that are known to be equivalent.
+exec-ddl
+CREATE TABLE t61795 (
+  a INT PRIMARY KEY,
+  b INT,
+  c INT,
+  UNIQUE (b)
+)
+----
+
+memo expect=SplitDisjunction
+SELECT t1.a
+FROM t61795 AS t1
+JOIN t61795 AS t2 ON t1.c = t1.b AND t1.b = t2.b
+WHERE t1.a = 10 OR t2.b != abs(t2.b)
+ORDER BY t1.b ASC
+----
+memo (optimized, ~28KB, required=[presentation: a:1] [ordering: +2])
+ ├── G1: (project G2 G3 a b)
+ │    ├── [presentation: a:1] [ordering: +2]
+ │    │    ├── best: (sort G1)
+ │    │    └── cost: 1084.68
+ │    └── []
+ │         ├── best: (project G2 G3 a b)
+ │         └── cost: 1084.65
+ ├── G2: (select G4 G5) (select G6 G7) (distinct-on G8 G9 cols=(1))
+ │    ├── [ordering: +(2|3)]
+ │    │    ├── best: (sort G2)
+ │    │    └── cost: 1084.67
+ │    └── []
+ │         ├── best: (select G4 G5)
+ │         └── cost: 1084.64
+ ├── G3: (projections)
+ ├── G4: (scan t61795 [as=t1],cols=(1-3))
+ │    ├── [ordering: +2]
+ │    │    ├── best: (sort G4)
+ │    │    └── cost: 1323.94
+ │    └── []
+ │         ├── best: (scan t61795 [as=t1],cols=(1-3))
+ │         └── cost: 1074.61
+ ├── G5: (filters G10 G11)
+ ├── G6: (index-join G12 t61795,cols=(1-3))
+ │    ├── [ordering: +2]
+ │    │    ├── best: (index-join G12="[ordering: +2]" t61795,cols=(1-3))
+ │    │    └── cost: 3040.04
+ │    └── []
+ │         ├── best: (index-join G12 t61795,cols=(1-3))
+ │         └── cost: 3040.04
+ ├── G7: (filters G10)
+ ├── G8: (union-all G13 G14)
+ │    ├── [ordering: +(2|3)]
+ │    │    ├── best: (sort G8)
+ │    │    └── cost: 1089.85
+ │    └── []
+ │         ├── best: (union-all G13 G14)
+ │         └── cost: 1089.76
+ ├── G9: (aggregations G15 G16)
+ ├── G10: (eq G17 G18)
+ ├── G11: (or G19 G20)
+ ├── G12: (select G21 G22)
+ │    ├── [ordering: +2]
+ │    │    ├── best: (select G21="[ordering: +2]" G22)
+ │    │    └── cost: 1043.53
+ │    └── []
+ │         ├── best: (select G21 G22)
+ │         └── cost: 1043.53
+ ├── G13: (select G23 G24) (select G25 G26) (select G27 G26)
+ │    └── []
+ │         ├── best: (select G25 G26)
+ │         └── cost: 5.10
+ ├── G14: (select G28 G29) (select G30 G31)
+ │    └── []
+ │         ├── best: (select G28 G29)
+ │         └── cost: 1084.64
+ ├── G15: (const-agg G18)
+ ├── G16: (const-agg G17)
+ ├── G17: (variable t1.c)
+ ├── G18: (variable t1.b)
+ ├── G19: (eq G32 G33)
+ ├── G20: (ne G18 G34)
+ ├── G21: (scan t61795@secondary [as=t1],cols=(1,2),constrained)
+ │    ├── [ordering: +2]
+ │    │    ├── best: (scan t61795@secondary [as=t1],cols=(1,2),constrained)
+ │    │    └── cost: 1033.61
+ │    └── []
+ │         ├── best: (scan t61795@secondary [as=t1],cols=(1,2),constrained)
+ │         └── cost: 1033.61
+ ├── G22: (filters G11)
+ ├── G23: (scan t61795 [as=t1],cols=(9-11))
+ │    └── []
+ │         ├── best: (scan t61795 [as=t1],cols=(9-11))
+ │         └── cost: 1074.61
+ ├── G24: (filters G35 G36)
+ ├── G25: (scan t61795 [as=t1],cols=(9-11),constrained)
+ │    └── []
+ │         ├── best: (scan t61795 [as=t1],cols=(9-11),constrained)
+ │         └── cost: 5.07
+ ├── G26: (filters G35)
+ ├── G27: (index-join G37 t61795,cols=(9-11))
+ │    └── []
+ │         ├── best: (index-join G37 t61795,cols=(9-11))
+ │         └── cost: 1049.59
+ ├── G28: (scan t61795 [as=t1],cols=(13-15))
+ │    └── []
+ │         ├── best: (scan t61795 [as=t1],cols=(13-15))
+ │         └── cost: 1074.61
+ ├── G29: (filters G38 G39)
+ ├── G30: (index-join G40 t61795,cols=(13-15))
+ │    └── []
+ │         ├── best: (index-join G40 t61795,cols=(13-15))
+ │         └── cost: 3040.04
+ ├── G31: (filters G38)
+ ├── G32: (variable t1.a)
+ ├── G33: (const 10)
+ ├── G34: (function G41 abs)
+ ├── G35: (eq G42 G43)
+ ├── G36: (eq G44 G33)
+ ├── G37: (select G45 G46)
+ │    └── []
+ │         ├── best: (select G45 G46)
+ │         └── cost: 1043.53
+ ├── G38: (eq G47 G48)
+ ├── G39: (ne G48 G49)
+ ├── G40: (select G50 G51)
+ │    └── []
+ │         ├── best: (select G50 G51)
+ │         └── cost: 1043.53
+ ├── G41: (scalar-list G18)
+ ├── G42: (variable t1.c)
+ ├── G43: (variable t1.b)
+ ├── G44: (variable t1.a)
+ ├── G45: (scan t61795@secondary [as=t1],cols=(9,10),constrained)
+ │    └── []
+ │         ├── best: (scan t61795@secondary [as=t1],cols=(9,10),constrained)
+ │         └── cost: 1033.61
+ ├── G46: (filters G36)
+ ├── G47: (variable t1.c)
+ ├── G48: (variable t1.b)
+ ├── G49: (function G52 abs)
+ ├── G50: (scan t61795@secondary [as=t1],cols=(13,14),constrained)
+ │    └── []
+ │         ├── best: (scan t61795@secondary [as=t1],cols=(13,14),constrained)
+ │         └── cost: 1033.61
+ ├── G51: (filters G39)
+ └── G52: (scalar-list G48)
 
 # --------------------------------------------------
 # SplitDisjunctionAddKey

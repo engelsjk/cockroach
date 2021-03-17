@@ -20,7 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupbase"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupresolver"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
@@ -332,9 +332,9 @@ func spansForAllTableIndexes(
 		// entire interval. DROPPED tables should never later become PUBLIC.
 		// TODO(pbardea): Consider and test the interaction between revision_history
 		// backups and OFFLINE tables.
-		rawTbl := descpb.TableFromDescriptor(rev.Desc, hlc.Timestamp{})
+		rawTbl, _, _, _ := descpb.FromDescriptor(rev.Desc)
 		if rawTbl != nil && rawTbl.State != descpb.DescriptorState_DROP {
-			tbl := tabledesc.NewImmutable(*rawTbl)
+			tbl := tabledesc.NewBuilder(rawTbl).BuildImmutableTable()
 			revSpans, err := getLogicallyMergedTableSpans(tbl, added, execCfg.Codec, rev.Time,
 				checkForKVInBounds)
 			if err != nil {
@@ -808,13 +808,30 @@ func backupPlanHook(
 			mvccFilter = MVCCFilter_All
 		}
 
-		targetDescs, completeDBs, err := backupbase.ResolveTargetsToDescriptors(ctx, p, endTime, backupStmt.Targets)
-		if err != nil {
-			return errors.Wrap(err, "failed to resolve targets specified in the BACKUP stmt")
-		}
+		var targetDescs []catalog.Descriptor
+		var completeDBs []descpb.ID
 
-		if backupStmt.Coverage() == tree.AllDescriptors && len(targetDescs) == 0 {
-			return errors.New("no descriptors available to backup at selected time")
+		switch backupStmt.Coverage() {
+		case tree.RequestedDescriptors:
+			var err error
+			targetDescs, completeDBs, err = backupresolver.ResolveTargetsToDescriptors(ctx, p, endTime, backupStmt.Targets)
+			if err != nil {
+				return errors.Wrap(err, "failed to resolve targets specified in the BACKUP stmt")
+			}
+		case tree.AllDescriptors:
+			allDescs, err := backupresolver.LoadAllDescs(ctx, p.ExecCfg().Codec, p.ExecCfg().DB, endTime)
+			if err != nil {
+				return err
+			}
+			targetDescs, completeDBs, err = fullClusterTargetsBackup(allDescs)
+			if err != nil {
+				return err
+			}
+			if len(targetDescs) == 0 {
+				return errors.New("no descriptors available to backup at selected time")
+			}
+		default:
+			return errors.AssertionFailedf("unexpected descriptor coverage %v", backupStmt.Coverage())
 		}
 
 		// Check BACKUP privileges.
@@ -958,7 +975,7 @@ func backupPlanHook(
 
 			// Include all tenants.
 			// TODO(tbg): make conditional on cluster setting.
-			tenantRows, err = p.ExecCfg().InternalExecutor.Query(
+			tenantRows, err = p.ExecCfg().InternalExecutor.QueryBuffered(
 				ctx, "backup-lookup-tenant", p.ExtendedEvalContext().Txn,
 				`SELECT id, active, info FROM system.tenants`,
 			)
@@ -996,7 +1013,7 @@ func backupPlanHook(
 			dbsInPrev := make(map[descpb.ID]struct{})
 			rawDescs := prevBackups[len(prevBackups)-1].Descriptors
 			for i := range rawDescs {
-				if t := descpb.TableFromDescriptor(&rawDescs[i], hlc.Timestamp{}); t != nil {
+				if t, _, _, _ := descpb.FromDescriptor(&rawDescs[i]); t != nil {
 					tablesInPrev[t.ID] = struct{}{}
 				}
 			}
@@ -1034,7 +1051,7 @@ func backupPlanHook(
 				return errors.Wrap(err, "invalid previous backups")
 			}
 			if coveredTime != startTime {
-				return errors.Wrapf(err, "expected previous backups to cover until time %v, got %v", startTime, coveredTime)
+				return errors.Errorf("expected previous backups to cover until time %v, got %v", startTime, coveredTime)
 			}
 		}
 
@@ -1119,7 +1136,7 @@ func backupPlanHook(
 		//  2. Verifies we can write to destination location.
 		// This temporary checkpoint file gets renamed to real checkpoint
 		// file when the backup jobs starts execution.
-		doWriteBackupManifestCheckpoint := func(ctx context.Context, jobID int64) error {
+		doWriteBackupManifestCheckpoint := func(ctx context.Context, jobID jobspb.JobID) error {
 			if err := writeBackupManifest(
 				ctx, p.ExecCfg().Settings, defaultStore, tempCheckpointFileNameForJob(jobID),
 				encryptionOptions, &backupManifest,
@@ -1335,7 +1352,7 @@ func protectTimestampForBackup(
 	ctx context.Context,
 	p sql.PlanHookState,
 	txn *kv.Txn,
-	jobID int64,
+	jobID jobspb.JobID,
 	spans []roachpb.Span,
 	startTime, endTime hlc.Timestamp,
 	backupDetails jobspb.BackupDetails,

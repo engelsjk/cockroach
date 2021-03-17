@@ -251,10 +251,21 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			unique:   true,
 		},
 		{
-			// Contained by is not yet supported.
-			filters:  "j <@ '1'",
-			indexOrd: jsonOrd,
-			ok:       false,
+			// Contained by is supported for json.
+			filters:          "j <@ '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j <@ '1'",
+		},
+		{
+			filters:          `j <@ '{"a": 1}'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j <@ '{"a": 1}'`,
 		},
 		{
 			filters:  "a @> '{1}'",
@@ -264,10 +275,21 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			unique:   true,
 		},
 		{
-			// Contained by is not yet supported.
-			filters:  "a <@ '{1}'",
-			indexOrd: arrayOrd,
-			ok:       false,
+			// Contained by is supported for arrays.
+			filters:          "a <@ '{1}'",
+			indexOrd:         arrayOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "a <@ '{1}'",
+		},
+		{
+			filters:          "a <@ '{}'",
+			indexOrd:         arrayOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "a <@ '{}'",
 		},
 		{
 			// Wrong index ordinal.
@@ -289,6 +311,20 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			ok:       false,
 		},
 		{
+			// When operations affecting two different variables are OR-ed, we cannot
+			// constrain either index.
+			filters:  "j <@ '1' OR a <@ '{1}'",
+			indexOrd: jsonOrd,
+			ok:       false,
+		},
+		{
+			// When operations affecting two different variables are OR-ed, we cannot
+			// constrain either index.
+			filters:  "j <@ '1' OR a <@ '{1}'",
+			indexOrd: arrayOrd,
+			ok:       false,
+		},
+		{
 			// We can constrain either index when the functions are AND-ed.
 			filters:          "j @> '1' AND a @> '{1}'",
 			indexOrd:         jsonOrd,
@@ -305,6 +341,24 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			tight:            false,
 			unique:           true,
 			remainingFilters: "j @> '1'",
+		},
+		{
+			// We can constrain the array index when the functions are AND-ed.
+			filters:          "j <@ '1' AND a <@ '{1}'",
+			indexOrd:         arrayOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "j <@ '1' AND a <@ '{1}'",
+		},
+		{
+			// We can constrain the JSON index when the functions are AND-ed.
+			filters:          "j <@ '1' AND a <@ '{1}'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j <@ '1' AND a <@ '{1}'",
 		},
 		{
 			// We can guarantee unique primary keys when there are multiple paths

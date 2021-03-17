@@ -12,6 +12,7 @@ package exec
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
@@ -61,6 +62,11 @@ type ScanParams struct {
 	Locking *tree.LockingItem
 
 	EstimatedRowCount float64
+
+	// If true, we are performing a locality optimized search. In order for this
+	// to work correctly, the execution engine must create a local DistSQL plan
+	// for the main query (subqueries and postqueries need not be local).
+	LocalityOptimized bool
 }
 
 // OutputOrdering indicates the required output ordering on a Node that is being
@@ -286,9 +292,12 @@ type EstimatedStats struct {
 	TableStatsAvailable bool
 	// RowCount is the estimated number of rows produced by the operator.
 	RowCount float64
-	// TableRowCount is set only for scans; it is the estimated total number of
-	// rows in the table we are scanning.
-	TableRowCount float64
+	// TableStatsRowCount is set only for scans; it is the estimated total number
+	// of rows in the table we are scanning.
+	TableStatsRowCount uint64
+	// TableStatsCreatedAt is set only for scans; it is the time when the latest
+	// table statistics were collected.
+	TableStatsCreatedAt time.Time
 	// Cost is the estimated cost of the operator. This cost includes the costs of
 	// the child operators.
 	Cost float64

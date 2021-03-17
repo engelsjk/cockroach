@@ -45,7 +45,7 @@ func SetSmallMaxGCIntervalForTest() func() {
 }
 
 type schemaChangeGCResumer struct {
-	jobID int64
+	jobID jobspb.JobID
 }
 
 // performGC GCs any schema elements that are in the DELETING state and returns
@@ -105,7 +105,7 @@ func (r schemaChangeGCResumer) Resume(ctx context.Context, execCtx interface{}) 
 		if err := sql.TruncateInterleavedIndexes(
 			ctx,
 			execCfg,
-			tabledesc.NewImmutable(*details.InterleavedTable),
+			tabledesc.NewBuilder(details.InterleavedTable).BuildImmutableTable(),
 			details.InterleavedIndexes,
 		); err != nil {
 			return err

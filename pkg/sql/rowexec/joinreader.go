@@ -13,7 +13,6 @@ package rowexec
 import (
 	"context"
 	"sort"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -150,7 +149,6 @@ var _ execinfra.Processor = &joinReader{}
 var _ execinfra.RowSource = &joinReader{}
 var _ execinfrapb.MetadataSource = &joinReader{}
 var _ execinfra.OpNode = &joinReader{}
-var _ execinfra.KVReader = &joinReader{}
 
 const joinReaderProcName = "join reader"
 
@@ -204,7 +202,7 @@ func newJoinReader(
 		return nil, errors.Errorf("unsupported joinReaderType")
 	}
 	jr := &joinReader{
-		desc:                              tabledesc.NewImmutable(spec.Table),
+		desc:                              tabledesc.NewBuilder(&spec.Table).BuildImmutableTable(),
 		maintainOrdering:                  spec.MaintainOrdering,
 		input:                             input,
 		lookupCols:                        lookupCols,
@@ -282,9 +280,13 @@ func newJoinReader(
 		output,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{jr.input},
-			TrailingMetaCallback: func(ctx context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
+				// We need to generate metadata before closing the processor
+				// because InternalClose() updates jr.Ctx to the "original"
+				// context.
+				trailingMeta := jr.generateMeta(jr.Ctx)
 				jr.close()
-				return jr.generateMeta(ctx)
+				return trailingMeta
 			},
 		},
 	); err != nil {
@@ -413,7 +415,7 @@ func (jr *joinReader) initJoinReaderStrategy(
 	limit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
 	// Initialize memory monitors and row container for looked up rows.
 	jr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx.Cfg, "joinreader-limited")
-	jr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.Cfg.DiskMonitor, "joinreader-disk")
+	jr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, "joinreader-disk")
 	drc := rowcontainer.NewDiskBackedNumberedRowContainer(
 		false, /* deDup */
 		typs,
@@ -700,12 +702,8 @@ func (jr *joinReader) emitRow() (
 
 // Start is part of the RowSource interface.
 func (jr *joinReader) Start(ctx context.Context) {
-	jr.input.Start(ctx)
 	ctx = jr.StartInternal(ctx, joinReaderProcName)
-	// Go around "this value of ctx is never used" linter error. We do it this
-	// way instead of omitting the assignment to ctx above so that if in the
-	// future other initialization is added, the correct ctx is used.
-	_ = ctx
+	jr.input.Start(ctx)
 	jr.runningState = jrReadingInput
 }
 
@@ -745,36 +743,21 @@ func (jr *joinReader) execStatsForTrace() *execinfrapb.ComponentStats {
 	return &execinfrapb.ComponentStats{
 		Inputs: []execinfrapb.InputStats{is},
 		KV: execinfrapb.KVStats{
-			BytesRead:      optional.MakeUint(uint64(jr.GetBytesRead())),
+			BytesRead:      optional.MakeUint(uint64(jr.fetcher.GetBytesRead())),
 			TuplesRead:     fis.NumTuples,
 			KVTime:         fis.WaitTime,
-			ContentionTime: optional.MakeTimeValue(jr.GetCumulativeContentionTime()),
+			ContentionTime: optional.MakeTimeValue(execinfra.GetCumulativeContentionTime(jr.Ctx)),
 		},
 		Output: jr.Out.Stats(),
 	}
 }
 
-// GetBytesRead is part of the execinfra.KVReader interface.
-func (jr *joinReader) GetBytesRead() int64 {
-	return jr.fetcher.GetBytesRead()
-}
-
-// GetRowsRead is part of the execinfra.KVReader interface.
-func (jr *joinReader) GetRowsRead() int64 {
-	return jr.rowsRead
-}
-
-// GetCumulativeContentionTime is part of the execinfra.KVReader interface.
-func (jr *joinReader) GetCumulativeContentionTime() time.Duration {
-	return execinfra.GetCumulativeContentionTime(jr.Ctx)
-}
-
 func (jr *joinReader) generateMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
-	trailingMeta := make([]execinfrapb.ProducerMetadata, 1)
+	trailingMeta := make([]execinfrapb.ProducerMetadata, 1, 2)
 	meta := &trailingMeta[0]
 	meta.Metrics = execinfrapb.GetMetricsMeta()
-	meta.Metrics.RowsRead = jr.GetRowsRead()
-	meta.Metrics.BytesRead = jr.GetBytesRead()
+	meta.Metrics.RowsRead = jr.rowsRead
+	meta.Metrics.BytesRead = jr.fetcher.GetBytesRead()
 	if tfs := execinfra.GetLeafTxnFinalState(ctx, jr.FlowCtx.Txn); tfs != nil {
 		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}

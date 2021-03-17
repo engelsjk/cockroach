@@ -199,8 +199,8 @@ func GetResumeSpans(
 	// Find the index of the first mutation that is being worked on.
 	const noIndex = -1
 	mutationIdx := noIndex
-	for i, m := range tableDesc.GetMutations() {
-		if m.MutationID != mutationID {
+	for i, m := range tableDesc.AllMutations() {
+		if m.MutationID() != mutationID {
 			break
 		}
 		if mutationIdx == noIndex && filter(m) {
@@ -214,7 +214,7 @@ func GetResumeSpans(
 	}
 
 	// Find the job.
-	var jobID int64
+	var jobID jobspb.JobID
 	if len(tableDesc.GetMutationJobs()) > 0 {
 		// TODO (lucy): We need to get rid of MutationJobs. This is the only place
 		// where we need to get the job where it's not completely straightforward to
@@ -222,7 +222,7 @@ func GetResumeSpans(
 		// know which job it's associated with.
 		for _, job := range tableDesc.GetMutationJobs() {
 			if job.MutationID == mutationID {
-				jobID = job.JobID
+				jobID = jobspb.JobID(job.JobID)
 				break
 			}
 		}

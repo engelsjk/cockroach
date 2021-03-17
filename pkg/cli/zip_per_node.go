@@ -66,6 +66,7 @@ var debugZipTablesPerNode = []string{
 	"crdb_internal.leases",
 
 	"crdb_internal.node_build_info",
+	"crdb_internal.node_contention_events",
 	"crdb_internal.node_inflight_trace_spans",
 	"crdb_internal.node_metrics",
 	"crdb_internal.node_queries",
@@ -196,11 +197,11 @@ func (zc *debugZipContext) collectPerNodeData(
 	fmt.Printf("using SQL connection URL for node %s: %s\n", id, curSQLConn.url)
 
 	for _, table := range debugZipTablesPerNode {
-		selectClause, ok := customSelectClause[table]
-		if !ok {
-			selectClause = "*"
+		query := fmt.Sprintf(`SELECT * FROM %s`, table)
+		if override, ok := customQuery[table]; ok {
+			query = override
 		}
-		if err := zc.dumpTableDataForZip(curSQLConn, prefix, table, selectClause); err != nil {
+		if err := zc.dumpTableDataForZip(curSQLConn, prefix, table, query); err != nil {
 			return errors.Wrapf(err, "fetching %s", table)
 		}
 	}

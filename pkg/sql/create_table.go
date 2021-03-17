@@ -134,7 +134,12 @@ func (p *planner) getSchemaIDForCreate(
 // as well as the schema id. It returns valid data in the case that
 // the desired object exists.
 func getTableCreateParams(
-	params runParams, dbID descpb.ID, persistence tree.Persistence, tableName *tree.TableName,
+	params runParams,
+	dbID descpb.ID,
+	persistence tree.Persistence,
+	tableName *tree.TableName,
+	kind tree.RequiredTableKind,
+	ifNotExists bool,
 ) (tKey catalogkeys.DescriptorKey, schemaID descpb.ID, err error) {
 	// Check we are not creating a table which conflicts with an alias available
 	// as a built-in type in CockroachDB but an extension type on the public
@@ -196,26 +201,64 @@ func getTableCreateParams(
 		return nil, 0, err
 	}
 
-	exists, id, err := catalogkv.LookupObjectID(
-		params.ctx, params.p.txn, params.ExecCfg().Codec, dbID, schemaID, tableName.Table())
-	if err == nil && exists {
-		// Try and see what kind of object we collided with.
-		desc, err := catalogkv.GetAnyDescriptorByID(params.ctx, params.p.txn, params.ExecCfg().Codec, id, catalogkv.Immutable)
-		if err != nil {
-			return nil, 0, sqlerrors.WrapErrorWhileConstructingObjectAlreadyExistsErr(err)
-		}
-		// Still return data in this case.
-		return tKey, schemaID, sqlerrors.MakeObjectAlreadyExistsError(desc.DescriptorProto(), tableName.Table())
-	} else if err != nil {
-		return nil, 0, err
+	desc, err := catalogkv.GetDescriptorCollidingWithObject(
+		params.ctx,
+		params.p.txn,
+		params.ExecCfg().Codec,
+		dbID,
+		schemaID,
+		tableName.Table(),
+	)
+	if err != nil {
+		return nil, descpb.InvalidID, err
 	}
+	if desc != nil {
+		// Ensure that the descriptor that does exist has the appropriate type.
+		{
+			mismatchedType := true
+			if tableDescriptor, ok := desc.(catalog.TableDescriptor); ok {
+				mismatchedType = false
+				switch kind {
+				case tree.ResolveRequireTableDesc:
+					mismatchedType = !tableDescriptor.IsTable()
+				case tree.ResolveRequireViewDesc:
+					mismatchedType = !tableDescriptor.IsView()
+				case tree.ResolveRequireSequenceDesc:
+					mismatchedType = !tableDescriptor.IsSequence()
+				}
+				// If kind any is passed then there will never be a mismatch
+				// and we can return an exists error.
+			}
+			// Only complain about mismatched types for
+			// if not exists clauses.
+			if mismatchedType && ifNotExists {
+				return nil, descpb.InvalidID, pgerror.Newf(pgcode.WrongObjectType,
+					"%q is not a %s",
+					tableName.Table(),
+					kind)
+			}
+		}
+
+		// Check if the object already exists in a dropped state
+		if desc.Dropped() {
+			return nil, descpb.InvalidID, pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+				"%s %q is being dropped, try again later",
+				kind,
+				tableName.Table())
+		}
+
+		// Still return data in this case.
+		return tKey, schemaID, sqlerrors.MakeObjectAlreadyExistsError(desc.DescriptorProto(), tableName.FQString())
+	}
+
 	return tKey, schemaID, nil
 }
 
 func (n *createTableNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("table"))
 
-	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), n.n.Persistence, &n.n.Table)
+	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), n.n.Persistence, &n.n.Table,
+		tree.ResolveRequireTableDesc, n.n.IfNotExists)
 	if err != nil {
 		if sqlerrors.IsRelationAlreadyExistsError(err) && n.n.IfNotExists {
 			return nil
@@ -364,21 +407,16 @@ func (n *createTableNode) startExec(params runParams) error {
 		return err
 	}
 
+	if err := validateDescriptor(params.ctx, params.p, desc); err != nil {
+		return err
+	}
+
 	if desc.LocalityConfig != nil {
-		_, dbDesc, err := params.p.Descriptors().GetImmutableDatabaseByID(
-			params.ctx,
-			params.p.txn,
-			desc.ParentID,
-			tree.DatabaseLookupFlags{Required: true},
-		)
-		if err != nil {
-			return errors.Wrap(err, "error resolving database for multi-region")
-		}
 		if err := ApplyZoneConfigForMultiRegionTable(
 			params.ctx,
 			params.p.txn,
 			params.p.ExecCfg(),
-			*dbDesc.RegionConfig,
+			*n.dbDesc.GetRegionConfig(),
 			desc,
 			ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes,
 		); err != nil {
@@ -390,7 +428,7 @@ func (n *createTableNode) startExec(params runParams) error {
 			typeDesc, err := params.p.Descriptors().GetMutableTypeVersionByID(
 				params.ctx,
 				params.p.txn,
-				dbDesc.RegionConfig.RegionEnumID,
+				n.dbDesc.GetRegionConfig().RegionEnumID,
 			)
 			if err != nil {
 				return errors.Wrap(err, "error resolving multi-region enum")
@@ -402,11 +440,6 @@ func (n *createTableNode) startExec(params runParams) error {
 				return errors.Wrap(err, "error adding backreference to multi-region enum")
 			}
 		}
-	}
-
-	dg := catalogkv.NewOneLevelUncachedDescGetter(params.p.txn, params.ExecCfg().Codec)
-	if err := desc.Validate(params.ctx, dg); err != nil {
-		return err
 	}
 
 	// Log Create Table event. This is an auditable log event and is
@@ -585,12 +618,10 @@ func (p *planner) MaybeUpgradeDependentOldForeignKeyVersionTables(
 	maybeUpgradeFKRepresentation := func(id descpb.ID) error {
 		// Read the referenced table and see if the foreign key representation has changed. If it has, write
 		// the upgraded descriptor back to disk.
-		desc, err := catalogkv.GetDescriptorByID(ctx, p.txn, p.ExecCfg().Codec, id,
-			catalogkv.Mutable, catalogkv.TableDescriptorKind, true /* required */)
+		tbl, err := catalogkv.MustGetMutableTableDescByID(ctx, p.txn, p.ExecCfg().Codec, id)
 		if err != nil {
 			return err
 		}
-		tbl := desc.(*tabledesc.Mutable)
 		changes := tbl.GetPostDeserializationChanges()
 		if changes.UpgradedForeignKeyRepresentation {
 			err := p.writeSchemaChange(ctx, tbl, descpb.InvalidMutationID,
@@ -751,7 +782,7 @@ func ResolveUniqueWithoutIndexConstraint(
 	}
 
 	// Verify we are not writing a constraint over the same name.
-	constraintInfo, err := tbl.GetConstraintInfo(ctx, nil)
+	constraintInfo, err := tbl.GetConstraintInfo()
 	if err != nil {
 		return err
 	}
@@ -950,7 +981,7 @@ func ResolveFK(
 	// or else we can hit other checks that break things with
 	// undesired error codes, e.g. #42858.
 	// It may be removable after #37255 is complete.
-	constraintInfo, err := tbl.GetConstraintInfo(ctx, nil)
+	constraintInfo, err := tbl.GetConstraintInfo()
 	if err != nil {
 		return err
 	}
@@ -1152,6 +1183,10 @@ func addInterleave(
 	if interleave.DropBehavior != tree.DropDefault {
 		return unimplemented.NewWithIssuef(
 			7854, "unsupported shorthand %s", interleave.DropBehavior)
+	}
+
+	if desc.IsLocalityRegionalByRow() {
+		return interleaveOnRegionalByRowError()
 	}
 
 	parentTable, err := resolver.ResolveExistingTableObject(
@@ -1430,6 +1465,21 @@ func newTableDescIfAs(
 	return desc, nil
 }
 
+type newTableDescOptions struct {
+	bypassLocalityOnNonMultiRegionDatabaseCheck bool
+}
+
+// NewTableDescOption is an option on NewTableDesc.
+type NewTableDescOption func(o *newTableDescOptions)
+
+// NewTableDescOptionBypassLocalityOnNonMultiRegionDatabaseCheck will allow
+// LOCALITY on non multi-region tables.
+func NewTableDescOptionBypassLocalityOnNonMultiRegionDatabaseCheck() NewTableDescOption {
+	return func(o *newTableDescOptions) {
+		o.bypassLocalityOnNonMultiRegionDatabaseCheck = true
+	}
+}
+
 // NewTableDesc creates a table descriptor from a CreateTable statement.
 //
 // txn and vt can be nil if the table to be created does not contain references
@@ -1461,7 +1511,8 @@ func NewTableDesc(
 	vt resolver.SchemaResolver,
 	st *cluster.Settings,
 	n *tree.CreateTable,
-	parentID, parentSchemaID, id, regionEnumID descpb.ID,
+	parentID, parentSchemaID, id descpb.ID,
+	regionConfig *descpb.DatabaseDescriptor_RegionConfig,
 	creationTime hlc.Timestamp,
 	privileges *descpb.PrivilegeDescriptor,
 	affected map[descpb.ID]*tabledesc.Mutable,
@@ -1469,10 +1520,16 @@ func NewTableDesc(
 	evalCtx *tree.EvalContext,
 	sessionData *sessiondata.SessionData,
 	persistence tree.Persistence,
+	inOpts ...NewTableDescOption,
 ) (*tabledesc.Mutable, error) {
 	// Used to delay establishing Column/Sequence dependency until ColumnIDs have
 	// been populated.
 	columnDefaultExprs := make([]tree.TypedExpr, len(n.Defs))
+
+	var opts newTableDescOptions
+	for _, o := range inOpts {
+		o(&opts)
+	}
 
 	desc := tabledesc.InitTableDescriptor(
 		id, parentID, parentSchemaID, n.Table.Table(), creationTime, privileges, persistence,
@@ -1498,34 +1555,57 @@ func NewTableDesc(
 		}
 	}
 
-	// Add implied columns under REGIONAL BY ROW.
-	locality := n.Locality
+	isRegionalByRow := n.Locality != nil && n.Locality.LocalityLevel == tree.LocalityLevelRow
+
 	var partitionAllBy *tree.PartitionBy
 	primaryIndexColumnSet := make(map[string]struct{})
-	if locality != nil && locality.LocalityLevel == tree.LocalityLevelRow {
-		// Check the table is multi-region enabled.
-		dbDesc, err := catalogkv.MustGetDatabaseDescByID(ctx, txn, evalCtx.Codec, parentID)
-		if err != nil {
-			return nil, err
-		}
-		if !dbDesc.IsMultiRegion() {
-			return nil, pgerror.Newf(
-				pgcode.InvalidTableDefinition,
-				"cannot set LOCALITY on a database that is not multi-region enabled",
+
+	if n.Locality != nil && regionConfig == nil &&
+		!opts.bypassLocalityOnNonMultiRegionDatabaseCheck {
+		return nil, pgerror.Newf(
+			pgcode.InvalidTableDefinition,
+			"cannot set LOCALITY on a table in a database that is not multi-region enabled",
+		)
+	}
+
+	if n.Locality != nil || regionConfig != nil {
+		// Check PARTITION BY is not set on any column, index or table definition.
+		if n.PartitionByTable.ContainsPartitioningClause() {
+			return nil, pgerror.New(
+				pgcode.FeatureNotSupported,
+				"multi-region tables containing PARTITION BY are not supported",
 			)
 		}
+		for _, def := range n.Defs {
+			switch d := def.(type) {
+			case *tree.IndexTableDef:
+				if d.PartitionByIndex.ContainsPartitioningClause() {
+					return nil, pgerror.New(
+						pgcode.FeatureNotSupported,
+						"multi-region tables with an INDEX containing PARTITION BY are not supported",
+					)
+				}
+			case *tree.UniqueConstraintTableDef:
+				if d.PartitionByIndex.ContainsPartitioningClause() {
+					return nil, pgerror.New(
+						pgcode.FeatureNotSupported,
+						"multi-region tables with an UNIQUE constraint containing PARTITION BY are not supported",
+					)
+				}
+			}
+		}
+	}
 
+	// Add implied columns under REGIONAL BY ROW.
+	if isRegionalByRow {
 		regionalByRowCol := tree.RegionalByRowRegionDefaultColName
 		if n.Locality.RegionalByRowColumn != "" {
 			regionalByRowCol = n.Locality.RegionalByRowColumn
 		}
 
-		// Check PARTITION BY is not set on any column definition.
-		if n.PartitionByTable.ContainsPartitioningClause() {
-			return nil, pgerror.New(
-				pgcode.FeatureNotSupported,
-				"REGIONAL BY ROW on a TABLE containing PARTITION BY is not supported",
-			)
+		// Check no interleaving is on the table.
+		if n.Interleave != nil {
+			return nil, interleaveOnRegionalByRowError()
 		}
 
 		// Check PARTITION BY is not set on anything partitionable, and also check
@@ -1540,7 +1620,7 @@ func NewTableDesc(
 					if err != nil {
 						return nil, errors.Wrap(err, "error resolving REGIONAL BY ROW column type")
 					}
-					if t.Oid() != typedesc.TypeIDToOID(dbDesc.RegionConfig.RegionEnumID) {
+					if t.Oid() != typedesc.TypeIDToOID(regionConfig.RegionEnumID) {
 						err = pgerror.Newf(
 							pgcode.InvalidTableDefinition,
 							"cannot use column %s which has type %s in REGIONAL BY ROW",
@@ -1549,7 +1629,7 @@ func NewTableDesc(
 						)
 						if t, terr := vt.ResolveTypeByOID(
 							ctx,
-							typedesc.TypeIDToOID(dbDesc.RegionConfig.RegionEnumID),
+							typedesc.TypeIDToOID(regionConfig.RegionEnumID),
 						); terr == nil {
 							if n.Locality.RegionalByRowColumn != tree.RegionalByRowRegionNotSpecifiedName {
 								// In this case, someone used REGIONAL BY ROW AS <col> where
@@ -1572,20 +1652,7 @@ func NewTableDesc(
 						}
 						return nil, err
 					}
-				}
-			case *tree.IndexTableDef:
-				if d.PartitionByIndex.ContainsPartitioningClause() {
-					return nil, pgerror.New(
-						pgcode.FeatureNotSupported,
-						"REGIONAL BY ROW on a table with an INDEX containing PARTITION BY is not supported",
-					)
-				}
-			case *tree.UniqueConstraintTableDef:
-				if d.PartitionByIndex.ContainsPartitioningClause() {
-					return nil, pgerror.New(
-						pgcode.FeatureNotSupported,
-						"REGIONAL BY ROW on a table with an UNIQUE constraint containing PARTITION BY is not supported",
-					)
+					break
 				}
 			}
 		}
@@ -1598,7 +1665,7 @@ func NewTableDesc(
 					regionalByRowCol.String(),
 				)
 			}
-			oid := typedesc.TypeIDToOID(dbDesc.RegionConfig.RegionEnumID)
+			oid := typedesc.TypeIDToOID(regionConfig.RegionEnumID)
 			n.Defs = append(
 				n.Defs,
 				regionalByRowDefaultColDef(oid, regionalByRowGatewayRegionDefaultExpr(oid)),
@@ -1609,7 +1676,7 @@ func NewTableDesc(
 		// Construct the partitioning for the PARTITION ALL BY.
 		desc.PartitionAllBy = true
 		partitionAllBy = partitionByForRegionalByRow(
-			*dbDesc.RegionConfig,
+			*regionConfig,
 			regionalByRowCol,
 		)
 		// Leading region column of REGIONAL BY ROW is part of the primary
@@ -1644,7 +1711,17 @@ func NewTableDesc(
 	}
 
 	allowImplicitPartitioning := (sessionData != nil && sessionData.ImplicitColumnPartitioningEnabled) ||
-		(locality != nil && locality.LocalityLevel == tree.LocalityLevelRow)
+		(n.Locality != nil && n.Locality.LocalityLevel == tree.LocalityLevelRow)
+
+	// We defer index creation of implicit indexes in column definitions
+	// until after all columns have been initialized, in case there is
+	// an implicit index that will depend on a column that has not yet
+	// been initialized.
+	type implicitColumnDefIdx struct {
+		idx *descpb.IndexDescriptor
+		def *tree.ColumnTableDef
+	}
+	var implicitColumnDefIdxs []implicitColumnDefIdx
 
 	for i, def := range n.Defs {
 		if d, ok := def.(*tree.ColumnTableDef); ok {
@@ -1676,6 +1753,9 @@ func NewTableDesc(
 			if d.PrimaryKey.Sharded {
 				if !sessionData.HashShardedIndexesEnabled {
 					return nil, hashShardedIndexesDisabledError
+				}
+				if isRegionalByRow {
+					return nil, hashShardedIndexesOnRegionalByRowError()
 				}
 				if n.PartitionByTable.ContainsPartitions() {
 					return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
@@ -1734,29 +1814,7 @@ func NewTableDesc(
 
 			if idx != nil {
 				idx.Version = indexEncodingVersion
-
-				// If it a non-primary index that is implicitly created, ensure partitioning
-				// for PARTITION ALL BY.
-				if desc.PartitionAllBy && !d.PrimaryKey.IsPrimaryKey {
-					var err error
-					*idx, err = CreatePartitioning(
-						ctx,
-						st,
-						evalCtx,
-						&desc,
-						*idx,
-						partitionAllBy,
-						nil, /* allowedNewColumnNames */
-						allowImplicitPartitioning,
-					)
-					if err != nil {
-						return nil, err
-					}
-				}
-
-				if err := desc.AddIndex(*idx, d.PrimaryKey.IsPrimaryKey); err != nil {
-					return nil, err
-				}
+				implicitColumnDefIdxs = append(implicitColumnDefIdxs, implicitColumnDefIdx{idx: idx, def: d})
 			}
 
 			if d.HasColumnFamily() {
@@ -1768,6 +1826,31 @@ func NewTableDesc(
 					return nil, err
 				}
 			}
+		}
+	}
+
+	for _, implicitColumnDefIdx := range implicitColumnDefIdxs {
+		// If it is a non-primary index that is implicitly created, ensure
+		// partitioning for PARTITION ALL BY.
+		if desc.PartitionAllBy && !implicitColumnDefIdx.def.PrimaryKey.IsPrimaryKey {
+			var err error
+			*implicitColumnDefIdx.idx, err = CreatePartitioning(
+				ctx,
+				st,
+				evalCtx,
+				&desc,
+				*implicitColumnDefIdx.idx,
+				partitionAllBy,
+				nil, /* allowedNewColumnNames */
+				allowImplicitPartitioning,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if err := desc.AddIndex(*implicitColumnDefIdx.idx, implicitColumnDefIdx.def.PrimaryKey.IsPrimaryKey); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1793,36 +1876,38 @@ func NewTableDesc(
 		}
 	}
 
-	setupShardedIndexForNewTable := func(d *tree.IndexTableDef, idx *descpb.IndexDescriptor) error {
+	setupShardedIndexForNewTable := func(
+		d tree.IndexTableDef, idx *descpb.IndexDescriptor,
+	) (columns tree.IndexElemList, _ error) {
 		if n.PartitionByTable.ContainsPartitions() {
-			return pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
+			return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
 		}
-		shardCol, newColumn, err := setupShardedIndex(
+		shardCol, newColumns, newColumn, err := setupShardedIndex(
 			ctx,
 			evalCtx,
 			semaCtx,
 			sessionData.HashShardedIndexesEnabled,
-			&d.Columns,
+			d.Columns,
 			d.Sharded.ShardBuckets,
 			&desc,
 			idx,
 			true /* isNewTable */)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if newColumn {
 			buckets, err := tabledesc.EvalShardBucketCount(ctx, semaCtx, evalCtx, d.Sharded.ShardBuckets)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			checkConstraint, err := makeShardCheckConstraintDef(&desc, int(buckets), shardCol)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			n.Defs = append(n.Defs, checkConstraint)
 			columnDefaultExprs = append(columnDefaultExprs, nil)
 		}
-		return nil
+		return newColumns, nil
 	}
 
 	idxValidator := schemaexpr.MakeIndexPredicateValidator(ctx, n.Table, &desc, semaCtx)
@@ -1845,15 +1930,21 @@ func NewTableDesc(
 			if d.Inverted {
 				idx.Type = descpb.IndexDescriptor_INVERTED
 			}
+			columns := d.Columns
 			if d.Sharded != nil {
 				if d.Interleave != nil {
 					return nil, pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
 				}
-				if err := setupShardedIndexForNewTable(d, &idx); err != nil {
+				if isRegionalByRow {
+					return nil, hashShardedIndexesOnRegionalByRowError()
+				}
+				var err error
+				columns, err = setupShardedIndexForNewTable(*d, &idx)
+				if err != nil {
 					return nil, err
 				}
 			}
-			if err := idx.FillColumns(d.Columns); err != nil {
+			if err := idx.FillColumns(columns); err != nil {
 				return nil, err
 			}
 			if d.Inverted {
@@ -1937,15 +2028,21 @@ func NewTableDesc(
 				StoreColumnNames: d.Storing.ToStrings(),
 				Version:          indexEncodingVersion,
 			}
+			columns := d.Columns
 			if d.Sharded != nil {
 				if n.Interleave != nil && d.PrimaryKey {
 					return nil, pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
 				}
-				if err := setupShardedIndexForNewTable(&d.IndexTableDef, &idx); err != nil {
+				if isRegionalByRow {
+					return nil, hashShardedIndexesOnRegionalByRowError()
+				}
+				var err error
+				columns, err = setupShardedIndexForNewTable(d.IndexTableDef, &idx)
+				if err != nil {
 					return nil, err
 				}
 			}
-			if err := idx.FillColumns(d.Columns); err != nil {
+			if err := idx.FillColumns(columns); err != nil {
 				return nil, err
 			}
 			// Specifying a partitioning on a PRIMARY KEY constraint should be disallowed by the
@@ -2006,7 +2103,7 @@ func NewTableDesc(
 						"interleave not supported in primary key constraint definition",
 					)
 				}
-				for _, c := range d.Columns {
+				for _, c := range columns {
 					primaryIndexColumnSet[string(c.Column)] = struct{}{}
 				}
 			}
@@ -2264,11 +2361,16 @@ func NewTableDesc(
 		return nil, err
 	}
 
-	if regionEnumID != descpb.InvalidID || n.Locality != nil {
+	if regionConfig != nil || n.Locality != nil {
+		localityTelemetryName := "unspecified"
+		if n.Locality != nil {
+			localityTelemetryName = n.Locality.TelemetryName()
+		}
+		telemetry.Inc(sqltelemetry.CreateTableLocalityCounter(localityTelemetryName))
 		if n.Locality == nil {
 			// The absence of a locality on the AST node indicates that the table must
 			// be homed in the primary region.
-			desc.SetTableLocalityRegionalByTable(tree.PrimaryRegionLocalityName)
+			desc.SetTableLocalityRegionalByTable(tree.PrimaryRegionNotSpecifiedName)
 		} else if n.Locality.LocalityLevel == tree.LocalityLevelTable {
 			desc.SetTableLocalityRegionalByTable(n.Locality.TableRegion)
 		} else if n.Locality.LocalityLevel == tree.LocalityLevelGlobal {
@@ -2277,11 +2379,6 @@ func NewTableDesc(
 			desc.SetTableLocalityRegionalByRow(n.Locality.RegionalByRowColumn)
 		} else {
 			return nil, errors.Newf("unknown locality level: %v", n.Locality.LocalityLevel)
-		}
-
-		dg := catalogkv.NewOneLevelUncachedDescGetter(txn, evalCtx.Codec)
-		if err := desc.ValidateTableLocalityConfig(ctx, dg); err != nil {
-			return nil, err
 		}
 	}
 
@@ -2349,18 +2446,11 @@ func newTableDesc(
 		}
 	}
 
-	regionEnumID := descpb.InvalidID
 	_, dbDesc, err := params.p.Descriptors().GetImmutableDatabaseByID(
 		params.ctx, params.p.txn, parentID, tree.DatabaseLookupFlags{},
 	)
 	if err != nil {
 		return nil, err
-	}
-	if dbDesc.IsMultiRegion() {
-		regionEnumID, err = dbDesc.MultiRegionEnumID()
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	// We need to run NewTableDesc with caching disabled, because
@@ -2377,7 +2467,7 @@ func newTableDesc(
 			parentID,
 			parentSchemaID,
 			id,
-			regionEnumID,
+			dbDesc.GetRegionConfig(),
 			creationTime,
 			privileges,
 			affected,
@@ -2741,6 +2831,14 @@ func regionalByRowDefaultColDef(oid oid.Oid, defaultExpr tree.Expr) *tree.Column
 	c.Nullable.Nullability = tree.NotNull
 	c.DefaultExpr.Expr = defaultExpr
 	return c
+}
+
+func hashShardedIndexesOnRegionalByRowError() error {
+	return pgerror.New(pgcode.FeatureNotSupported, "hash sharded indexes are not compatible with REGIONAL BY ROW tables")
+}
+
+func interleaveOnRegionalByRowError() error {
+	return pgerror.New(pgcode.FeatureNotSupported, "interleaved tables are not compatible with REGIONAL BY ROW tables")
 }
 
 func checkClusterSupportsPartitionByAll(evalCtx *tree.EvalContext) error {

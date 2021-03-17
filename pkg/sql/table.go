@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
@@ -61,7 +62,8 @@ func (p *planner) createDropDatabaseJob(
 			DroppedDatabaseID: databaseID,
 			FormatVersion:     jobspb.DatabaseJobFormatVersion,
 		},
-		Progress: jobspb.SchemaChangeProgress{},
+		Progress:      jobspb.SchemaChangeProgress{},
+		NonCancelable: true,
 	}
 	newJob, err := p.extendedEvalCtx.QueueJob(ctx, jobRecord)
 	if err != nil {
@@ -71,7 +73,7 @@ func (p *planner) createDropDatabaseJob(
 	return nil
 }
 
-// createNonDropDatabaseChangeJob covers all database descriptor updates other
+// CreateNonDropDatabaseChangeJob covers all database descriptor updates other
 // than dropping the database.
 // TODO (lucy): This should ideally look into the set of queued jobs so that we
 // don't queue multiple jobs for the same database.
@@ -85,7 +87,8 @@ func (p *planner) createNonDropDatabaseChangeJob(
 			DescID:        databaseID,
 			FormatVersion: jobspb.DatabaseJobFormatVersion,
 		},
-		Progress: jobspb.SchemaChangeProgress{},
+		Progress:      jobspb.SchemaChangeProgress{},
+		NonCancelable: true,
 	}
 	newJob, err := p.extendedEvalCtx.QueueJob(ctx, jobRecord)
 	if err != nil {
@@ -149,7 +152,7 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 		// TODO (lucy): get rid of this when we get rid of MutationJobs.
 		if mutationID != descpb.InvalidMutationID {
 			tableDesc.MutationJobs = append(tableDesc.MutationJobs, descpb.TableDescriptor_MutationJob{
-				MutationID: mutationID, JobID: newJob.ID()})
+				MutationID: mutationID, JobID: int64(newJob.ID())})
 		}
 		log.Infof(ctx, "queued new schema change job %d for table %d, mutation %d",
 			newJob.ID(), tableDesc.ID, mutationID)
@@ -180,7 +183,7 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 				// Also add a MutationJob on the table descriptor.
 				// TODO (lucy): get rid of this when we get rid of MutationJobs.
 				tableDesc.MutationJobs = append(tableDesc.MutationJobs, descpb.TableDescriptor_MutationJob{
-					MutationID: mutationID, JobID: job.ID()})
+					MutationID: mutationID, JobID: int64(job.ID())})
 			}
 		}
 		if err := job.SetDetails(ctx, p.txn, newDetails); err != nil {
@@ -279,7 +282,7 @@ func (p *planner) writeTableDescToBatch(
 		}
 	}
 
-	if err := tableDesc.ValidateSelf(ctx); err != nil {
+	if err := catalog.ValidateSelf(tableDesc); err != nil {
 		return errors.AssertionFailedf("table descriptor is not valid: %s\n%v", err, tableDesc)
 	}
 

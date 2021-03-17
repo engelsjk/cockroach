@@ -82,7 +82,7 @@ message EncryptionInfo {
 message StreamIngestionDetails {
   // StreamAddress locates the stream. It enables the client to find the
   // addresses of the stream's partitions.
-  string stream_address = 1 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl.StreamAddress"];
+  string stream_address = 1;
   // Span is the keyspan into which this job will ingest KVs.
   //
   // The stream should emit all changes for a given span, and no changes outside
@@ -184,6 +184,12 @@ message RestoreDetails {
   // stages have completed via these flags.
   bool prepare_completed = 8;
   bool stats_inserted = 9;
+  // SystemTablesRestored keeps track of dynamic states that need to happen only
+  // once during the lifetime of a job. Note, that this state may be shared
+  // between job versions, so updates to this map must be considered carefully.
+  // It maps system table names to whether or not they have already been
+  // restored.
+  map<string, bool> system_tables_restored = 17;
   // DescriptorsPublished indicates whether or not the descriptors written in
   // the job have been transactionally updated after the data was restored.
   bool descriptors_published = 10;
@@ -191,7 +197,7 @@ message RestoreDetails {
     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/tree.DescriptorCoverage"
   ];
   BackupEncryptionOptions encryption = 12;
-  // NEXT ID: 17.
+  // NEXT ID: 18.
 }
 
 message RestoreProgress {
@@ -208,7 +214,11 @@ message ImportDetails {
     repeated string target_cols = 21;
     reserved 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17;
   }
+  message Schema {
+    sqlbase.SchemaDescriptor desc = 1;
+  }
   repeated Table tables = 1 [(gogoproto.nullable) = false];
+  repeated Schema schemas = 23 [(gogoproto.nullable) = false];
   repeated string uris = 2 [(gogoproto.customname) = "URIs"];
   roachpb.IOFileFormat format = 3 [(gogoproto.nullable) = false];
 
@@ -237,6 +247,7 @@ message ImportDetails {
   bool ingest_directly = 11;
 
   bool prepare_complete = 12;
+  bool schemas_published = 24;
   bool tables_published = 13;
 
   bool parse_bundle_schema = 14;
@@ -250,6 +261,8 @@ message ImportDetails {
     (gogoproto.customname) = "ProtectedTimestampRecord",
     (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
   ];
+
+  // next val: 25
 }
 
 // SequenceValChunks represents a single chunk of sequence values allocated
@@ -713,7 +726,7 @@ enum Type {
 }
 
 message Job {
-  int64 id = 1;
+  int64 id = 1 [(gogoproto.nullable) = false, (gogoproto.customtype) = "JobID"];
   // Keep progress first as it may bre more relevant to see when looking at a
   // running job.
   Progress progress = 2;

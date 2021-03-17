@@ -350,9 +350,9 @@ func TestSystemPrivilegeValidate(t *testing.T) {
 	defer delete(SystemAllowedPrivileges, id)
 
 	rootWrongPrivilegesErr := "user root must have exactly SELECT, GRANT " +
-		"privileges on system table with ID=.*"
+		"privileges on (system )?table with ID=.*"
 	adminWrongPrivilegesErr := "user admin must have exactly SELECT, GRANT " +
-		"privileges on system table with ID=.*"
+		"privileges on (system )?table with ID=.*"
 
 	{
 		// Valid: root user has one of the allowable privilege sets.
@@ -564,7 +564,7 @@ func TestFixPrivileges(t *testing.T) {
 			desc.Grant(u, p)
 		}
 
-		if a, e := MaybeFixPrivileges(testCase.id, desc), testCase.modified; a != e {
+		if a, e := MaybeFixPrivileges(testCase.id, &desc), testCase.modified; a != e {
 			t.Errorf("#%d: expected modified=%t, got modified=%t", num, e, a)
 			continue
 		}

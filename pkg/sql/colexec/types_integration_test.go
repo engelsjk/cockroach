@@ -50,9 +50,9 @@ func TestSQLTypesIntegration(t *testing.T) {
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Cfg: &execinfra.ServerConfig{
-			Settings:    st,
-			DiskMonitor: diskMonitor,
+			Settings: st,
 		},
+		DiskMonitor: diskMonitor,
 	}
 
 	var da rowenc.DatumAlloc
@@ -94,7 +94,7 @@ func TestSQLTypesIntegration(t *testing.T) {
 				output,
 				nil, /* metadataSourcesQueue */
 				nil, /* toClose */
-				nil, /* execStatsForTrace */
+				nil, /* getStats */
 				nil, /* cancelFlow */
 			)
 			require.NoError(t, err)

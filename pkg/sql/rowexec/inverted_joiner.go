@@ -12,7 +12,6 @@ package rowexec
 
 import (
 	"context"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -167,7 +166,6 @@ var _ execinfra.Processor = &invertedJoiner{}
 var _ execinfra.RowSource = &invertedJoiner{}
 var _ execinfrapb.MetadataSource = &invertedJoiner{}
 var _ execinfra.OpNode = &invertedJoiner{}
-var _ execinfra.KVReader = &invertedJoiner{}
 
 const invertedJoinerProcName = "inverted joiner"
 
@@ -189,7 +187,7 @@ func newInvertedJoiner(
 		return nil, errors.AssertionFailedf("unexpected inverted join type %s", spec.Type)
 	}
 	ij := &invertedJoiner{
-		desc:                 tabledesc.NewImmutable(spec.Table),
+		desc:                 tabledesc.NewBuilder(&spec.Table).BuildImmutableTable(),
 		input:                input,
 		inputTypes:           input.OutputTypes(),
 		prefixEqualityCols:   spec.PrefixEqualityColumns,
@@ -250,9 +248,13 @@ func newInvertedJoiner(
 		ij, post, outputColTypes, flowCtx, processorID, output, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ij.input},
-			TrailingMetaCallback: func(ctx context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
+				// We need to generate metadata before closing the processor
+				// because InternalClose() updates ij.Ctx to the "original"
+				// context.
+				trailingMeta := ij.generateMeta(ij.Ctx)
 				ij.close()
-				return ij.generateMeta(ctx)
+				return trailingMeta
 			},
 		},
 	); err != nil {
@@ -327,7 +329,7 @@ func newInvertedJoiner(
 	// Initialize memory monitors and row container for index rows.
 	ctx := flowCtx.EvalCtx.Ctx()
 	ij.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx.Cfg, "invertedjoiner-limited")
-	ij.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.Cfg.DiskMonitor, "invertedjoiner-disk")
+	ij.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, "invertedjoiner-disk")
 	ij.indexRows = rowcontainer.NewDiskBackedNumberedRowContainer(
 		true, /* deDup */
 		ij.indexRowTypes,
@@ -734,12 +736,8 @@ func (ij *invertedJoiner) transformToTableRow(indexRow rowenc.EncDatumRow) {
 
 // Start is part of the RowSource interface.
 func (ij *invertedJoiner) Start(ctx context.Context) {
-	ij.input.Start(ctx)
 	ctx = ij.StartInternal(ctx, invertedJoinerProcName)
-	// Go around "this value of ctx is never used" linter error. We do it this
-	// way instead of omitting the assignment to ctx above so that if in the
-	// future other initialization is added, the correct ctx is used.
-	_ = ctx
+	ij.input.Start(ctx)
 	ij.runningState = ijReadingInput
 }
 
@@ -777,7 +775,7 @@ func (ij *invertedJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
 	return &execinfrapb.ComponentStats{
 		Inputs: []execinfrapb.InputStats{is},
 		KV: execinfrapb.KVStats{
-			BytesRead:      optional.MakeUint(uint64(ij.GetBytesRead())),
+			BytesRead:      optional.MakeUint(uint64(ij.fetcher.GetBytesRead())),
 			TuplesRead:     fis.NumTuples,
 			KVTime:         fis.WaitTime,
 			ContentionTime: optional.MakeTimeValue(execinfra.GetCumulativeContentionTime(ij.Ctx)),
@@ -790,23 +788,12 @@ func (ij *invertedJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
 	}
 }
 
-// GetBytesRead is part of the execinfra.KVReader interface.
-func (ij *invertedJoiner) GetBytesRead() int64 {
-	return ij.fetcher.GetBytesRead()
-}
-
-// GetRowsRead is part of the execinfra.KVReader interface.
-func (ij *invertedJoiner) GetRowsRead() int64 {
-	return ij.rowsRead
-}
-
-// GetCumulativeContentionTime is part of the execinfra.KVReader interface.
-func (ij *invertedJoiner) GetCumulativeContentionTime() time.Duration {
-	return execinfra.GetCumulativeContentionTime(ij.Ctx)
-}
-
 func (ij *invertedJoiner) generateMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
-	var trailingMeta []execinfrapb.ProducerMetadata
+	trailingMeta := make([]execinfrapb.ProducerMetadata, 1, 2)
+	meta := &trailingMeta[0]
+	meta.Metrics = execinfrapb.GetMetricsMeta()
+	meta.Metrics.BytesRead = ij.fetcher.GetBytesRead()
+	meta.Metrics.RowsRead = ij.rowsRead
 	if tfs := execinfra.GetLeafTxnFinalState(ctx, ij.FlowCtx.Txn); tfs != nil {
 		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}

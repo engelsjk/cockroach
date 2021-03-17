@@ -421,6 +421,7 @@ func TestLint(t *testing.T) {
 				re: `\bos\.(Getenv|LookupEnv)\(`,
 				excludes: []string{
 					":!acceptance",
+					":!build/bazel",
 					":!ccl/acceptanceccl/backup_test.go",
 					":!ccl/backupccl/backup_cloud_test.go",
 					// KMS requires AWS credentials from environment variables.
@@ -433,7 +434,7 @@ func TestLint(t *testing.T) {
 					":!nightly",
 					":!testutils/lint",
 					":!util/envutil/env.go",
-					":!testutils/bazel.go",
+					":!testutils/data_path.go",
 					":!util/log/tracebacks.go",
 					":!util/sdnotify/sdnotify_unix.go",
 					":!util/grpcutil", // GRPC_GO_* variables
@@ -863,6 +864,40 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`protoutil\.Clone\(`),
 		), func(s string) {
 			t.Errorf("\n%s <- forbidden; use 'protoutil.Clone' instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestNumCPU", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`runtime\.NumCPU\(\)`,
+			"--",
+			"*.go",
+			":!testutils/lint/*.go",
+			":!util/system/*.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden, use system.NumCPU instead (after reading that function's comment)", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -1593,6 +1628,9 @@ func TestLint(t *testing.T) {
 				filter,
 				// Skip .pb.go and .pb.gw.go generated files.
 				stream.GrepNot(`pkg/.*\.pb(\.gw|)\.go:`),
+				// This file is a conditionally-compiled stub implementation that
+				// will produce fake "func is unused" errors.
+				stream.GrepNot(`pkg/build/bazel/non_bazel.go`),
 				// Skip generated file.
 				stream.GrepNot(`pkg/ui/distoss/bindata.go`),
 				stream.GrepNot(`pkg/ui/distccl/bindata.go`),

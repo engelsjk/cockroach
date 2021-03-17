@@ -52,7 +52,14 @@ func (r *Replica) addToTSCacheChecked(
 	// directly instead of using the local HLC clock as a proxy for its high
 	// water-mark, but it serves as a good proxy for proper handling of HLC
 	// clock updates and, by extension, observed timestamps.
-	if !ts.Synthetic && st.Now.ToTimestamp().Less(ts) {
+	//
+	// TODO(nvanbenschoten): this is currently disabled because we seem to
+	// regularly hit it on master. Now that we ship a snapshot of the timestamp
+	// cache on lease transfers instead of just the current clock time, the
+	// property this is asserting is no longer quite as important, so we can
+	// disable the check. However, it would still be nice to track down how we
+	// can hit this.
+	if !ts.Synthetic && st.Now.ToTimestamp().Less(ts) && false {
 		log.Fatalf(ctx, "Unsafe timestamp cache update! Cannot add timestamp %s to timestamp "+
 			"cache after evaluating %v (resp=%v; err=%v) with local hlc clock at timestamp %s. "+
 			"Non-synthetic timestamps should always lag the local hlc clock.", ts, ba, br, pErr, st.Now)
@@ -541,12 +548,14 @@ func transactionPushMarker(key roachpb.Key, txnID uuid.UUID) roachpb.Key {
 
 // GetCurrentReadSummary returns a new ReadSummary reflecting all reads served
 // by the range to this point.
-func (r *Replica) GetCurrentReadSummary() rspb.ReadSummary {
+func (r *Replica) GetCurrentReadSummary() (rspb.ReadSummary, hlc.Timestamp) {
 	sum := collectReadSummaryFromTimestampCache(r.store.tsCache, r.Desc())
 	// Forward the read summary by the range's closed timestamp, because any
-	// replica could have served reads below this time.
-	sum.Merge(rspb.FromTimestamp(r.GetFrozenClosedTimestamp()))
-	return sum
+	// replica could have served reads below this time. We also return the
+	// closed timestamp separately, in case callers want it split out.
+	closedTS := r.ClosedTimestampV2()
+	sum.Merge(rspb.FromTimestamp(closedTS))
+	return sum, closedTS
 }
 
 // collectReadSummaryFromTimestampCache constucts a read summary for the range

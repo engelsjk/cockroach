@@ -14,11 +14,9 @@ import (
 	"bytes"
 	"context"
 	gosql "database/sql"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"math"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -1506,6 +1504,12 @@ func TestRemoteDebugModeSetting(t *testing.T) {
 	if _, err := client.ListSessions(ctx, &serverpb.ListSessionsRequest{}); err != nil {
 		t.Error(err)
 	}
+	if _, err := client.ListLocalContentionEvents(ctx, &serverpb.ListContentionEventsRequest{}); err != nil {
+		t.Error(err)
+	}
+	if _, err := client.ListContentionEvents(ctx, &serverpb.ListContentionEventsRequest{}); err != nil {
+		t.Error(err)
+	}
 
 	// Check that keys are properly omitted from the Ranges, HotRanges, and
 	// RangeLog endpoints.
@@ -1923,101 +1927,83 @@ func TestListSessionsSecurity(t *testing.T) {
 	}
 }
 
-func TestListSessionsV2(t *testing.T) {
+func TestListContentionEventsSecurity(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
 	ctx := context.Background()
-	defer testCluster.Stopper().Stop(ctx)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	ts := s.(*TestServer)
+	defer ts.Stopper().Stop(ctx)
 
-	ts1 := testCluster.Server(0)
+	expectedErrNoPermission := "does not have permission to view contention events"
 
-	var sqlConns []*gosql.Conn
-	for i := 0; i < 15; i++ {
-		serverConn := testCluster.ServerConn(i % 3)
-		conn, err := serverConn.Conn(ctx)
-		require.NoError(t, err)
-		sqlConns = append(sqlConns, conn)
+	// HTTP requests respect the authenticated username from the HTTP session.
+	testCases := []struct {
+		endpoint                       string
+		expectedErr                    string
+		requestWithAdmin               bool
+		requestWithViewActivityGranted bool
+	}{
+		{"local_contention_events", expectedErrNoPermission, false, false},
+		{"contention_events", expectedErrNoPermission, false, false},
+		{"local_contention_events", "", true, false},
+		{"contention_events", "", true, false},
+		{"local_contention_events", "", false, true},
+		{"contention_events", "", false, true},
 	}
-
-	defer func() {
-		for _, conn := range sqlConns {
-			_ = conn.Close()
+	myUser := authenticatedUserNameNoAdmin().Normalized()
+	for _, tc := range testCases {
+		if tc.requestWithViewActivityGranted {
+			// Note that for this query to work, it is crucial that
+			// getStatusJSONProtoWithAdminOption below is called at least once,
+			// on the previous test case, so that the user exists.
+			_, err := db.Exec("ALTER USER $1 VIEWACTIVITY", myUser)
+			require.NoError(t, err)
 		}
-	}()
-
-	doSessionsRequest := func(client http.Client, limit int, start string) listSessionsResponse {
-		req, err := http.NewRequest("GET", ts1.AdminURL()+apiV2Path+"sessions/", nil)
-		require.NoError(t, err)
-		query := req.URL.Query()
-		if limit > 0 {
-			query.Add("limit", strconv.Itoa(limit))
-		}
-		if len(start) > 0 {
-			query.Add("start", start)
-		}
-		req.URL.RawQuery = query.Encode()
-		resp, err := client.Do(req)
-		require.NoError(t, err)
-		require.NotNil(t, resp)
-		bytesResponse, err := ioutil.ReadAll(resp.Body)
-		require.NoError(t, err)
-		require.NoError(t, resp.Body.Close())
-
-		var sessionsResponse listSessionsResponse
-		if resp.StatusCode != 200 {
-			t.Fatal(string(bytesResponse))
-		}
-		require.NoError(t, json.Unmarshal(bytesResponse, &sessionsResponse))
-		return sessionsResponse
-	}
-
-	time.Sleep(500 * time.Millisecond)
-	adminClient, err := ts1.GetAdminAuthenticatedHTTPClient()
-	require.NoError(t, err)
-	sessionsResponse := doSessionsRequest(adminClient, 0, "")
-	require.LessOrEqual(t, 15, len(sessionsResponse.Sessions))
-	require.Equal(t, 0, len(sessionsResponse.Errors))
-	allSessions := sessionsResponse.Sessions
-	sort.Slice(allSessions, func(i, j int) bool {
-		return allSessions[i].Start.Before(allSessions[j].Start)
-	})
-
-	// Test the paginated version is identical to the non-paginated one.
-	for limit := 1; limit <= 15; limit++ {
-		var next string
-		var paginatedSessions []serverpb.Session
-		for {
-			sessionsResponse := doSessionsRequest(adminClient, limit, next)
-			paginatedSessions = append(paginatedSessions, sessionsResponse.Sessions...)
-			next = sessionsResponse.Next
-			require.LessOrEqual(t, len(sessionsResponse.Sessions), limit)
-			if len(sessionsResponse.Sessions) < limit {
-				break
+		var response serverpb.ListContentionEventsResponse
+		err := getStatusJSONProtoWithAdminOption(s, tc.endpoint, &response, tc.requestWithAdmin)
+		if tc.expectedErr == "" {
+			if err != nil || len(response.Errors) > 0 {
+				t.Errorf("unexpected failure listing contention events; error: %v; response errors: %v",
+					err, response.Errors)
+			}
+		} else {
+			respErr := "<no error>"
+			if len(response.Errors) > 0 {
+				respErr = response.Errors[0].Message
+			}
+			if !testutils.IsError(err, tc.expectedErr) &&
+				!strings.Contains(respErr, tc.expectedErr) {
+				t.Errorf("did not get expected error %q when listing contention events from %s: %v",
+					tc.expectedErr, tc.endpoint, err)
 			}
 		}
-		sort.Slice(paginatedSessions, func(i, j int) bool {
-			return paginatedSessions[i].Start.Before(paginatedSessions[j].Start)
-		})
-		// Sometimes there can be a transient session that pops up in one of the two
-		// calls. Exclude it by only comparing the first 15 sessions.
-		require.Equal(t, paginatedSessions[:15], allSessions[:15])
+		if tc.requestWithViewActivityGranted {
+			_, err := db.Exec("ALTER USER $1 NOVIEWACTIVITY", myUser)
+			require.NoError(t, err)
+		}
 	}
 
-	// A non-admin user cannot see sessions at all.
-	nonAdminClient, err := ts1.GetAuthenticatedHTTPClient(false)
-	require.NoError(t, err)
-	req, err := http.NewRequest("GET", ts1.AdminURL()+apiV2Path+"sessions/", nil)
-	require.NoError(t, err)
-	resp, err := nonAdminClient.Do(req)
-	require.NoError(t, err)
-	require.NotNil(t, resp)
-	bytesResponse, err := ioutil.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.NoError(t, resp.Body.Close())
-	require.Equal(t, http.StatusForbidden, resp.StatusCode)
-	require.Contains(t, string(bytesResponse), "not allowed")
+	// gRPC requests behave as root and thus are always allowed.
+	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
+	rpcContext := newRPCTestContext(ts, rootConfig)
+	url := ts.ServingRPCAddr()
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := serverpb.NewStatusClient(conn)
+	request := &serverpb.ListContentionEventsRequest{}
+	if resp, err := client.ListLocalContentionEvents(ctx, request); err != nil || len(resp.Errors) > 0 {
+		t.Errorf("unexpected failure listing local contention events; error: %v; response errors: %v",
+			err, resp.Errors)
+	}
+	if resp, err := client.ListContentionEvents(ctx, request); err != nil || len(resp.Errors) > 0 {
+		t.Errorf("unexpected failure listing contention events; error: %v; response errors: %v",
+			err, resp.Errors)
+	}
 }
 
 func TestCreateStatementDiagnosticsReport(t *testing.T) {
@@ -2084,13 +2070,6 @@ func TestStatementDiagnosticsCompleted(t *testing.T) {
 	if err := getStatusJSONProto(s, diagPath, &diagRespGet); err != nil {
 		t.Fatal(err)
 	}
-
-	json := diagRespGet.Diagnostics.Trace
-	if json == "" ||
-		!strings.Contains(json, "traced statement") ||
-		!strings.Contains(json, "statement execution committed the txn") {
-		t.Fatal("statement diagnostics did not capture a trace")
-	}
 }
 
 func TestJobStatusResponse(t *testing.T) {
@@ -2146,7 +2125,7 @@ func TestJobStatusResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.JobId = job.ID()
+	request.JobId = int64(job.ID())
 	response, err = client.JobStatus(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)

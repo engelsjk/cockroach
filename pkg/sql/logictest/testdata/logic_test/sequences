@@ -90,7 +90,7 @@ statement ok
 CREATE SEQUENCE foo
 
 # A sequence with the same name can't be created again.
-statement error pgcode 42P07 relation "foo" already exists
+statement error pgcode 42P07 relation "test.public.foo" already exists
 CREATE SEQUENCE foo
 
 statement ok
@@ -100,7 +100,7 @@ statement error pgcode 42601 conflicting or redundant options
 CREATE SEQUENCE bar INCREMENT 5 MAXVALUE 1000 INCREMENT 2
 
 # Sequences are in the same namespace as tables.
-statement error pgcode 42P07 relation "foo" already exists
+statement error pgcode 42P07 relation "test.public.foo" already exists
 CREATE TABLE foo (k BYTES PRIMARY KEY, v BYTES)
 
 # You can't create with 0 increment.
@@ -133,11 +133,11 @@ CREATE SEQUENCE ignored_options_test NO CYCLE
 statement ok
 CREATE SEQUENCE show_create_test
 
-query ITTITTTTTTTBB colnames
+query ITTITTTTTTTBBBB colnames
 SELECT * FROM crdb_internal.create_statements WHERE descriptor_name = 'show_create_test'
 ----
-database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name   create_statement                                                                                     state   create_nofks                                                                                         alter_statements  validate_statements  has_partitions  is_multi_region
-52           test           public       63             sequence         show_create_test  CREATE SEQUENCE public.show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  PUBLIC  CREATE SEQUENCE public.show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  {}                {}                   false           false
+database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name   create_statement                                                                                     state   create_nofks                                                                                         alter_statements  validate_statements  has_partitions  is_multi_region  is_virtual  is_temporary
+52           test           public       63             sequence         show_create_test  CREATE SEQUENCE public.show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  PUBLIC  CREATE SEQUENCE public.show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  {}                {}                   false           false            false       false
 
 query TT colnames
 SHOW CREATE SEQUENCE show_create_test
@@ -1743,3 +1743,71 @@ SELECT last_value FROM cached_lower_bound_test_2;
 
 statement ok
 DROP SEQUENCE cached_lower_bound_test_2;
+
+
+# Unit test for #60737
+
+statement ok
+CREATE SEQUENCE s1 MINVALUE -4 START WITH -2 CACHE 5 INCREMENT BY -2;
+
+statement ok
+CREATE TABLE s2 (A int)
+
+# Case 1: Both s1's are sequences and the old one is being dropped.
+statement ok
+BEGIN
+
+statement ok
+DROP SEQUENCE s1
+
+statement error pgcode 55000 sequence "s1" is being dropped, try again later
+CREATE SEQUENCE IF NOT EXISTS s1 MINVALUE -4 START WITH -2 CACHE 5 INCREMENT BY -2;
+
+statement ok
+END
+
+# Case 2: Both s2's are different types and the old one is being dropped.
+statement ok
+BEGIN
+
+statement ok
+DROP TABLE s2
+
+statement error pgcode 42809 "s2" is not a sequence
+CREATE SEQUENCE IF NOT EXISTS s2 MINVALUE -4 START WITH -2 CACHE 5 INCREMENT BY -2;
+
+statement ok
+END
+
+# Case 3: Both s2's are a different type
+statement ok
+BEGIN
+
+statement error pgcode 42809 "s2" is not a sequence
+CREATE SEQUENCE IF NOT EXISTS s2 MINVALUE -4 START WITH -2 CACHE 5 INCREMENT BY -2;
+
+statement ok
+END
+
+statement ok
+DROP SEQUENCE s1
+
+statement ok
+DROP TABLE s2
+
+# Validate that cross DB sequences are detected by internal tables
+statement ok
+CREATE DATABASE db3;
+
+statement ok
+CREATE SEQUENCE db3.s;
+
+statement ok
+CREATE TABLE tDb3Ref (i INT PRIMARY KEY DEFAULT (nextval('db3.s')));
+
+query TTTTTTT
+SELECT * FROM "".crdb_internal.cross_db_references;
+----
+db2  public  seq   db1  public  t  sequences owning table
+db2  public  seq2  db1  public  t  sequences owning table
+test  public  tdb3ref  db3  public  s  table column refers to sequence

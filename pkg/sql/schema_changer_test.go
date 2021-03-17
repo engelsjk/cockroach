@@ -160,7 +160,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	for _, direction := range []descpb.DescriptorMutation_Direction{
 		descpb.DescriptorMutation_ADD, descpb.DescriptorMutation_DROP,
 	} {
-		tableDesc.GetMutations()[0].Direction = direction
+		tableDesc.Mutations[0].Direction = direction
 		expectedVersion++
 		if err := kvDB.Put(
 			ctx,
@@ -186,7 +186,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 			if newVersion != expectedVersion {
 				t.Fatalf("bad version; e = %d, v = %d", expectedVersion, newVersion)
 			}
-			state := tableDesc.GetMutations()[0].State
+			state := tableDesc.Mutations[0].State
 			if state != expectedState {
 				t.Fatalf("bad state; e = %d, v = %d", expectedState, state)
 			}
@@ -195,7 +195,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	// RunStateMachineBeforeBackfill() doesn't complete the schema change.
 	tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(tableDesc.GetMutations()) == 0 {
+	if len(tableDesc.Mutations) == 0 {
 		t.Fatalf("table expected to have an outstanding schema change: %v", tableDesc)
 	}
 }
@@ -458,7 +458,8 @@ func TestRollbackOfAddingTable(t *testing.T) {
 	require.NoError(t, row.Scan(&descBytes))
 	var desc descpb.Descriptor
 	require.NoError(t, protoutil.Unmarshal(descBytes, &desc))
-	viewDesc := desc.GetTable() //nolint:descriptormarshal
+	//nolint:descriptormarshal
+	viewDesc := desc.GetTable()
 	require.Equal(t, "v", viewDesc.GetName(), "read a different descriptor than expected")
 	require.Equal(t, descpb.DescriptorState_DROP, viewDesc.GetState())
 
@@ -508,7 +509,7 @@ func TestRaceWithBackfill(t *testing.T) {
 			BackfillChunkSize: chunkSize,
 		},
 		// Disable GC job.
-		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { select {} }},
+		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error { select {} }},
 		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				notifyBackfill()
@@ -787,7 +788,7 @@ func TestBackfillErrors(t *testing.T) {
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			BackfillChunkSize: chunkSize,
 		},
-		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { <-blockGC; return nil }},
+		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error { <-blockGC; return nil }},
 	}
 
 	tc := serverutils.StartNewTestCluster(t, numNodes,
@@ -1799,8 +1800,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 	// Wait until all the mutations have been processed.
 	testutils.SucceedsSoon(t, func() error {
 		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.GetMutations()) > 0 {
-			return errors.Errorf("%d mutations remaining", len(tableDesc.GetMutations()))
+		if len(tableDesc.AllMutations()) > 0 {
+			return errors.Errorf("%d mutations remaining", len(tableDesc.AllMutations()))
 		}
 		return nil
 	})
@@ -2166,7 +2167,7 @@ func TestSchemaUniqueColumnDropFailure(t *testing.T) {
 			WriteCheckpointInterval: time.Nanosecond,
 		},
 		// Disable GC job.
-		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { select {} }},
+		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error { select {} }},
 		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				attempts++
@@ -2223,8 +2224,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT UNIQUE DEFAULT 23 CREATE FAMILY F3
 		t.Fatalf("e = %d, v = %d, columns = %+v", e, len(tableDesc.PublicColumns()), tableDesc.PublicColumns())
 	} else if tableDesc.PublicColumns()[0].GetName() != "k" {
 		t.Fatalf("columns %+v", tableDesc.PublicColumns())
-	} else if len(tableDesc.GetMutations()) != 2 {
-		t.Fatalf("mutations %+v", tableDesc.GetMutations())
+	} else if len(tableDesc.AllMutations()) != 2 {
+		t.Fatalf("mutations %+v", tableDesc.AllMutations())
 	}
 }
 
@@ -2511,7 +2512,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 
 	// Test that trying different schema changes results an error.
 	_, err := sqlDB.Exec(`ALTER TABLE t.test ADD COLUMN z INT`)
-	expected := "pq: unimplemented: cannot perform a schema change operation while a primary key change is in progress"
+	expected := `pq: relation "test" \(53\): unimplemented: cannot perform a schema change operation while a primary key change is in progress`
 	if !testutils.IsError(err, expected) {
 		t.Fatalf("expected to find error %s but found %+v", expected, err)
 	}
@@ -2794,8 +2795,8 @@ COMMIT;
 	// Ensure that t.test doesn't have any pending mutations
 	// after the primary key change.
 	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(desc.GetMutations()) != 0 {
-		t.Fatalf("expected to find 0 mutations, but found %d", len(desc.GetMutations()))
+	if len(desc.AllMutations()) != 0 {
+		t.Fatalf("expected to find 0 mutations, but found %d", len(desc.AllMutations()))
 	}
 }
 
@@ -3067,8 +3068,8 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 	// that the job did not succeed even though it was canceled.
 	testutils.SucceedsSoon(t, func() error {
 		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.GetMutations()) != 0 {
-			return errors.Errorf("expected 0 mutations after cancellation, found %d", len(tableDesc.GetMutations()))
+		if len(tableDesc.AllMutations()) != 0 {
+			return errors.Errorf("expected 0 mutations after cancellation, found %d", len(tableDesc.AllMutations()))
 		}
 		if tableDesc.GetPrimaryIndex().NumColumns() != 1 || tableDesc.GetPrimaryIndex().GetColumnName(0) != "rowid" {
 			return errors.Errorf("expected primary key change to not succeed after cancellation")
@@ -3101,7 +3102,7 @@ func TestPrimaryKeyDropIndexNotCancelable(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		GCJob: &sql.GCJobTestingKnobs{
-			RunBeforeResume: func(jobID int64) error {
+			RunBeforeResume: func(jobID jobspb.JobID) error {
 				if !shouldAttemptCancel {
 					return nil
 				}
@@ -3369,7 +3370,7 @@ INSERT INTO t.test (k, v, length) VALUES (2, 3, 1);
 	// Wait until both mutations are queued up.
 	testutils.SucceedsSoon(t, func() error {
 		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if l := len(tableDesc.GetMutations()); l != 3 {
+		if l := len(tableDesc.AllMutations()); l != 3 {
 			return errors.Errorf("number of mutations = %d", l)
 		}
 		return nil
@@ -3467,7 +3468,7 @@ INSERT INTO t.test (k, v, length) VALUES (2, 3, 1);
 	}
 
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if l := len(tableDesc.GetMutations()); l != 3 {
+	if l := len(tableDesc.AllMutations()); l != 3 {
 		t.Fatalf("number of mutations = %d", l)
 	}
 
@@ -3636,7 +3637,7 @@ INSERT INTO t.kv VALUES ('a', 'b');
 			name:        `drop-create`,
 			firstStmt:   `DROP TABLE t.kv`,
 			secondStmt:  `CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR)`,
-			expectedErr: `relation "kv" already exists`,
+			expectedErr: `table "kv" is being dropped, try again later`,
 		},
 		// schema change followed by another statement works.
 		{
@@ -4018,7 +4019,7 @@ func TestTruncateInternals(t *testing.T) {
 	// Disable schema changes.
 	blockGC := make(chan struct{})
 	params.Knobs = base.TestingKnobs{
-		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { <-blockGC; return nil }},
+		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error { <-blockGC; return nil }},
 	}
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
@@ -4355,7 +4356,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	// Check that an outstanding schema change exists.
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	oldID := tableDesc.GetID()
-	if lenMutations := len(tableDesc.GetMutations()); lenMutations != 3 {
+	if lenMutations := len(tableDesc.AllMutations()); lenMutations != 3 {
 		t.Fatalf("%d outstanding schema change", lenMutations)
 	}
 
@@ -4382,7 +4383,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	// Col "x" is public and col "v" is dropped.
-	if num := len(tableDesc.GetMutations()); num > 0 {
+	if num := len(tableDesc.AllMutations()); num > 0 {
 		t.Fatalf("%d outstanding mutation", num)
 	}
 	if lenCols := len(tableDesc.PublicColumns()); lenCols != 2 {
@@ -5226,14 +5227,14 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// Start schema change that eventually runs a backfill.
 	if _, err := sqlDB.Exec(`CREATE UNIQUE INDEX foo ON t.test (v)`); !testutils.IsError(
-		err, fmt.Sprintf("%d entries, expected %d violates unique constraint", maxValue, maxValue+1),
+		err, "duplicate key value violates unique constraint \"foo\"",
 	) {
 		t.Fatal(err)
 	}
 
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(tableDesc.PublicNonPrimaryIndexes()) > 0 || len(tableDesc.GetMutations()) > 0 {
-		t.Fatalf("descriptor broken %d, %d", len(tableDesc.PublicNonPrimaryIndexes()), len(tableDesc.GetMutations()))
+	if len(tableDesc.PublicNonPrimaryIndexes()) > 0 || len(tableDesc.AllMutations()) > 0 {
+		t.Fatalf("descriptor broken %d, %d", len(tableDesc.PublicNonPrimaryIndexes()), len(tableDesc.AllMutations()))
 	}
 }
 
@@ -5306,8 +5307,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v JSON);
 	}
 
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(tableDesc.PublicNonPrimaryIndexes()) > 0 || len(tableDesc.GetMutations()) > 0 {
-		t.Fatalf("descriptor broken %d, %d", len(tableDesc.PublicNonPrimaryIndexes()), len(tableDesc.GetMutations()))
+	if len(tableDesc.PublicNonPrimaryIndexes()) > 0 || len(tableDesc.AllMutations()) > 0 {
+		t.Fatalf("descriptor broken %d, %d", len(tableDesc.PublicNonPrimaryIndexes()), len(tableDesc.AllMutations()))
 	}
 }
 
@@ -6177,13 +6178,13 @@ func TestMultipleRevert(t *testing.T) {
 				// Keep returning a retryable error until the job was actually canceled.
 				return jobs.NewRetryJobError("retry until cancel")
 			},
-			RunBeforeOnFailOrCancel: func(_ int64) error {
+			RunBeforeOnFailOrCancel: func(_ jobspb.JobID) error {
 				// Allow the backfill to proceed normally once the job was actually
 				// canceled.
 				shouldBlockBackfill = false
 				return nil
 			},
-			RunAfterMutationReversal: func(_ int64) error {
+			RunAfterMutationReversal: func(_ jobspb.JobID) error {
 				// Throw one retryable error right after mutations were reversed so that
 				// the mutation gets attempted to be reversed again.
 				if !shouldRetryAfterReversingMutations {
@@ -6276,7 +6277,7 @@ SELECT value
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
 			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-				RunBeforeOnFailOrCancel: func(_ int64) error {
+				RunBeforeOnFailOrCancel: func(_ jobspb.JobID) error {
 					onFailOrCancelStarted = true
 					return nil
 				},
@@ -6301,11 +6302,11 @@ SELECT value
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
 			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-				RunBeforeOnFailOrCancel: func(_ int64) error {
+				RunBeforeOnFailOrCancel: func(_ jobspb.JobID) error {
 					onFailOrCancelStarted = true
 					return nil
 				},
-				RunBeforeMutationReversal: func(_ int64) error {
+				RunBeforeMutationReversal: func(_ jobspb.JobID) error {
 					// The first time through reversing mutations, return a retriable
 					// error.
 					if !onFailOrCancelStarted || injectedError {
@@ -6337,7 +6338,7 @@ func TestDropTableWhileSchemaChangeReverting(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			RunBeforeOnFailOrCancel: func(_ int64) error {
+			RunBeforeOnFailOrCancel: func(_ jobspb.JobID) error {
 				close(beforeOnFailOrCancelNotification)
 				<-continueNotification
 				// Return a retry error, so that we can be sure to test the path where
@@ -6408,7 +6409,7 @@ CREATE UNIQUE INDEX i ON t.test(v);
 `)
 		require.Regexp(t, `violates unique constraint "i"`, err.Error())
 
-		var jobID int64
+		var jobID jobspb.JobID
 		var jobErr string
 		row := sqlDB.QueryRow("SELECT job_id, error FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE'")
 		require.NoError(t, row.Scan(&jobID, &jobErr))
@@ -6430,7 +6431,7 @@ CREATE UNIQUE INDEX i ON t.test(v);
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
 			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-				RunBeforeOnFailOrCancel: func(_ int64) error {
+				RunBeforeOnFailOrCancel: func(_ jobspb.JobID) error {
 					onFailOrCancelStarted = true
 					return nil
 				},
@@ -6457,7 +6458,7 @@ CREATE UNIQUE INDEX i ON t.test(v);
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
 			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-				RunBeforeOnFailOrCancel: func(_ int64) error {
+				RunBeforeOnFailOrCancel: func(_ jobspb.JobID) error {
 					onFailOrCancelStarted = true
 					return nil
 				},
@@ -6618,11 +6619,11 @@ func TestFailureToMarkCanceledReversalLeadsToCanceledStatus(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	jobCancellationsToFail := struct {
 		syncutil.Mutex
-		jobs map[int64]struct{}
+		jobs map[jobspb.JobID]struct{}
 	}{
-		jobs: make(map[int64]struct{}),
+		jobs: make(map[jobspb.JobID]struct{}),
 	}
-	withJobsToFail := func(f func(m map[int64]struct{})) {
+	withJobsToFail := func(f func(m map[jobspb.JobID]struct{})) {
 		jobCancellationsToFail.Lock()
 		defer jobCancellationsToFail.Unlock()
 		f(jobCancellationsToFail.jobs)
@@ -6636,7 +6637,7 @@ func TestFailureToMarkCanceledReversalLeadsToCanceledStatus(t *testing.T) {
 		},
 		JobsTestingKnobs: &jobs.TestingKnobs{
 			BeforeUpdate: func(orig, updated jobs.JobMetadata) (err error) {
-				withJobsToFail(func(m map[int64]struct{}) {
+				withJobsToFail(func(m map[jobspb.JobID]struct{}) {
 					if _, ok := m[orig.ID]; ok && updated.Status == jobs.StatusCanceled {
 						delete(m, orig.ID)
 						err = errors.Errorf("boom")
@@ -6655,8 +6656,8 @@ func TestFailureToMarkCanceledReversalLeadsToCanceledStatus(t *testing.T) {
 	tdb.Exec(t, `CREATE TABLE db.t (i INT PRIMARY KEY, j INT)`)
 	var schemaChangeWaitGroup sync.WaitGroup
 	var jobsErrGroup errgroup.Group
-	const numIndexes = 2                // number of indexes to add
-	jobIDs := make([]int64, numIndexes) // job IDs for the index additions
+	const numIndexes = 2                       // number of indexes to add
+	jobIDs := make([]jobspb.JobID, numIndexes) // job IDs for the index additions
 	for i := 0; i < numIndexes; i++ {
 		idxName := "t_" + strconv.Itoa(i) + "_idx"
 		schemaChangeWaitGroup.Add(1)
@@ -6675,7 +6676,7 @@ SELECT job_id FROM crdb_internal.jobs
 		})
 	}
 	require.NoError(t, jobsErrGroup.Wait())
-	withJobsToFail(func(m map[int64]struct{}) {
+	withJobsToFail(func(m map[jobspb.JobID]struct{}) {
 		for _, id := range jobIDs {
 			m[id] = struct{}{}
 		}
@@ -6695,7 +6696,7 @@ SELECT job_id FROM crdb_internal.jobs
 			Scan(&status)
 		require.Equal(t, jobs.StatusCanceled, status)
 	}
-	withJobsToFail(func(m map[int64]struct{}) {
+	withJobsToFail(func(m map[jobspb.JobID]struct{}) {
 		require.Len(t, m, 0)
 	})
 }
@@ -6725,8 +6726,8 @@ func TestCancelMultipleQueued(t *testing.T) {
 	tdb.Exec(t, `CREATE TABLE db.t (i INT PRIMARY KEY, j INT)`)
 	var schemaChangeWaitGroup sync.WaitGroup
 	var jobsErrGroup errgroup.Group
-	const numIndexes = 10               // number of indexes to add
-	jobIDs := make([]int64, numIndexes) // job IDs for the index additions
+	const numIndexes = 10                      // number of indexes to add
+	jobIDs := make([]jobspb.JobID, numIndexes) // job IDs for the index additions
 	shouldCancel := make([]bool, numIndexes)
 	for i := 0; i < numIndexes; i++ {
 		idxName := "t_" + strconv.Itoa(i) + "_idx"
@@ -6830,7 +6831,7 @@ func TestRollbackForeignKeyAddition(t *testing.T) {
 
 	<-beforeBackfillNotification
 
-	var jobID int64
+	var jobID jobspb.JobID
 
 	// We filter by descriptor_ids because there's a bug where we create an extra
 	// no-op job for the referenced table (#57624).
@@ -6849,4 +6850,183 @@ AND descriptor_ids[1] = 'db.t2'::regclass::int`,
 		Scan(&status, &error)
 	require.Equal(t, status, jobs.StatusCanceled)
 	require.Equal(t, error, "job canceled by user")
+}
+
+// TestRevertingJobsOnDatabasesAndSchemas tests that schema change jobs on
+// databases and schemas return an error from the OnFailOrCancel hook. It also
+// tests that such jobs are not cancelable. Regression test for #59415.
+func TestRevertingJobsOnDatabasesAndSchemas(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer sqltestutils.SetTestJobsAdoptInterval()()
+
+	testCases := []struct {
+		name       string
+		setupStmts string
+		scStmt     string
+		jobRegex   string
+	}{
+		{
+			name:       "drop schema",
+			setupStmts: `CREATE DATABASE db_drop_schema; CREATE SCHEMA db_drop_schema.sc;`,
+			scStmt:     `DROP SCHEMA db_drop_schema.sc`,
+			jobRegex:   `^DROP SCHEMA db_drop_schema.sc$`,
+		},
+		{
+			name:       "rename schema",
+			setupStmts: `CREATE DATABASE db_rename_schema; CREATE SCHEMA db_rename_schema.sc;`,
+			scStmt:     `ALTER SCHEMA db_rename_schema.sc RENAME TO new_name`,
+			jobRegex:   `^ALTER SCHEMA db_rename_schema.sc RENAME TO new_name$`,
+		},
+		{
+			name:       "grant on schema",
+			setupStmts: `CREATE DATABASE db_grant_on_schema; CREATE SCHEMA db_grant_on_schema.sc;`,
+			scStmt:     `GRANT ALL ON SCHEMA db_grant_on_schema.sc TO PUBLIC`,
+			jobRegex:   `updating privileges for schema`,
+		},
+		{
+			name:       "drop database cascade",
+			setupStmts: `CREATE DATABASE db_drop; CREATE SCHEMA db_drop.sc; CREATE TABLE db_drop.sc.tbl();`,
+			scStmt:     `DROP DATABASE db_drop CASCADE`,
+			jobRegex:   `^DROP DATABASE db_drop CASCADE$`,
+		},
+		{
+			name:       "rename database",
+			setupStmts: `CREATE DATABASE db_rename;`,
+			scStmt:     `ALTER DATABASE db_rename RENAME TO db_new_name`,
+			jobRegex:   `^ALTER DATABASE db_rename RENAME TO db_new_name$`,
+		},
+		{
+			name:       "grant on database",
+			setupStmts: `CREATE DATABASE db_grant`,
+			scStmt:     `GRANT ALL ON DATABASE db_grant TO PUBLIC`,
+			jobRegex:   `updating privileges for database`,
+		},
+	}
+
+	ctx := context.Background()
+
+	t.Run("failed due to injected error", func(t *testing.T) {
+		var s serverutils.TestServerInterface
+		params, _ := tests.CreateTestServerParams()
+		params.Knobs = base.TestingKnobs{
+			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+				RunBeforeResume: func(jobID jobspb.JobID) error {
+					scJob, err := s.JobRegistry().(*jobs.Registry).LoadJob(ctx, jobID)
+					if err != nil {
+						return err
+					}
+					pl := scJob.Payload()
+					// This is a hacky way to only inject errors in the rename/drop/grant jobs.
+					if strings.Contains(pl.Description, "updating parent database") {
+						return nil
+					}
+					for _, s := range []string{"DROP", "RENAME", "updating privileges"} {
+						if strings.Contains(pl.Description, s) {
+							return errors.New("injected permanent error")
+						}
+					}
+					return nil
+				},
+			},
+		}
+		var db *gosql.DB
+		s, db, _ = serverutils.StartServer(t, params)
+		defer s.Stopper().Stop(ctx)
+		sqlDB := sqlutils.MakeSQLRunner(db)
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				sqlDB.Exec(t, tc.setupStmts)
+				sqlDB.ExpectErr(t, "injected permanent error", tc.scStmt)
+				result := sqlDB.QueryStr(t,
+					`SELECT status, error FROM crdb_internal.jobs WHERE description ~ $1`,
+					tc.jobRegex)
+				require.Len(t, result, 1)
+				status, jobError := result[0][0], result[0][1]
+				require.Equal(t, string(jobs.StatusFailed), status)
+				require.Regexp(t,
+					"cannot be reverted, manual cleanup may be required: "+
+						"schema change jobs on databases and schemas cannot be reverted",
+					jobError)
+			})
+		}
+	})
+
+	t.Run("canceling not allowed", func(t *testing.T) {
+		var state = struct {
+			mu    syncutil.Mutex
+			jobID jobspb.JobID
+			// Closed in the RunBeforeResume testing knob.
+			beforeResumeNotification chan struct{}
+			// Closed when we're ready to resume the schema change.
+			continueNotification chan struct{}
+		}{}
+		initNotification := func() (chan struct{}, chan struct{}) {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			state.beforeResumeNotification = make(chan struct{})
+			state.continueNotification = make(chan struct{})
+			return state.beforeResumeNotification, state.continueNotification
+		}
+		notifyBeforeResume := func(jobID jobspb.JobID) {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			state.jobID = jobID
+			if state.beforeResumeNotification != nil {
+				close(state.beforeResumeNotification)
+				state.beforeResumeNotification = nil
+			}
+			if state.continueNotification != nil {
+				<-state.continueNotification
+			}
+		}
+
+		var s serverutils.TestServerInterface
+		params, _ := tests.CreateTestServerParams()
+		params.Knobs = base.TestingKnobs{
+			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+				RunBeforeResume: func(jobID jobspb.JobID) error {
+					scJob, err := s.JobRegistry().(*jobs.Registry).LoadJob(ctx, jobID)
+					if err != nil {
+						return err
+					}
+					pl := scJob.Payload()
+					// This is a hacky way to only block in the rename/drop/grant jobs.
+					if strings.Contains(pl.Description, "updating parent database") {
+						return nil
+					}
+					for _, s := range []string{"DROP", "RENAME", "updating privileges"} {
+						if strings.Contains(pl.Description, s) {
+							notifyBeforeResume(jobID)
+						}
+					}
+					return nil
+				},
+			},
+		}
+		var db *gosql.DB
+		s, db, _ = serverutils.StartServer(t, params)
+		defer s.Stopper().Stop(ctx)
+		sqlDB := sqlutils.MakeSQLRunner(db)
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				beforeResumeNotification, continueNotification := initNotification()
+				sqlDB.Exec(t, tc.setupStmts)
+
+				g := ctxgroup.WithContext(ctx)
+				g.GoCtx(func(ctx context.Context) error {
+					_, err := db.ExecContext(ctx, tc.scStmt)
+					assert.NoError(t, err)
+					return nil
+				})
+
+				<-beforeResumeNotification
+				sqlDB.ExpectErr(t, "not cancelable", "CANCEL JOB $1", state.jobID)
+
+				close(continueNotification)
+				require.NoError(t, g.Wait())
+			})
+		}
+	})
 }

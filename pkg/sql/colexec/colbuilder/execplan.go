@@ -72,6 +72,10 @@ func wrapRowSources(
 		// necessarily a execinfra.RowSource, so remove the unnecessary
 		// conversion.
 		if c, ok := input.(*colexec.Columnarizer); ok {
+			// Since this Columnarizer has been previously added to Closers and
+			// MetadataSources, this call ensures that all future calls are noops.
+			// Modifying the slices at this stage is difficult.
+			c.MarkAsRemovedFromFlow()
 			toWrapInputs = append(toWrapInputs, c.Input())
 		} else {
 			// Note that this materializer is *not* added to the set of
@@ -90,7 +94,7 @@ func wrapRowSources(
 				nil, /* output */
 				nil, /* metadataSourcesQueue */
 				nil, /* toClose */
-				nil, /* execStatsForTrace */
+				nil, /* getStats */
 				nil, /* cancelFlow */
 			)
 			if err != nil {
@@ -571,9 +575,6 @@ func (r opResult) createAndWrapRowSource(
 			if err != nil {
 				return nil, err
 			}
-			if kvReader, ok := proc.(execinfra.KVReader); ok {
-				r.KVReader = kvReader
-			}
 			var (
 				rs execinfra.RowSource
 				ok bool
@@ -592,7 +593,10 @@ func (r opResult) createAndWrapRowSource(
 		return err
 	}
 	r.Op = c
-	r.MetadataSources = append(r.MetadataSources, c)
+	if args.TestingKnobs.PlanInvariantsCheckers {
+		r.Op = colexec.NewInvariantsChecker(r.Op)
+	}
+	r.MetadataSources = append(r.MetadataSources, r.Op.(execinfrapb.MetadataSource))
 	r.ToClose = append(r.ToClose, c)
 	return nil
 }
@@ -712,7 +716,7 @@ func NewColOperator(
 					core.Values.NumRows, len(core.Values.Columns),
 				)
 			}
-			result.Op = colexecutils.NewFixedNumTuplesNoInputOp(streamingAllocator, int(core.Values.NumRows))
+			result.Op = colexecutils.NewFixedNumTuplesNoInputOp(streamingAllocator, int(core.Values.NumRows), nil /* opToInitialize */)
 			result.ColumnTypes = make([]*types.T, len(core.Values.Columns))
 			for i, col := range core.Values.Columns {
 				result.ColumnTypes[i] = col.Type
@@ -726,15 +730,18 @@ func NewColOperator(
 			if err != nil {
 				return r, err
 			}
-			result.Op = scanOp
-			result.KVReader = scanOp
-			result.MetadataSources = append(result.MetadataSources, scanOp)
-			result.Releasables = append(result.Releasables, scanOp)
 			// colBatchScan is wrapped with a cancel checker below, so we need
 			// to log its creation separately.
 			if log.V(1) {
-				log.Infof(ctx, "made op %T\n", result.Op)
+				log.Infof(ctx, "made op %T\n", scanOp)
 			}
+			result.Op = scanOp
+			if args.TestingKnobs.PlanInvariantsCheckers {
+				result.Op = colexec.NewInvariantsChecker(result.Op)
+			}
+			result.KVReader = scanOp
+			result.MetadataSources = append(result.MetadataSources, result.Op.(execinfrapb.MetadataSource))
+			result.Releasables = append(result.Releasables, scanOp)
 
 			// We want to check for cancellation once per input batch, and
 			// wrapping only colBatchScan with a CancelChecker allows us to do
@@ -774,7 +781,7 @@ func NewColOperator(
 				// TableReader, so we end up creating an orphaned colBatchScan.
 				// We should avoid that. Ideally the optimizer would not plan a
 				// scan in this unusual case.
-				result.Op, err = colexecutils.NewFixedNumTuplesNoInputOp(streamingAllocator, 1 /* numTuples */), nil
+				result.Op, err = colexecutils.NewFixedNumTuplesNoInputOp(streamingAllocator, 1 /* numTuples */, inputs[0]), nil
 				// We make ColumnTypes non-nil so that sanity check doesn't
 				// panic.
 				result.ColumnTypes = []*types.T{}
@@ -1335,6 +1342,9 @@ func NewColOperator(
 		}
 	}
 	r.Op, r.ColumnTypes = addProjection(r.Op, r.ColumnTypes, projection)
+	if args.TestingKnobs.PlanInvariantsCheckers {
+		r.Op = colexec.NewInvariantsChecker(r.Op)
+	}
 	return r, err
 }
 
@@ -1525,7 +1535,7 @@ func (r opResult) createBufferingUnlimitedMemAccount(
 func (r opResult) createDiskAccount(
 	ctx context.Context, flowCtx *execinfra.FlowCtx, name string,
 ) *mon.BoundAccount {
-	opDiskMonitor := execinfra.NewMonitor(ctx, flowCtx.Cfg.DiskMonitor, name)
+	opDiskMonitor := execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, name)
 	r.OpMonitors = append(r.OpMonitors, opDiskMonitor)
 	opDiskAccount := opDiskMonitor.MakeBoundAccount()
 	r.OpAccounts = append(r.OpAccounts, &opDiskAccount)

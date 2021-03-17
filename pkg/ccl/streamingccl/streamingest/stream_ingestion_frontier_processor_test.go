@@ -53,18 +53,21 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			DB:          kvDB,
-			DiskMonitor: testDiskMonitor,
 			JobRegistry: registry,
 		},
-		EvalCtx: &evalCtx,
+		EvalCtx:     &evalCtx,
+		DiskMonitor: testDiskMonitor,
 	}
 
 	out := &distsqlutils.RowBuffer{}
 	post := execinfrapb.PostProcessSpec{}
 
 	var spec execinfrapb.StreamIngestionDataSpec
-	pa1 := streamingccl.PartitionAddress("partition1")
-	pa2 := streamingccl.PartitionAddress("partition2")
+	// The stream address needs to be set with a scheme we support, but this test
+	// will mock out the actual client.
+	spec.StreamAddress = "randomgen://test/"
+	pa1 := streamingccl.PartitionAddress("randomgen://test1/")
+	pa2 := streamingccl.PartitionAddress("randomgen://test2/")
 
 	v := roachpb.MakeValueFromString("value_1")
 	v.Timestamp = hlc.Timestamp{WallTime: 1}
@@ -151,7 +154,7 @@ func TestStreamIngestionFrontierProcessor(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			spec.PartitionAddresses = []streamingccl.PartitionAddress{pa1, pa2}
+			spec.PartitionAddresses = []string{string(pa1), string(pa2)}
 			proc, err := newStreamIngestionDataProcessor(&flowCtx, 0 /* processorID */, spec, &post, out)
 			require.NoError(t, err)
 			sip, ok := proc.(*streamIngestionProcessor)

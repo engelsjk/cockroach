@@ -43,7 +43,7 @@ type Job struct {
 	// Started, etc., have Registry call a setupFn and a workFn as appropriate.
 	registry *Registry
 
-	id        int64
+	id        jobspb.JobID
 	createdBy *CreatedByInfo
 	sessionID sqlliveness.SessionID
 	mu        struct {
@@ -179,7 +179,7 @@ func (s Status) Terminal() bool {
 // InvalidStatusError is the error returned when the desired operation is
 // invalid given the job's current status.
 type InvalidStatusError struct {
-	id     int64
+	id     jobspb.JobID
 	status Status
 	op     string
 	err    string
@@ -202,7 +202,7 @@ func SimplifyInvalidStatusError(err error) error {
 }
 
 // ID returns the ID of the job.
-func (j *Job) ID() int64 {
+func (j *Job) ID() jobspb.JobID {
 	return j.id
 }
 
@@ -289,6 +289,21 @@ func (j *Job) SetDescription(ctx context.Context, txn *kv.Txn, updateFn Descript
 	})
 }
 
+// SetNonCancelable updates the NonCancelable field of a created job.
+func (j *Job) SetNonCancelable(
+	ctx context.Context, txn *kv.Txn, updateFn NonCancelableUpdateFn,
+) error {
+	return j.Update(ctx, txn, func(_ *kv.Txn, md JobMetadata, ju *JobUpdater) error {
+		prev := md.Payload.Noncancelable
+		newStatus := updateFn(ctx, prev)
+		if prev != newStatus {
+			md.Payload.Noncancelable = newStatus
+			ju.UpdatePayload(md.Payload)
+		}
+		return nil
+	})
+}
+
 // RunningStatusFn is a callback that computes a job's running status
 // given its details. It is safe to modify details in the callback; those
 // modifications will be automatically persisted to the database record.
@@ -297,6 +312,10 @@ type RunningStatusFn func(ctx context.Context, details jobspb.Details) (RunningS
 // DescriptionUpdateFn is a callback that computes a job's description
 // given its current one.
 type DescriptionUpdateFn func(ctx context.Context, description string) (string, error)
+
+// NonCancelableUpdateFn is a callback that computes a job's non-cancelable
+// status given its current one.
+type NonCancelableUpdateFn func(ctx context.Context, nonCancelable bool) bool
 
 // FractionProgressedFn is a callback that computes a job's completion fraction
 // given its details. It is safe to modify details in the callback; those
@@ -701,7 +720,7 @@ func (j *Job) runInTxn(
 
 // JobNotFoundError is returned from load when the job does not exist.
 type JobNotFoundError struct {
-	jobID int64
+	jobID jobspb.JobID
 }
 
 // Error makes JobNotFoundError an error.
@@ -849,14 +868,16 @@ func (sj *StartableJob) Start(ctx context.Context) (err error) {
 	if !sj.txn.IsCommitted() {
 		return fmt.Errorf("cannot resume %T job which is not committed", sj.resumer)
 	}
-	if err := sj.started(ctx, nil /* txn */); err != nil {
-		return err
-	}
 
 	finishSpan := func() {
 		if sj.span != nil {
 			sj.span.Finish()
 		}
+	}
+
+	if err := sj.started(ctx, nil /* txn */); err != nil {
+		finishSpan()
+		return err
 	}
 
 	if err := sj.registry.stopper.RunAsyncTask(ctx, sj.taskName(), func(ctx context.Context) {
@@ -900,22 +921,38 @@ func (sj *StartableJob) ReportExecutionResults(
 }
 
 // CleanupOnRollback will unregister the job in the case that the creating
-// transaction has been rolled back.
+// transaction has been rolled back. It will return an assertion failure if
+// the transaction used to create this job is committed. It will return an
+// error but proceed with cleanup if the transaction is still open under
+// the assumption that this is being called due to an unrecoverable error
+// that prevented the transaction from being cleaned up.
 func (sj *StartableJob) CleanupOnRollback(ctx context.Context) error {
-	if sj.txn.IsCommitted() {
+
+	if sj.txn.IsCommitted() && ctx.Err() == nil {
 		return errors.AssertionFailedf(
 			"cannot call CleanupOnRollback for a StartableJob created by a committed transaction")
 	}
-	if !sj.txn.Sender().TxnStatus().IsFinalized() {
-		return errors.AssertionFailedf(
-			"cannot call CleanupOnRollback for a StartableJob with a non-finalized transaction")
-	}
+
+	// Note that we check the context error because when a context is canceled in
+	// (*kv.DB).Txn() we move the cleanup to async. That async cleanup may not
+	// have happened either due to a race or due to the server shutting down.
+	// Another issue is that the cleanup may fail with an ambiguous error due to
+	// networking problems leading the transaction in an undefined state.
+	// Given that, proceed to clean up regardless.
+
 	sj.registry.unregister(sj.ID())
 	if sj.span != nil {
 		sj.span.Finish()
 	}
 	if sj.cancel != nil {
 		sj.cancel()
+	}
+
+	// This is an error, but it's likely due to some shutdown behavior so do not
+	// mark it as an assertion failure.
+	if !sj.txn.Sender().TxnStatus().IsFinalized() && ctx.Err() == nil {
+		return errors.New(
+			"cannot call CleanupOnRollback for a StartableJob with a non-finalized transaction")
 	}
 	return nil
 }

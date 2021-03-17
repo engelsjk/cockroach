@@ -1403,6 +1403,151 @@ Response returned by target query's gateway node.
 
 
 
+## ListContentionEvents
+
+`GET /_status/contention_events`
+
+ListContentionEvents retrieves the contention events across the entire
+cluster.
+
+For SQL keys the following orderings are maintained:
+- on the highest level, all IndexContentionEvents objects are ordered
+  according to their importance (as defined by the number of contention
+  events within each object).
+- on the middle level, all SingleKeyContention objects are ordered by their
+  keys lexicographically.
+- on the lowest level, all SingleTxnContention objects are ordered by the
+  number of times that transaction was observed to contend with other
+  transactions.
+
+For non-SQL keys the following orderings are maintained:
+- on the top level, all SingleNonSQLKeyContention objects are ordered
+  by their keys lexicographically.
+- on the bottom level, all SingleTxnContention objects are ordered by the
+  number of times that transaction was observed to contend with other
+  transactions.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+Request object for ListContentionEvents and ListLocalContentionEvents.
+
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+Response object for ListContentionEvents and ListLocalContentionEvents.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| events | [cockroach.sql.contentionpb.SerializedRegistry](#cockroach.server.serverpb.ListContentionEventsResponse-cockroach.sql.contentionpb.SerializedRegistry) |  | All available contention information on this node or cluster. | [reserved](#support-status) |
+| errors | [ListContentionEventsError](#cockroach.server.serverpb.ListContentionEventsResponse-cockroach.server.serverpb.ListContentionEventsError) | repeated | Any errors that occurred during fan-out calls to other nodes. | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.ListContentionEventsResponse-cockroach.server.serverpb.ListContentionEventsError"></a>
+#### ListContentionEventsError
+
+An error wrapper object for ListContentionEventsResponse.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| node_id | [int32](#cockroach.server.serverpb.ListContentionEventsResponse-int32) |  | ID of node that was being contacted when this error occurred. | [reserved](#support-status) |
+| message | [string](#cockroach.server.serverpb.ListContentionEventsResponse-string) |  | Error message. | [reserved](#support-status) |
+
+
+
+
+
+
+## ListLocalContentionEvents
+
+`GET /_status/local_contention_events`
+
+ListLocalContentionEvents retrieves the contention events on this node.
+
+For SQL keys the following orderings are maintained:
+- on the highest level, all IndexContentionEvents objects are ordered
+  according to their importance (as defined by the number of contention
+  events within each object).
+- on the middle level, all SingleKeyContention objects are ordered by their
+  keys lexicographically.
+- on the lowest level, all SingleTxnContention objects are ordered by the
+  number of times that transaction was observed to contend with other
+  transactions.
+
+For non-SQL keys the following orderings are maintained:
+- on the top level, all SingleNonSQLKeyContention objects are ordered
+  by their keys lexicographically.
+- on the bottom level, all SingleTxnContention objects are ordered by the
+  number of times that transaction was observed to contend with other
+  transactions.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+Request object for ListContentionEvents and ListLocalContentionEvents.
+
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+Response object for ListContentionEvents and ListLocalContentionEvents.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| events | [cockroach.sql.contentionpb.SerializedRegistry](#cockroach.server.serverpb.ListContentionEventsResponse-cockroach.sql.contentionpb.SerializedRegistry) |  | All available contention information on this node or cluster. | [reserved](#support-status) |
+| errors | [ListContentionEventsError](#cockroach.server.serverpb.ListContentionEventsResponse-cockroach.server.serverpb.ListContentionEventsError) | repeated | Any errors that occurred during fan-out calls to other nodes. | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.ListContentionEventsResponse-cockroach.server.serverpb.ListContentionEventsError"></a>
+#### ListContentionEventsError
+
+An error wrapper object for ListContentionEventsResponse.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| node_id | [int32](#cockroach.server.serverpb.ListContentionEventsResponse-int32) |  | ID of node that was being contacted when this error occurred. | [reserved](#support-status) |
+| message | [string](#cockroach.server.serverpb.ListContentionEventsResponse-string) |  | Error message. | [reserved](#support-status) |
+
+
+
+
+
+
 ## CancelSession
 
 `POST /_status/cancel_session/{node_id}`
@@ -2581,7 +2726,6 @@ Support status: [reserved](#support-status)
 | id | [int64](#cockroach.server.serverpb.StatementDiagnosticsResponse-int64) |  |  | [reserved](#support-status) |
 | statement_fingerprint | [string](#cockroach.server.serverpb.StatementDiagnosticsResponse-string) |  |  | [reserved](#support-status) |
 | collected_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.StatementDiagnosticsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
-| trace | [string](#cockroach.server.serverpb.StatementDiagnosticsResponse-string) |  |  | [reserved](#support-status) |
 
 
 

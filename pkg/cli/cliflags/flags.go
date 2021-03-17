@@ -678,6 +678,11 @@ Also see: ` + build.MakeIssueURL(53404) + `
 Disable use of implicit credentials when accessing external data.
 Instead, require the user to always specify access keys.`,
 	}
+	ExternalIODisabled = FlagInfo{
+		Name: "external-io-disabled",
+		Description: `
+Disable use of "external" IO, such as to S3, GCS, or the file system (nodelocal), or anything other than userfile.`,
+	}
 
 	// KeySize, CertificateLifetime, AllowKeyReuse, and OverwriteFiles are used for
 	// certificate generation functions.
@@ -712,8 +717,33 @@ Instead, require the user to always specify access keys.`,
 	}
 
 	InitToken = FlagInfo{
-		Name:        "init-token",
-		Description: `Shared token for initialization of node TLS certificates`,
+		Name: "init-token",
+		Description: `Shared token for initialization of node TLS certificates.
+
+This flag is optional for the 'start' command. When omitted, the 'start'
+command expects the operator to prepare TLS certificates beforehand using
+the 'cert' command.
+
+This flag must be combined with --num-expected-initial-nodes.`,
+	}
+
+	NumExpectedInitialNodes = FlagInfo{
+		Name: "num-expected-initial-nodes",
+		Description: `Number of expected nodes during TLS certificate creation,
+including the node where the connect command is run.
+
+This flag must be combined with --init-token.`,
+	}
+
+	SingleNode = FlagInfo{
+		Name: "single-node",
+		Description: `Prepare the certificates for a subsequent 'start-single-node'
+command. The 'connect' command only runs cursory checks on the network
+configuration and does not wait for peers to auto-negotiate a common
+set of credentials.
+
+The --single-node flag is exclusive with the --init-num-peers and --init-token
+flags.`,
 	}
 
 	CertsDir = FlagInfo{
@@ -1281,6 +1311,30 @@ dependencies on other tables.
 		Description: `
 Override limits on line size when importing Postgres dump files. This setting 
 may need to be tweaked if the Postgres dump file has extremely long lines.
+`,
+	}
+
+	ImportIgnoreUnsupportedStatements = FlagInfo{
+		Name: "ignore-unsupported-statements",
+		Description: `
+Ignore statements that are unsupported during an import from a PGDUMP file.
+`,
+	}
+
+	ImportLogIgnoredStatements = FlagInfo{
+		Name: "log-ignored-statements",
+		Description: `
+Log unsupported statements that are ignored during an import from a PGDUMP file to the specified
+destination. This flag should be used in conjunction with the ignore-unsupported-statements flag
+that ignores the unsupported statements during an import.
+`,
+	}
+
+	ImportRowLimit = FlagInfo{
+		Name: "row-limit",
+		Description: `
+Specify the number of rows that will be imported for each table during a PGDUMP or MYSQLDUMP import.
+This can be used to check schema and data correctness without running the entire import.
 `,
 	}
 

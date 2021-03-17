@@ -212,9 +212,12 @@ func (sc *SemaContext) GetTypeResolver() TypeReferenceResolver {
 }
 
 func placeholderTypeAmbiguityError(idx PlaceholderIdx) error {
-	return pgerror.WithCandidateCode(
-		&placeholderTypeAmbiguityErr{idx},
-		pgcode.InvalidParameterValue)
+	return errors.WithHint(
+		pgerror.WithCandidateCode(
+			&placeholderTypeAmbiguityErr{idx},
+			pgcode.IndeterminateDatatype),
+		"consider adding explicit type casts to the placeholder arguments",
+	)
 }
 
 type placeholderTypeAmbiguityErr struct {
@@ -465,11 +468,11 @@ func (expr *CastExpr) TypeCheck(
 			desired = exprType
 		}
 	case semaCtx.isUnresolvedPlaceholder(expr.Expr):
-		// This case will be triggered if ProcessPlaceholderAnnotations found
-		// the same placeholder in another location where it was either not
-		// the child of a cast, or was the child of a cast to a different type.
-		// In this case, we default to inferring a STRING for the placeholder.
-		desired = types.String
+		// If the placeholder has not yet been resolved, then we can make its
+		// expected type be the cast type. If it already has been resolved, but the
+		// type we gave it before is not compatible with the usage here, then
+		// type-checking will fail as desired.
+		desired = exprType
 	case isEmptyArray(expr.Expr):
 		// An empty array can't be type-checked with a desired parameter of
 		// types.Any. If we're going to cast to another array type, which is a
@@ -1869,10 +1872,31 @@ func typeCheckComparisonOpWithSubOperator(
 		}
 	}
 	fn, ok := ops.LookupImpl(cmpTypeLeft, cmpTypeRight)
-	if !ok {
+	if !ok || !deepCheckValidCmpOp(ops, cmpTypeLeft, cmpTypeRight) {
 		return nil, nil, nil, false, subOpCompError(cmpTypeLeft, rightTyped.ResolvedType(), subOp, op)
 	}
 	return leftTyped, rightTyped, fn, false, nil
+}
+
+// deepCheckValidCmpOp performs extra checks that a given operation is valid
+// when the types are tuples.
+func deepCheckValidCmpOp(ops cmpOpOverload, leftType, rightType *types.T) bool {
+	if leftType.Family() == types.TupleFamily && rightType.Family() == types.TupleFamily {
+		l := leftType.TupleContents()
+		r := rightType.TupleContents()
+		if len(l) != len(r) {
+			return false
+		}
+		for i := range l {
+			if _, ok := ops.LookupImpl(l[i], r[i]); !ok {
+				return false
+			}
+			if !deepCheckValidCmpOp(ops, l[i], r[i]) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func subOpCompError(leftType, rightType *types.T, subOp, op ComparisonOperator) error {

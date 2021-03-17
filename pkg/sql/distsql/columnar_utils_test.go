@@ -100,8 +100,8 @@ func verifyColOperator(t *testing.T, args verifyColOperatorArgs) error {
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
-			DiskMonitor: diskMonitor,
 		},
+		DiskMonitor: diskMonitor,
 	}
 	flowCtx.Cfg.TestingKnobs.ForceDiskSpill = args.forceDiskSpill
 
@@ -177,7 +177,7 @@ func verifyColOperator(t *testing.T, args verifyColOperatorArgs) error {
 		nil, /* output */
 		result.MetadataSources,
 		result.ToClose,
-		nil, /* execStatsForTrace */
+		nil, /* getStats */
 		nil, /* cancelFlow */
 	)
 	if err != nil {

@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -184,12 +185,12 @@ func (p *planner) renameSchema(
 	ctx context.Context, db *dbdesc.Mutable, desc *schemadesc.Mutable, newName string, jobDesc string,
 ) error {
 	// Check that there isn't a name collision with the new name.
-	found, err := p.schemaExists(ctx, db.ID, newName)
+	found, _, err := schemaExists(ctx, p.txn, p.ExecCfg().Codec, db.ID, newName)
 	if err != nil {
 		return err
 	}
 	if found {
-		return pgerror.Newf(pgcode.DuplicateSchema, "schema %q already exists", newName)
+		return sqlerrors.NewSchemaAlreadyExistsError(newName)
 	}
 
 	// Ensure that the new name is a valid schema name.

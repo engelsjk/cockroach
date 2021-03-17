@@ -41,10 +41,10 @@ func TestVectorizeInternalMemorySpaceError(t *testing.T) {
 
 	flowCtx := &execinfra.FlowCtx{
 		Cfg: &execinfra.ServerConfig{
-			Settings:    st,
-			DiskMonitor: testDiskMonitor,
+			Settings: st,
 		},
-		EvalCtx: &evalCtx,
+		DiskMonitor: testDiskMonitor,
+		EvalCtx:     &evalCtx,
 	}
 
 	oneInput := []execinfrapb.InputSyncSpec{
@@ -73,9 +73,9 @@ func TestVectorizeInternalMemorySpaceError(t *testing.T) {
 	for _, tc := range testCases {
 		for _, success := range []bool{true, false} {
 			t.Run(fmt.Sprintf("%s-success-expected-%t", tc.desc, success), func(t *testing.T) {
-				inputs := []colexecop.Operator{colexecutils.NewFixedNumTuplesNoInputOp(testAllocator, 0 /* numTuples */)}
+				inputs := []colexecop.Operator{colexecutils.NewFixedNumTuplesNoInputOp(testAllocator, 0 /* numTuples */, nil /* opToInitialize */)}
 				if len(tc.spec.Input) > 1 {
-					inputs = append(inputs, colexecutils.NewFixedNumTuplesNoInputOp(testAllocator, 0 /* numTuples */))
+					inputs = append(inputs, colexecutils.NewFixedNumTuplesNoInputOp(testAllocator, 0 /* numTuples */, nil /* opToInitialize */))
 				}
 				memMon := mon.NewMonitor("MemoryMonitor", mon.MemoryResource, nil, nil, 0, math.MaxInt64, st)
 				if success {
@@ -117,10 +117,10 @@ func TestVectorizeAllocatorSpaceError(t *testing.T) {
 
 	flowCtx := &execinfra.FlowCtx{
 		Cfg: &execinfra.ServerConfig{
-			Settings:    st,
-			DiskMonitor: testDiskMonitor,
+			Settings: st,
 		},
-		EvalCtx: &evalCtx,
+		DiskMonitor: testDiskMonitor,
+		EvalCtx:     &evalCtx,
 	}
 
 	oneInput := []execinfrapb.InputSyncSpec{

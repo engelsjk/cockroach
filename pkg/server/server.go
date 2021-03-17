@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,8 +41,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvprober"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/container"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -62,6 +66,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/gcjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
@@ -143,6 +148,7 @@ type Server struct {
 	recorder     *status.MetricsRecorder
 	runtime      *status.RuntimeStatSampler
 	updates      *diagnostics.UpdateChecker
+	ctSender     *sidetransport.Sender
 
 	admin           *adminServer
 	status          *statusServer
@@ -154,7 +160,8 @@ type Server struct {
 	raftTransport   *kvserver.RaftTransport
 	stopper         *stop.Stopper
 
-	debug *debug.Server
+	debug    *debug.Server
+	kvProber *kvprober.Prober
 
 	replicationReporter   *reports.Reporter
 	protectedtsProvider   protectedts.Provider
@@ -475,6 +482,10 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	sTS := ts.MakeServer(cfg.AmbientCtx, tsDB, nodeCountFn, cfg.TimeSeriesServerConfig, stopper)
 
+	ctSender := sidetransport.NewSender(stopper, st, clock, nodeDialer)
+	stores := kvserver.NewStores(cfg.AmbientCtx, clock)
+	ctReceiver := sidetransport.NewReceiver(nodeIDContainer, stopper, stores, nil /* testingKnobs */)
+
 	// The InternalExecutor will be further initialized later, as we create more
 	// of the server's components. There's a circular dependency - many things
 	// need an InternalExecutor, but the InternalExecutor needs an ExecutorConfig,
@@ -528,6 +539,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		LogRangeEvents:          cfg.EventLogEnabled,
 		RangeDescriptorCache:    distSender.RangeDescriptorCache(),
 		TimeSeriesDataStore:     tsDB,
+		ClosedTimestampSender:   ctSender,
+		ClosedTimestampReceiver: ctReceiver,
 
 		// Initialize the closed timestamp subsystem. Note that it won't
 		// be ready until it is .Start()ed, but the grpc server can be
@@ -540,7 +553,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			// before this is ever called.
 			Refresh: func(rangeIDs ...roachpb.RangeID) {
 				for _, rangeID := range rangeIDs {
-					repl, _, err := lateBoundNode.stores.GetReplicaForRangeID(rangeID)
+					repl, _, err := lateBoundNode.stores.GetReplicaForRangeID(ctx, rangeID)
 					if err != nil || repl == nil {
 						continue
 					}
@@ -576,12 +589,13 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	node := NewNode(
 		storeCfg, recorder, registry, stopper,
-		txnMetrics, nil /* execCfg */, &rpcContext.ClusterID)
+		txnMetrics, stores, nil /* execCfg */, &rpcContext.ClusterID)
 	lateBoundNode = node
 	roachpb.RegisterInternalServer(grpcServer.Server, node)
 	kvserver.RegisterPerReplicaServer(grpcServer.Server, node.perReplicaServer)
 	kvserver.RegisterPerStoreServer(grpcServer.Server, node.perReplicaServer)
 	node.storeCfg.ClosedTimestamp.RegisterClosedTimestampServer(grpcServer.Server)
+	ctpb.RegisterSideTransportServer(grpcServer.Server, ctReceiver)
 	replicationReporter := reports.NewReporter(
 		db, node.stores, storePool, st, nodeLiveness, internalExecutor)
 
@@ -601,6 +615,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// TODO(tbg): give adminServer only what it needs (and avoid circular deps).
 	sAdmin := newAdminServer(lateBoundServer, internalExecutor)
 	sessionRegistry := sql.NewSessionRegistry()
+	contentionRegistry := contention.NewRegistry()
 
 	sStatus := newStatusServer(
 		cfg.AmbientCtx,
@@ -616,6 +631,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		node.stores,
 		stopper,
 		sessionRegistry,
+		contentionRegistry,
 		internalExecutor,
 	)
 	// TODO(tbg): don't pass all of Server into this to avoid this hack.
@@ -634,6 +650,14 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			break
 		}
 	}
+
+	kvProber := kvprober.NewProber(kvprober.Opts{
+		AmbientCtx:              cfg.AmbientCtx,
+		DB:                      db,
+		Settings:                st,
+		HistogramWindowInterval: cfg.HistogramWindowInterval(),
+	})
+	registry.AddMetricStruct(kvProber.Metrics())
 
 	sqlServer, err := newSQLServer(ctx, sqlServerArgs{
 		sqlServerOptionalKVArgs: sqlServerOptionalKVArgs{
@@ -660,6 +684,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		registry:                 registry,
 		recorder:                 recorder,
 		sessionRegistry:          sessionRegistry,
+		contentionRegistry:       contentionRegistry,
 		circularInternalExecutor: internalExecutor,
 		circularJobRegistry:      jobRegistry,
 		jobAdoptionStopFile:      jobAdoptionStopFile,
@@ -693,6 +718,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		registry:               registry,
 		recorder:               recorder,
 		updates:                updates,
+		ctSender:               ctSender,
 		runtime:                runtimeSampler,
 		admin:                  sAdmin,
 		status:                 sStatus,
@@ -702,6 +728,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		raftTransport:          raftTransport,
 		stopper:                stopper,
 		debug:                  debugServer,
+		kvProber:               kvProber,
 		replicationReporter:    replicationReporter,
 		protectedtsProvider:    protectedtsProvider,
 		protectedtsReconciler:  protectedtsReconciler,
@@ -894,7 +921,7 @@ func ensureClockMonotonicity(
 	clock *hlc.Clock,
 	startTime time.Time,
 	prevHLCUpperBound int64,
-	sleepUntilFn func(until int64, currTime func() int64),
+	sleepUntilFn func(t hlc.Timestamp),
 ) {
 	var sleepUntil int64
 	if prevHLCUpperBound != 0 {
@@ -918,10 +945,7 @@ func ensureClockMonotonicity(
 		sleepUntil = startTime.UnixNano() + int64(clock.MaxOffset()) + 1
 	}
 
-	currentWallTimeFn := func() int64 { /* function to report current time */
-		return clock.Now().WallTime
-	}
-	currentWallTime := currentWallTimeFn()
+	currentWallTime := clock.Now().WallTime
 	delta := time.Duration(sleepUntil - currentWallTime)
 	if delta > 0 {
 		log.Ops.Infof(
@@ -931,7 +955,7 @@ func ensureClockMonotonicity(
 			sleepUntil,
 			delta,
 		)
-		sleepUntilFn(sleepUntil, currentWallTimeFn)
+		sleepUntilFn(hlc.Timestamp{WallTime: sleepUntil})
 	}
 }
 
@@ -1526,7 +1550,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 			s.clock,
 			s.startTime,
 			hlcUpperBound,
-			timeutil.SleepUntil,
+			s.clock.SleepUntil,
 		)
 	}
 
@@ -1806,10 +1830,16 @@ func (s *Server) PreStart(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to register engines with debug server")
 	}
 
+	s.ctSender.Run(ctx, state.nodeID)
+
 	// Attempt to upgrade cluster version now that the sql server has been
 	// started. At this point we know that all sqlmigrations have successfully
 	// been run so it is safe to upgrade to the binary's current version.
 	s.startAttemptUpgrade(ctx)
+
+	if err := s.kvProber.Start(ctx, s.stopper); err != nil {
+		return errors.Wrapf(err, "failed to start KV prober")
+	}
 
 	log.Event(ctx, "server initialized")
 	return nil
@@ -1853,7 +1883,7 @@ func (s *Server) startListenRPCAndSQL(
 	}
 	if ln == nil {
 		var err error
-		ln, err = listen(ctx, &s.cfg.Addr, &s.cfg.AdvertiseAddr, rpcChanName)
+		ln, err = ListenAndUpdateAddrs(ctx, &s.cfg.Addr, &s.cfg.AdvertiseAddr, rpcChanName)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1862,7 +1892,7 @@ func (s *Server) startListenRPCAndSQL(
 
 	var pgL net.Listener
 	if s.cfg.SplitListenSQL {
-		pgL, err = listen(ctx, &s.cfg.SQLAddr, &s.cfg.SQLAdvertiseAddr, "sql")
+		pgL, err = ListenAndUpdateAddrs(ctx, &s.cfg.SQLAddr, &s.cfg.SQLAdvertiseAddr, "sql")
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1955,7 +1985,7 @@ func (s *Server) startListenRPCAndSQL(
 func (s *Server) startServeUI(
 	ctx, workersCtx context.Context, connManager netutil.Server, uiTLSConfig *tls.Config,
 ) error {
-	httpLn, err := listen(ctx, &s.cfg.HTTPAddr, &s.cfg.HTTPAdvertiseAddr, "http")
+	httpLn, err := ListenAndUpdateAddrs(ctx, &s.cfg.HTTPAddr, &s.cfg.HTTPAdvertiseAddr, "http")
 	if err != nil {
 		return err
 	}
@@ -2104,6 +2134,18 @@ func (s *Server) Decommission(
 			// we're guaranteed to be on v20.2.
 			targetStatus = livenesspb.MembershipStatus_DECOMMISSIONING
 		}
+	}
+
+	// If we're asked to decommission ourself we may lose access to cluster RPC,
+	// so we decommission ourself last. We copy the slice to avoid mutating the
+	// input slice.
+	if targetStatus == livenesspb.MembershipStatus_DECOMMISSIONED {
+		orderedNodeIDs := make([]roachpb.NodeID, len(nodeIDs))
+		copy(orderedNodeIDs, nodeIDs)
+		sort.SliceStable(orderedNodeIDs, func(i, j int) bool {
+			return orderedNodeIDs[j] == s.NodeID()
+		})
+		nodeIDs = orderedNodeIDs
 	}
 
 	var event eventpb.EventPayload
@@ -2469,7 +2511,11 @@ type tcpKeepAliveManager struct {
 	loggedKeepAliveStatus int32
 }
 
-func listen(
+// ListenAndUpdateAddrs starts a TCP listener on the specified address
+// then updates the address and advertised address fields based on the
+// actual interface address resolved by the OS during the Listen()
+// call.
+func ListenAndUpdateAddrs(
 	ctx context.Context, addr, advertiseAddr *string, connName string,
 ) (net.Listener, error) {
 	ln, err := net.Listen("tcp", *addr)

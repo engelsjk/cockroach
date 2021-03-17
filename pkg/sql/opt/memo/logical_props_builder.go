@@ -670,6 +670,12 @@ func (b *logicalPropsBuilder) buildExceptAllProps(except *ExceptAllExpr, rel *pr
 	b.buildSetProps(except, rel)
 }
 
+func (b *logicalPropsBuilder) buildLocalityOptimizedSearchProps(
+	locOptSearch *LocalityOptimizedSearchExpr, rel *props.Relational,
+) {
+	b.buildSetProps(locOptSearch, rel)
+}
+
 func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relational) {
 	BuildSharedProps(setNode, &rel.Shared)
 
@@ -712,6 +718,34 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 	case opt.UnionOp, opt.IntersectOp, opt.ExceptOp:
 		// These operators eliminate duplicates, so a strict key exists.
 		rel.FuncDeps.AddStrictKey(rel.OutputCols, rel.OutputCols)
+	}
+	switch setNode.Op() {
+	case opt.UnionOp, opt.UnionAllOp, opt.LocalityOptimizedSearchOp:
+		// If columns at ordinals (i, j) are equivalent in both the left input
+		// and right input, then the output columns at ordinals at (i, j) are
+		// also equivalent.
+		for i := range setPrivate.OutCols {
+			for j := i + 1; j < len(setPrivate.OutCols); j++ {
+				if leftProps.FuncDeps.AreColsEquiv(setPrivate.LeftCols[i], setPrivate.LeftCols[j]) &&
+					rightProps.FuncDeps.AreColsEquiv(setPrivate.RightCols[i], setPrivate.RightCols[j]) {
+					rel.FuncDeps.AddEquivalency(setPrivate.OutCols[i], setPrivate.OutCols[j])
+				}
+			}
+		}
+	case opt.IntersectOp, opt.IntersectAllOp, opt.ExceptOp, opt.ExceptAllOp:
+		// Intersect, IntersectAll, Except and ExceptAll only output rows from
+		// the left input, so if columns at ordinals (i, j) are equivalent in
+		// the left input, then they are equivalent in the output.
+		// TODO(mgartner): The entire FD set on the left side can be used, but
+		// columns may need to be mapped. Intersections can combine FD
+		// information from both the left and the right.
+		for i := range setPrivate.OutCols {
+			for j := i + 1; j < len(setPrivate.OutCols); j++ {
+				if leftProps.FuncDeps.AreColsEquiv(setPrivate.LeftCols[i], setPrivate.LeftCols[j]) {
+					rel.FuncDeps.AddEquivalency(setPrivate.OutCols[i], setPrivate.OutCols[j])
+				}
+			}
+		}
 	}
 
 	// Cardinality
@@ -1654,6 +1688,8 @@ func MakeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
 	}
 
 	fd = &props.FuncDepSet{}
+
+	// Add keys from indexes.
 	for i := 0; i < tab.IndexCount(); i++ {
 		var keyCols opt.ColSet
 		index := tab.Index(i)
@@ -1690,6 +1726,7 @@ func MakeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
 		}
 	}
 
+	// Add keys from unique constraints.
 	if !md.TableMeta(tabID).IgnoreUniqueWithoutIndexKeys {
 		for i := 0; i < tab.UniqueCount(); i++ {
 			unique := tab.Unique(i)
@@ -1731,6 +1768,36 @@ func MakeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
 				fd.AddLaxKey(keyCols, allCols)
 			} else {
 				fd.AddStrictKey(keyCols, allCols)
+			}
+		}
+	}
+
+	// Add computed columns.
+	for i, n := 0, tab.ColumnCount(); i < n; i++ {
+		if tab.Column(i).IsComputed() {
+			tabMeta := md.TableMeta(tabID)
+			colID := tabMeta.MetaID.ColumnID(i)
+			expr := tabMeta.ComputedCols[colID]
+			if expr == nil {
+				// The computed columns haven't been added to the metadata.
+				continue
+			}
+			if v, ok := expr.(*VariableExpr); ok {
+				// This computed column is exactly equal to another column in the table,
+				// so add an equivalency.
+				fd.AddEquivalency(v.Col, colID)
+				continue
+			}
+			// Else, this computed column is an immutable expression over zero or more
+			// other columns in the table.
+
+			from := getOuterCols(expr)
+			// We want to set up the FD: from --> colID.
+			// This does not necessarily hold for "composite" types like decimals or
+			// collated strings. For example if d is a decimal, d::TEXT can have
+			// different values for equal values of d, like 1 and 1.0.
+			if !CanBeCompositeSensitive(md, expr) {
+				fd.AddSynthesizedCol(from, colID)
 			}
 		}
 	}
@@ -2132,6 +2199,7 @@ func (h *joinPropsHelper) outputCols() opt.ColSet {
 	//
 	//   1. semi and anti joins, which only project the left columns
 	//   2. lookup joins, which can project a subset of input columns
+	//   3. inverted joins, which can project a subset of input columns
 	//
 	var cols opt.ColSet
 	switch h.joinType {
@@ -2145,6 +2213,10 @@ func (h *joinPropsHelper) outputCols() opt.ColSet {
 	if lookup, ok := h.join.(*LookupJoinExpr); ok {
 		// Remove any columns that are not projected by the lookup join.
 		cols.IntersectionWith(lookup.Cols)
+	}
+	if inv, ok := h.join.(*InvertedJoinExpr); ok {
+		// Remove any columns that are not projected by the inverted join.
+		cols.IntersectionWith(inv.Cols)
 	}
 
 	return cols

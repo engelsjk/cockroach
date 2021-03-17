@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -47,7 +48,7 @@ type alterPrimaryKeyLocalitySwap struct {
 func (p *planner) AlterPrimaryKey(
 	ctx context.Context,
 	tableDesc *tabledesc.Mutable,
-	alterPKNode *tree.AlterTableAlterPrimaryKey,
+	alterPKNode tree.AlterTableAlterPrimaryKey,
 	alterPrimaryKeyLocalitySwap *alterPrimaryKeyLocalitySwap,
 ) error {
 	if alterPKNode.Interleave != nil {
@@ -62,6 +63,9 @@ func (p *planner) AlterPrimaryKey(
 		}
 		if alterPKNode.Interleave != nil {
 			return pgerror.Newf(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
+		}
+		if tableDesc.IsLocalityRegionalByRow() {
+			return pgerror.New(pgcode.FeatureNotSupported, "hash sharded indexes are not compatible with REGIONAL BY ROW tables")
 		}
 	}
 
@@ -145,6 +149,19 @@ func (p *planner) AlterPrimaryKey(
 		)
 	}
 
+	// Validate if the end result is the same as the current
+	// primary index, which would mean nothing needs to be modified
+	// here.
+	{
+		requiresIndexChange, err := p.shouldCreateIndexes(ctx, tableDesc, &alterPKNode, alterPrimaryKeyLocalitySwap)
+		if err != nil {
+			return err
+		}
+		if !requiresIndexChange {
+			return nil
+		}
+	}
+
 	nameExists := func(name string) bool {
 		_, err := tableDesc.FindIndexWithName(name)
 		return err == nil
@@ -173,12 +190,12 @@ func (p *planner) AlterPrimaryKey(
 	// If the new index is requested to be sharded, set up the index descriptor
 	// to be sharded, and add the new shard column if it is missing.
 	if alterPKNode.Sharded != nil {
-		shardCol, newColumn, err := setupShardedIndex(
+		shardCol, newColumns, newColumn, err := setupShardedIndex(
 			ctx,
 			p.EvalContext(),
 			&p.semaCtx,
 			p.SessionData().HashShardedIndexesEnabled,
-			&alterPKNode.Columns,
+			alterPKNode.Columns,
 			alterPKNode.Sharded.ShardBuckets,
 			tableDesc,
 			newPrimaryIndexDesc,
@@ -187,6 +204,7 @@ func (p *planner) AlterPrimaryKey(
 		if err != nil {
 			return err
 		}
+		alterPKNode.Columns = newColumns
 		if newColumn {
 			if err := p.setupFamilyAndConstraintForShard(
 				ctx,
@@ -443,10 +461,6 @@ func (p *planner) AlterPrimaryKey(
 				return err
 			}
 		}
-		// TODO(#59719): decide what happens if any multiregion tables have
-		// PARTITION BY statements. We currently do not support this and ignore
-		// these old statements.
-		//
 		// Create partitioning if we are newly adding a PARTITION BY ALL statement.
 		if isNewPartitionAllBy {
 			if *newIndex, err = CreatePartitioning(
@@ -506,6 +520,101 @@ func (p *planner) AlterPrimaryKey(
 	)
 
 	return nil
+}
+
+// Given the current table descriptor and the new primary keys
+// index descriptor  this function determines if the two are
+// equivalent and if any index creation operations are needed
+// by comparing properties.
+func (p *planner) shouldCreateIndexes(
+	ctx context.Context,
+	desc *tabledesc.Mutable,
+	alterPKNode *tree.AlterTableAlterPrimaryKey,
+	alterPrimaryKeyLocalitySwap *alterPrimaryKeyLocalitySwap,
+) (requiresIndexChange bool, err error) {
+	oldPK := desc.GetPrimaryIndex()
+
+	// Validate if basic properties between the two match.
+	if len(oldPK.IndexDesc().ColumnIDs) != len(alterPKNode.Columns) ||
+		oldPK.IsSharded() != (alterPKNode.Sharded != nil) ||
+		oldPK.IsInterleaved() != (alterPKNode.Interleave != nil) {
+		return true, nil
+	}
+
+	// Validate if sharding properties are the same.
+	if alterPKNode.Sharded != nil {
+		shardBuckets, err := tabledesc.EvalShardBucketCount(ctx, &p.semaCtx, p.EvalContext(), alterPKNode.Sharded.ShardBuckets)
+		if err != nil {
+			return true, err
+		}
+		if oldPK.IndexDesc().Sharded.ShardBuckets != shardBuckets {
+			return true, nil
+		}
+	}
+
+	// Validate if interleaving properties match,
+	// specifically the parent table, and the index
+	// involved.
+	if alterPKNode.Interleave != nil {
+		parentTable, err := resolver.ResolveExistingTableObject(
+			ctx, p, &alterPKNode.Interleave.Parent, tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireTableDesc),
+		)
+		if err != nil {
+			return true, err
+		}
+
+		ancestors := oldPK.IndexDesc().Interleave.Ancestors
+		if len(ancestors) == 0 {
+			return true, nil
+		}
+		if ancestors[len(ancestors)-1].TableID !=
+			parentTable.GetID() {
+			return true, nil
+		}
+		if ancestors[len(ancestors)-1].IndexID !=
+			parentTable.GetPrimaryIndexID() {
+			return true, nil
+		}
+	}
+
+	// If the old primary key is dropped, then recreation
+	// is required.
+	if oldPK.IndexDesc().Disabled {
+		return true, nil
+	}
+
+	// Validate the columns on the indexes
+	for idx, elem := range alterPKNode.Columns {
+		col, err := desc.FindColumnWithName(elem.Column)
+		if err != nil {
+			return true, err
+		}
+
+		if col.GetID() != oldPK.IndexDesc().ColumnIDs[idx] {
+			return true, nil
+		}
+		if (elem.Direction == tree.Ascending &&
+			oldPK.IndexDesc().ColumnDirections[idx] != descpb.IndexDescriptor_ASC) ||
+			(elem.Direction == tree.Descending &&
+				oldPK.IndexDesc().ColumnDirections[idx] != descpb.IndexDescriptor_DESC) {
+			return true, nil
+		}
+	}
+
+	// Check partitioning changes based on primary key locality,
+	// either the config changes, or the region column is changed
+	// then recreate indexes.
+	if alterPrimaryKeyLocalitySwap != nil {
+		localitySwapConfig := alterPrimaryKeyLocalitySwap.localityConfigSwap
+		if !localitySwapConfig.NewLocalityConfig.Equal(localitySwapConfig.OldLocalityConfig) {
+			return true, nil
+		}
+		if localitySwapConfig.NewRegionalByRowColumnID != nil &&
+			*localitySwapConfig.NewRegionalByRowColumnID != oldPK.IndexDesc().ColumnIDs[0] {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // We only recreate the old primary key of the table as a unique secondary

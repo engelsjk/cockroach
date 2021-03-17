@@ -56,6 +56,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -828,7 +829,6 @@ func TestBackupRestoreNegativePrimaryKey(t *testing.T) {
 	backupAndRestore(ctx, t, tc, []string{LocalFoo}, []string{LocalFoo}, numAccounts)
 
 	sqlDB.Exec(t, `CREATE UNIQUE INDEX id2 ON data.bank (id)`)
-	sqlDB.Exec(t, `ALTER TABLE data.bank ALTER PRIMARY KEY USING COLUMNS(id)`)
 
 	var unused string
 	var exportedRows, exportedIndexEntries int
@@ -838,7 +838,7 @@ func TestBackupRestoreNegativePrimaryKey(t *testing.T) {
 	if exportedRows != numAccounts {
 		t.Fatalf("expected %d rows, got %d", numAccounts, exportedRows)
 	}
-	expectedIndexEntries := numAccounts * 3 // old PK, new and old secondary idx
+	expectedIndexEntries := numAccounts * 2 // Indexes id2 and balance_idx
 	if exportedIndexEntries != expectedIndexEntries {
 		t.Fatalf("expected %d index entries, got %d", expectedIndexEntries, exportedIndexEntries)
 	}
@@ -1278,8 +1278,8 @@ type inProgressState struct {
 	dir, name     string
 }
 
-func (ip inProgressState) latestJobID() (int64, error) {
-	var id int64
+func (ip inProgressState) latestJobID() (jobspb.JobID, error) {
+	var id jobspb.JobID
 	if err := ip.QueryRow(
 		`SELECT job_id FROM crdb_internal.jobs ORDER BY created DESC LIMIT 1`,
 	).Scan(&id); err != nil {
@@ -1514,7 +1514,7 @@ func createAndWaitForJob(
 		t.Fatal(err)
 	}
 
-	var jobID int64
+	var jobID jobspb.JobID
 	db.QueryRow(
 		t, `INSERT INTO system.jobs (created, status, payload, progress) VALUES ($1, $2, $3, $4) RETURNING id`,
 		timeutil.FromUnixMicros(now), jobs.StatusRunning, payload, progressBytes,
@@ -1642,7 +1642,7 @@ func TestBackupRestoreResume(t *testing.T) {
 	})
 }
 
-func getHighWaterMark(jobID int64, sqlDB *gosql.DB) (roachpb.Key, error) {
+func getHighWaterMark(jobID jobspb.JobID, sqlDB *gosql.DB) (roachpb.Key, error) {
 	var progressBytes []byte
 	if err := sqlDB.QueryRow(
 		`SELECT progress FROM system.jobs WHERE id = $1`, jobID,
@@ -1897,7 +1897,7 @@ func TestRestoreFailCleanup(t *testing.T) {
 	// stress test, it is here for safety.
 	blockGC := make(chan struct{})
 	params.Knobs.GCJob = &sql.GCJobTestingKnobs{
-		RunBeforeResume: func(_ int64) error {
+		RunBeforeResume: func(_ jobspb.JobID) error {
 			<-blockGC
 			return nil
 		},
@@ -2750,6 +2750,8 @@ func TestBackupRestoreDuringUserDefinedTypeChange(t *testing.T) {
 
 			// Create a database with a type.
 			sqlDB.Exec(t, `
+SET CLUSTER SETTING sql.defaults.drop_enum_value.enabled = true;
+SET enable_drop_enum_value = true;
 CREATE DATABASE d;
 CREATE TYPE d.greeting AS ENUM ('hello', 'howdy', 'hi');
 `)
@@ -5043,7 +5045,7 @@ func TestFileIOLimits(t *testing.T) {
 	)
 }
 
-func waitForSuccessfulJob(t *testing.T, tc *testcluster.TestCluster, id int64) {
+func waitForSuccessfulJob(t *testing.T, tc *testcluster.TestCluster, id jobspb.JobID) {
 	// Force newly created job to be adopted and verify it succeeds.
 	tc.Server(0).JobRegistry().(*jobs.Registry).TestingNudgeAdoptionQueue()
 	testutils.SucceedsSoon(t, func() error {
@@ -5065,7 +5067,7 @@ func TestDetachedBackup(t *testing.T) {
 	db := sqlDB.DB.(*gosql.DB)
 
 	// running backup under transaction requires DETACHED.
-	var jobID int64
+	var jobID jobspb.JobID
 	err := crdb.ExecuteTx(ctx, db, nil /* txopts */, func(tx *gosql.Tx) error {
 		return tx.QueryRow(`BACKUP DATABASE data TO $1`, LocalFoo).Scan(&jobID)
 	})
@@ -5118,7 +5120,7 @@ func TestDetachedRestore(t *testing.T) {
 	sqlDB.Exec(t, `CREATE DATABASE test`)
 
 	// Running RESTORE under transaction requires DETACHED.
-	var jobID int64
+	var jobID jobspb.JobID
 	err := crdb.ExecuteTx(ctx, db, nil /* txopts */, func(tx *gosql.Tx) error {
 		return tx.QueryRow(`RESTORE TABLE t FROM $1 WITH INTO_DB=test`, LocalFoo).Scan(&jobID)
 	})
@@ -5602,6 +5604,78 @@ func TestBackupRestoreSubsetCreatedStats(t *testing.T) {
 	sqlDB.CheckQueryResults(t, getStatsQuery(`"data 2".foo`), [][]string{})
 }
 
+// This test is a reproduction of a scenario that caused backup jobs to fail
+// during stats collection because the stats cache would attempt to resolve a
+// descriptor that had been dropped. Stats collection was made more resilient to
+// such errors in #61222.
+func TestBackupHandlesDroppedTypeStatsCollection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const dest = "userfile:///basefoo"
+	const numAccounts = 1
+	_, _, sqlDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	defer cleanupFn()
+
+	sqlDB.Exec(t, `CREATE TYPE greeting as ENUM ('hello')`)
+	sqlDB.Exec(t, `CREATE TABLE foo (t greeting)`)
+	sqlDB.Exec(t, `INSERT INTO foo VALUES ('hello')`)
+	sqlDB.Exec(t, `SET sql_safe_updates=false`)
+	sqlDB.Exec(t, `ALTER TABLE foo RENAME COLUMN t to t_old`)
+	sqlDB.Exec(t, `ALTER TABLE foo ADD COLUMN t VARCHAR`)
+	sqlDB.Exec(t, `ALTER TABLE foo DROP COLUMN t_old`)
+	sqlDB.Exec(t, `DROP TYPE greeting`)
+
+	// Prior to the fix mentioned above, the stats cache would attempt to resolve
+	// the dropped type when computing the stats for foo at the end of the backup
+	// job. This would result in a `descriptor not found` error.
+
+	// Ensure a full backup completes successfully.
+	sqlDB.Exec(t, `BACKUP foo TO $1`, dest)
+
+	// Ensure an incremental backup completes successfully.
+	sqlDB.Exec(t, `BACKUP foo TO $1`, dest)
+}
+
+func TestBackupRestoreCorruptedStatsIgnored(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const dest = "userfile:///basefoo"
+	const numAccounts = 1
+	_, tc, sqlDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts,
+		InitManualReplication)
+	defer cleanupFn()
+
+	var tableID int
+	sqlDB.QueryRow(t, `SELECT id FROM system.namespace WHERE name = 'bank'`).Scan(&tableID)
+	fmt.Println(tableID)
+	sqlDB.Exec(t, `BACKUP data.bank TO $1`, dest)
+
+	// Overwrite the stats file with some invalid data.
+	ctx := context.Background()
+	execCfg := tc.Server(0).ExecutorConfig().(sql.ExecutorConfig)
+	store, err := execCfg.DistSQLSrv.ExternalStorageFromURI(ctx, dest,
+		security.RootUserName())
+	require.NoError(t, err)
+	statsTable := StatsTable{
+		Statistics: []*stats.TableStatisticProto{{TableID: descpb.ID(tableID + 1), Name: "notbank"}},
+	}
+	require.NoError(t, writeTableStatistics(ctx, store, backupStatisticsFileName,
+		nil /* encryption */, &statsTable))
+
+	sqlDB.Exec(t, `CREATE DATABASE "data 2"`)
+	sqlDB.Exec(t, fmt.Sprintf(`RESTORE data.bank FROM "%s" WITH skip_missing_foreign_keys, into_db = "%s"`,
+		dest, "data 2"))
+
+	// Delete the stats file to ensure a restore can succeed even if statistics do
+	// not exist.
+	require.NoError(t, store.Delete(ctx, backupStatisticsFileName))
+	sqlDB.Exec(t, `CREATE DATABASE "data 3"`)
+	sqlDB.Exec(t, fmt.Sprintf(`RESTORE data.bank FROM "%s" WITH skip_missing_foreign_keys, into_db = "%s"`,
+		dest, "data 3"))
+}
+
 // Ensure that statistics are restored from correct backup.
 func TestBackupCreatedStatsFromIncrementalBackup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -5703,7 +5777,7 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 			func(t *testing.T, query string, sqlDB *sqlutils.SQLRunner) {
 				backupWithDetachedOption := query + ` WITH DETACHED`
 				db := sqlDB.DB.(*gosql.DB)
-				var jobID int64
+				var jobID jobspb.JobID
 				err := crdb.ExecuteTx(ctx, db, nil /* txopts */, func(tx *gosql.Tx) error {
 					return tx.QueryRow(backupWithDetachedOption).Scan(&jobID)
 				})
@@ -5791,6 +5865,11 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 	}
 }
 
+func getTableID(db *kv.DB, dbName, tableName string) descpb.ID {
+	desc := catalogkv.TestingGetTableDescriptor(db, keys.SystemSQLCodec, dbName, tableName)
+	return desc.GetID()
+}
+
 // TestSpanSelectionDuringBackup tests the method spansForAllTableIndexes which
 // is used to resolve the spans which will be backed up, and spans for which
 // protected ts records will be created.
@@ -5825,6 +5904,7 @@ func TestProtectedTimestampSpanSelectionDuringBackup(t *testing.T) {
 
 	conn := tc.ServerConn(0)
 	runner := sqlutils.MakeSQLRunner(conn)
+	db := tc.Server(0).DB()
 	baseBackupURI := "nodelocal://0/foo/"
 
 	t.Run("contiguous-span-merge", func(t *testing.T) {
@@ -5833,7 +5913,8 @@ func TestProtectedTimestampSpanSelectionDuringBackup(t *testing.T) {
 			"INDEX baz(name), INDEX bar (v))")
 
 		runner.Exec(t, fmt.Sprintf(`BACKUP DATABASE test INTO '%s'`, baseBackupURI+t.Name()))
-		require.Equal(t, []string{"/Table/53/{1-4}"}, actualResolvedSpans)
+		tableID := getTableID(db, "test", "foo")
+		require.Equal(t, []string{fmt.Sprintf("/Table/%d/{1-4}", tableID)}, actualResolvedSpans)
 		runner.Exec(t, "DROP DATABASE test;")
 		actualResolvedSpans = nil
 	})
@@ -5847,7 +5928,9 @@ func TestProtectedTimestampSpanSelectionDuringBackup(t *testing.T) {
 		runner.Exec(t, "DROP INDEX foo@baz")
 
 		runner.Exec(t, fmt.Sprintf(`BACKUP DATABASE test INTO '%s'`, baseBackupURI+t.Name()))
-		require.Equal(t, []string{"/Table/55/{1-2}", "/Table/55/{3-4}"}, actualResolvedSpans)
+		tableID := getTableID(db, "test", "foo")
+		require.Equal(t, []string{fmt.Sprintf("/Table/%d/{1-2}", tableID),
+			fmt.Sprintf("/Table/%d/{3-4}", tableID)}, actualResolvedSpans)
 		runner.Exec(t, "DROP DATABASE test;")
 		actualResolvedSpans = nil
 	})
@@ -5862,7 +5945,8 @@ func TestProtectedTimestampSpanSelectionDuringBackup(t *testing.T) {
 		time.Sleep(time.Second * 2)
 
 		runner.Exec(t, fmt.Sprintf(`BACKUP DATABASE test INTO '%s'`, baseBackupURI+t.Name()))
-		require.Equal(t, []string{"/Table/57/{1-4}"}, actualResolvedSpans)
+		tableID := getTableID(db, "test", "foo")
+		require.Equal(t, []string{fmt.Sprintf("/Table/%d/{1-4}", tableID)}, actualResolvedSpans)
 		runner.Exec(t, "DROP DATABASE test;")
 		actualResolvedSpans = nil
 	})
@@ -5880,7 +5964,10 @@ func TestProtectedTimestampSpanSelectionDuringBackup(t *testing.T) {
 		// tables parent and child.
 		// /Table/59/2 - /Table/59/3 is for the gpindex
 		// /Table/61/{2-3} is for the childindex
-		require.Equal(t, []string{"/Table/59/{1-3}", "/Table/61/{2-3}"}, actualResolvedSpans)
+		grandparentID := getTableID(db, "test", "grandparent")
+		childID := getTableID(db, "test", "child")
+		require.Equal(t, []string{fmt.Sprintf("/Table/%d/{1-3}", grandparentID),
+			fmt.Sprintf("/Table/%d/{2-3}", childID)}, actualResolvedSpans)
 		runner.Exec(t, "DROP DATABASE test;")
 		actualResolvedSpans = nil
 	})
@@ -5898,7 +5985,8 @@ func TestProtectedTimestampSpanSelectionDuringBackup(t *testing.T) {
 		// The BACKUP with revision history will pickup the dropped index baz as
 		// well because it existed in a non-drop state at some point in the interval
 		// covered by this BACKUP.
-		require.Equal(t, []string{"/Table/63/{1-4}"}, actualResolvedSpans)
+		tableID := getTableID(db, "test", "foo")
+		require.Equal(t, []string{fmt.Sprintf("/Table/%d/{1-4}", tableID)}, actualResolvedSpans)
 		actualResolvedSpans = nil
 		runner.Exec(t, "DROP TABLE foo")
 
@@ -5913,7 +6001,10 @@ func TestProtectedTimestampSpanSelectionDuringBackup(t *testing.T) {
 		// incremental backup with revision history. We also expect to see both drop
 		// and non-drop indexes of table foo2 as all the indexes were live at some
 		// point in the interval covered by this BACKUP.
-		require.Equal(t, []string{"/Table/63/{1-2}", "/Table/63/{3-4}", "/Table/64/{1-4}"}, actualResolvedSpans)
+		tableID2 := getTableID(db, "test", "foo2")
+		require.Equal(t, []string{fmt.Sprintf("/Table/%d/{1-2}", tableID),
+			fmt.Sprintf("/Table/%d/{3-4}", tableID), fmt.Sprintf("/Table/%d/{1-4}", tableID2)},
+			actualResolvedSpans)
 		runner.Exec(t, "DROP DATABASE test;")
 		actualResolvedSpans = nil
 	})
@@ -5926,13 +6017,15 @@ func TestProtectedTimestampSpanSelectionDuringBackup(t *testing.T) {
 		runner.Exec(t, "DROP INDEX foo@baz")
 
 		runner.Exec(t, fmt.Sprintf(`BACKUP DATABASE test INTO '%s'`, baseBackupURI+t.Name()))
-		require.Equal(t, []string{"/Table/66/{1-2}", "/Table/67/{1-3}"}, actualResolvedSpans)
+		tableID := getTableID(db, "test", "foo")
+		tableID2 := getTableID(db, "test", "foo2")
+		require.Equal(t, []string{fmt.Sprintf("/Table/%d/{1-2}", tableID),
+			fmt.Sprintf("/Table/%d/{1-3}", tableID2)}, actualResolvedSpans)
 		runner.Exec(t, "DROP DATABASE test;")
 		actualResolvedSpans = nil
 	})
 
 	t.Run("last-index-gced", func(t *testing.T) {
-		skip.WithIssue(t, 57546, "flaky test")
 		runner.Exec(t, "CREATE DATABASE test; USE test;")
 		runner.Exec(t, "CREATE TABLE foo (k INT PRIMARY KEY, v BYTES, name STRING, INDEX baz(name))")
 		runner.Exec(t, "INSERT INTO foo VALUES (1, NULL, 'test')")
@@ -5943,7 +6036,10 @@ func TestProtectedTimestampSpanSelectionDuringBackup(t *testing.T) {
 		runner.Exec(t, "ALTER TABLE foo CONFIGURE ZONE USING gc.ttlseconds=60")
 
 		runner.Exec(t, fmt.Sprintf(`BACKUP DATABASE test INTO '%s'`, baseBackupURI+t.Name()))
-		require.Equal(t, []string{"/Table/69/{1-2}", "/Table/70/{1-3}"}, actualResolvedSpans)
+		tableID := getTableID(db, "test", "foo")
+		tableID2 := getTableID(db, "test", "foo2")
+		require.Equal(t, []string{fmt.Sprintf("/Table/%d/{1-2}", tableID),
+			fmt.Sprintf("/Table/%d/{1-3}", tableID2)}, actualResolvedSpans)
 		runner.Exec(t, "DROP DATABASE test;")
 		actualResolvedSpans = nil
 	})
@@ -5962,7 +6058,7 @@ func getMockTableDesc(
 		PrimaryIndex: pkIndex,
 		Indexes:      indexes,
 	}
-	return tabledesc.NewImmutable(mockTableDescriptor)
+	return tabledesc.NewBuilder(&mockTableDescriptor).BuildImmutableTable()
 }
 
 // Unit tests for the getLogicallyMergedTableSpans() method.

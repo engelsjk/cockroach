@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -36,8 +37,8 @@ const (
 	// random stream client.
 	RandomStreamSchemaPlaceholder = "CREATE TABLE %s (k INT PRIMARY KEY, v INT)"
 
-	// TestScheme is the URI scheme used to create a test load.
-	TestScheme = "test"
+	// RandomGenScheme is the URI scheme used to create a test load.
+	RandomGenScheme = "randomgen"
 	// ValueRangeKey controls the range of the randomly generated values produced
 	// by this workload. The workload will generate between 0 and this value.
 	ValueRangeKey = "VALUE_RANGE"
@@ -64,14 +65,30 @@ const (
 	IngestionTablePrefix = "foo"
 )
 
-type interceptFn func(event streamingccl.Event, pa streamingccl.PartitionAddress)
+var randomStreamClientSingleton *randomStreamClient
+
+// GetRandomStreamClientSingletonForTesting returns the singleton instance of
+// the client. This is to be used in testing, when interceptors can be
+// registered on the client to observe events.
+func GetRandomStreamClientSingletonForTesting() Client {
+	if randomStreamClientSingleton == nil {
+		randomStreamClientSingleton = &randomStreamClient{}
+	}
+	return randomStreamClientSingleton
+}
+
+// InterceptFn is a function that will intercept events emitted by
+// an InterceptableStreamClient
+type InterceptFn func(event streamingccl.Event, pa streamingccl.PartitionAddress)
 
 // InterceptableStreamClient wraps a Client, and provides a method to register
 // interceptor methods that are run on every streamed Event.
 type InterceptableStreamClient interface {
 	Client
 
-	RegisterInterception(fn interceptFn)
+	// RegisterInterception is how you can register your interceptor to be called
+	// from an InterceptableStreamClient.
+	RegisterInterception(fn InterceptFn)
 }
 
 // randomStreamConfig specifies the variables that controls the rate and type of
@@ -147,9 +164,6 @@ func parseRandomStreamConfig(streamURL *url.URL) (randomStreamConfig, error) {
 //
 // The client can be configured to return more than one partition via the stream
 // URL. Each partition covers a single table span.
-//
-// TODO: Move this over to a _test file in the ingestion package when there is a
-// real stream client implementation.
 type randomStreamClient struct {
 	config randomStreamConfig
 
@@ -171,16 +185,21 @@ var _ InterceptableStreamClient = &randomStreamClient{}
 // events on a table with an integer key and integer value for the table with
 // the given ID.
 func newRandomStreamClient(streamURL *url.URL) (Client, error) {
+	if randomStreamClientSingleton == nil {
+		randomStreamClientSingleton = &randomStreamClient{}
+
+		randomStreamClientSingleton.mu.Lock()
+		randomStreamClientSingleton.mu.tableID = 52
+		randomStreamClientSingleton.mu.Unlock()
+	}
+
 	streamConfig, err := parseRandomStreamConfig(streamURL)
 	if err != nil {
 		return nil, err
 	}
+	randomStreamClientSingleton.config = streamConfig
 
-	client := randomStreamClient{config: streamConfig}
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	client.mu.tableID = 52
-	return &client, nil
+	return randomStreamClientSingleton, nil
 }
 
 func (m *randomStreamClient) getNextTableID() int {
@@ -202,7 +221,7 @@ func (m *randomStreamClient) GetTopology(
 	for i := 0; i < m.config.numPartitions; i++ {
 		tableID := descpb.ID(m.getNextTableID())
 		partitionURI := url.URL{
-			Scheme: TestScheme,
+			Scheme: RandomGenScheme,
 			Host:   strconv.Itoa(int(tableID)),
 		}
 		topology.Partitions = append(topology.Partitions,
@@ -223,7 +242,7 @@ func (m *randomStreamClient) getDescriptorAndNamespaceKVForTableID(
 		IngestionDatabaseID,
 		tableID,
 		fmt.Sprintf(RandomStreamSchemaPlaceholder, tableName),
-		&descpb.PrivilegeDescriptor{},
+		descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
 	)
 	if err != nil {
 		return nil, nil, err
@@ -259,27 +278,28 @@ func (m *randomStreamClient) getDescriptorAndNamespaceKVForTableID(
 
 // ConsumePartition implements the Client interface.
 func (m *randomStreamClient) ConsumePartition(
-	ctx context.Context, partitionAddress streamingccl.PartitionAddress, startTime time.Time,
-) (chan streamingccl.Event, error) {
+	ctx context.Context, partitionAddress streamingccl.PartitionAddress, startTime hlc.Timestamp,
+) (chan streamingccl.Event, chan error, error) {
 	eventCh := make(chan streamingccl.Event)
 	now := timeutil.Now()
-	if startTime.After(now) {
+	startWalltime := timeutil.Unix(0 /* sec */, startTime.WallTime)
+	if startWalltime.After(now) {
 		panic("cannot start random stream client event stream in the future")
 	}
 
 	partitionURL, err := partitionAddress.URL()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var partitionTableID int
 	partitionTableID, err = strconv.Atoi(partitionURL.Host)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	tableDesc, systemKVs, err := m.getDescriptorAndNamespaceKVForTableID(descpb.ID(partitionTableID))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	go func() {
 		defer close(eventCh)
@@ -346,7 +366,7 @@ func (m *randomStreamClient) ConsumePartition(
 		}
 	}()
 
-	return eventCh, nil
+	return eventCh, nil, nil
 }
 
 func rekey(tenantID roachpb.TenantID, k roachpb.Key) roachpb.Key {
@@ -394,8 +414,8 @@ func (m *randomStreamClient) makeRandomKey(
 	}
 }
 
-// RegisterInterception implements streamingest.interceptableStreamClient.
-func (m *randomStreamClient) RegisterInterception(fn interceptFn) {
+// RegisterInterception implements the InterceptableStreamClient interface.
+func (m *randomStreamClient) RegisterInterception(fn InterceptFn) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.mu.interceptors = append(m.mu.interceptors, fn)

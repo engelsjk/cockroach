@@ -515,8 +515,8 @@ func (sc *SchemaChanger) notFirstInLine(ctx context.Context, desc catalog.Descri
 		// descriptor, it seems possible for a job to be resumed after the mutation
 		// has already been removed. If there's a mutation provided, we should check
 		// whether it actually exists on the table descriptor and exit the job if not.
-		for i, mutation := range tableDesc.GetMutations() {
-			if mutation.MutationID == sc.mutationID {
+		for i, mutation := range tableDesc.AllMutations() {
+			if mutation.MutationID() == sc.mutationID {
 				if i != 0 {
 					log.Infof(ctx,
 						"schema change on %q (v%d): another change is still in progress",
@@ -534,17 +534,8 @@ func (sc *SchemaChanger) notFirstInLine(ctx context.Context, desc catalog.Descri
 func (sc *SchemaChanger) getTargetDescriptor(ctx context.Context) (catalog.Descriptor, error) {
 	// Retrieve the descriptor that is being changed.
 	var desc catalog.Descriptor
-	if err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		var err error
-		desc, err = catalogkv.GetDescriptorByID(
-			ctx,
-			txn,
-			sc.execCfg.Codec,
-			sc.descID,
-			catalogkv.Immutable,
-			catalogkv.AnyDescriptorKind,
-			true, /* required */
-		)
+	if err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+		desc, err = catalogkv.MustGetDescriptorByID(ctx, txn, sc.execCfg.Codec, sc.descID)
 		return err
 	}); err != nil {
 		return nil, err
@@ -719,12 +710,19 @@ func (sc *SchemaChanger) handlePermanentSchemaChangeError(
 	ctx context.Context, err error, evalCtx *extendedEvalContext,
 ) error {
 
-	// Ensure that this mutation is first in line prior to reverting.
+	// Ensure that this is a table descriptor and that the mutation is first in
+	// line prior to reverting.
 	{
 		// Pull out the requested descriptor.
 		desc, descErr := sc.getTargetDescriptor(ctx)
 		if descErr != nil {
 			return descErr
+		}
+		// Currently we don't attempt to roll back schema changes for anything other
+		// than tables. For jobs intended to drop other types of descriptors, we do
+		// nothing.
+		if _, ok := desc.(catalog.TableDescriptor); !ok {
+			return errors.Newf("schema change jobs on databases and schemas cannot be reverted")
 		}
 
 		// Check that we aren't queued behind another schema changer.
@@ -787,25 +785,17 @@ func (sc *SchemaChanger) initJobRunningStatus(ctx context.Context) error {
 		}
 
 		var runStatus jobs.RunningStatus
-		for _, mutation := range desc.GetMutations() {
-			if mutation.MutationID != sc.mutationID {
+		for _, mutation := range desc.AllMutations() {
+			if mutation.MutationID() != sc.mutationID {
 				// Mutations are applied in a FIFO order. Only apply the first set of
 				// mutations if they have the mutation ID we're looking for.
 				break
 			}
 
-			switch mutation.Direction {
-			case descpb.DescriptorMutation_ADD:
-				switch mutation.State {
-				case descpb.DescriptorMutation_DELETE_ONLY:
-					runStatus = RunningStatusDeleteOnly
-				}
-
-			case descpb.DescriptorMutation_DROP:
-				switch mutation.State {
-				case descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY:
-					runStatus = RunningStatusDeleteAndWriteOnly
-				}
+			if mutation.Adding() && mutation.DeleteOnly() {
+				runStatus = RunningStatusDeleteOnly
+			} else if mutation.Dropped() && mutation.WriteAndDeleteOnly() {
+				runStatus = RunningStatusDeleteAndWriteOnly
 			}
 		}
 		if runStatus != "" && !desc.Dropped() {
@@ -904,6 +894,15 @@ func (sc *SchemaChanger) RunStateMachineBeforeBackfill(ctx context.Context) erro
 		if err != nil {
 			return err
 		}
+		_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
+			ctx,
+			txn,
+			tbl.GetParentID(),
+			tree.DatabaseLookupFlags{Required: true},
+		)
+		if err != nil {
+			return err
+		}
 		runStatus = ""
 		// Apply mutations belonging to the same version.
 		for i, mutation := range tbl.Mutations {
@@ -938,6 +937,21 @@ func (sc *SchemaChanger) RunStateMachineBeforeBackfill(ctx context.Context) erro
 					tbl.Mutations[i].State = descpb.DescriptorMutation_DELETE_ONLY
 					runStatus = RunningStatusDeleteOnly
 				}
+			}
+			// We might have to update some zone configs for indexes that are
+			// being rewritten. It is important that this is done _before_ the
+			// index swap occurs. The logic that generates spans for subzone
+			// configurations removes spans for indexes in the dropping state,
+			// which we don't want. So, set up the zone configs before we swap.
+			if err := sc.applyZoneConfigChangeForMutation(
+				ctx,
+				txn,
+				dbDesc,
+				tbl,
+				mutation,
+				false, // isDone
+			); err != nil {
+				return err
 			}
 		}
 		if doNothing := runStatus == "" || tbl.Dropped(); doNothing {
@@ -1109,77 +1123,18 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 				}
 			}
 
-			// Some primary key change specific operations need to happen before
-			// and after the index swap occurs.
-			if pkSwap := mutation.GetPrimaryKeySwap(); pkSwap != nil {
-				// We might have to update some zone configs for indexes that are
-				// being rewritten. It is important that this is done _before_ the
-				// index swap occurs. The logic that generates spans for subzone
-				// configurations removes spans for indexes in the dropping state,
-				// which we don't want. So, set up the zone configs before we swap.
-				if lcSwap := pkSwap.LocalityConfigSwap; lcSwap != nil {
-					// We will add up to two options - one for the table itself, and one
-					// for all the new indexes associated with the table.
-					opts := make([]applyZoneConfigForMultiRegionTableOption, 0, 2)
-
-					// For locality configs, we need to update the zone configs to match
-					// the new multi-region locality configuration, instead of
-					// copying the old zone configs over.
-					if mutation.Direction == descpb.DescriptorMutation_ADD {
-						opts = append(
-							opts,
-							applyZoneConfigForMultiRegionTableOptionTableNewConfig(
-								lcSwap.NewLocalityConfig,
-							),
-						)
-						switch lcSwap.NewLocalityConfig.Locality.(type) {
-						case *descpb.TableDescriptor_LocalityConfig_Global_,
-							*descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
-							// Just the table re-writing the locality config change will suffice.
-						case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
-							// Apply new zone configurations for all newly partitioned indexes.
-							opts = append(
-								opts,
-								applyZoneConfigForMultiRegionTableOptionNewIndexes(
-									append(
-										[]descpb.IndexID{pkSwap.NewPrimaryIndexId},
-										pkSwap.NewIndexes...,
-									)...,
-								),
-							)
-						default:
-							return errors.AssertionFailedf(
-								"unknown locality on PK swap: %T",
-								lcSwap.NewLocalityConfig.Locality,
-							)
-						}
-					} else {
-						// DROP is hit on cancellation, in which case we must roll back.
-						opts = append(
-							opts,
-							applyZoneConfigForMultiRegionTableOptionTableNewConfig(
-								lcSwap.OldLocalityConfig,
-							),
-						)
-					}
-
-					if err := ApplyZoneConfigForMultiRegionTable(
-						ctx,
-						txn,
-						sc.execCfg,
-						*dbDesc.RegionConfig,
-						scTable,
-						opts...,
-					); err != nil {
-						return err
-					}
-				} else {
-					// For the normal case, copy the zone configs over.
-					if err := maybeUpdateZoneConfigsForPKChange(
-						ctx, txn, sc.execCfg, scTable, pkSwap); err != nil {
-						return err
-					}
-				}
+			// Ensure that zone configurations are finalized (or rolled back) when
+			// done is called.
+			// This will configure the table zone config for multi-region transformations.
+			if err := sc.applyZoneConfigChangeForMutation(
+				ctx,
+				txn,
+				dbDesc,
+				scTable,
+				mutation,
+				true, // isDone
+			); err != nil {
+				return err
 			}
 
 			// If we are refreshing a materialized view, then create GC jobs for all
@@ -1269,15 +1224,6 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 							"unknown locality on PK swap: %T",
 							localityConfigToSwapTo,
 						)
-					}
-
-					// Validate the new locality before updating the table descriptor.
-					dg := catalogkv.NewOneLevelUncachedDescGetter(txn, sc.execCfg.Codec)
-					if err := scTable.ValidateTableLocalityConfig(
-						ctx,
-						dg,
-					); err != nil {
-						return err
 					}
 				}
 
@@ -1725,8 +1671,8 @@ func (sc *SchemaChanger) updateJobForRollback(
 	// Initialize refresh spans to scan the entire table.
 	span := tableDesc.PrimaryIndexSpan(sc.execCfg.Codec)
 	var spanList []jobspb.ResumeSpanList
-	for _, m := range tableDesc.GetMutations() {
-		if m.MutationID == sc.mutationID {
+	for _, m := range tableDesc.AllMutations() {
+		if m.MutationID() == sc.mutationID {
 			spanList = append(spanList,
 				jobspb.ResumeSpanList{
 					ResumeSpans: []roachpb.Span{span},
@@ -1931,8 +1877,8 @@ func CreateGCJobRecord(
 // Note that this is defined here for testing purposes to avoid cyclic
 // dependencies.
 type GCJobTestingKnobs struct {
-	RunBeforeResume    func(jobID int64) error
-	RunBeforePerformGC func(jobID int64) error
+	RunBeforeResume    func(jobID jobspb.JobID) error
+	RunBeforePerformGC func(jobID jobspb.JobID) error
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
@@ -1952,7 +1898,7 @@ type SchemaChangerTestingKnobs struct {
 	RunBeforeBackfill func() error
 
 	// RunAfterBackfill is called after completing a backfill.
-	RunAfterBackfill func(jobID int64) error
+	RunAfterBackfill func(jobID jobspb.JobID) error
 
 	// RunBeforeQueryBackfill is called before a query based backfill.
 	RunBeforeQueryBackfill func() error
@@ -1980,20 +1926,20 @@ type SchemaChangerTestingKnobs struct {
 	RunBeforeConstraintValidation func() error
 
 	// RunBeforeMutationReversal runs at the beginning of maybeReverseMutations.
-	RunBeforeMutationReversal func(jobID int64) error
+	RunBeforeMutationReversal func(jobID jobspb.JobID) error
 
 	// RunAfterMutationReversal runs in OnFailOrCancel after the mutations have
 	// been reversed.
-	RunAfterMutationReversal func(jobID int64) error
+	RunAfterMutationReversal func(jobID jobspb.JobID) error
 
 	// RunAtStartOfOnFailOrCancel runs at the start of the OnFailOrCancel hook.
-	RunBeforeOnFailOrCancel func(jobID int64) error
+	RunBeforeOnFailOrCancel func(jobID jobspb.JobID) error
 
 	// RunAfterOnFailOrCancel runs after the OnFailOrCancel hook.
-	RunAfterOnFailOrCancel func(jobID int64) error
+	RunAfterOnFailOrCancel func(jobID jobspb.JobID) error
 
 	// RunBeforeResume runs at the start of the Resume hook.
-	RunBeforeResume func(jobID int64) error
+	RunBeforeResume func(jobID jobspb.JobID) error
 
 	// OldNamesDrainedNotification is called during a schema change,
 	// after all leases on the version of the descriptor with the old
@@ -2311,12 +2257,11 @@ func (r schemaChangeResumer) OnFailOrCancel(ctx context.Context, execCtx interfa
 	p := execCtx.(JobExecContext)
 	details := r.job.Details().(jobspb.SchemaChangeDetails)
 
-	if details.DroppedDatabaseID != descpb.InvalidID {
-		// TODO (lucy): Do we need to do anything here?
-		return nil
-	}
+	// If this is a schema change to drop a database or schema, DescID will be
+	// unset. We cannot revert such schema changes, so just exit early with an
+	// error.
 	if details.DescID == descpb.InvalidID {
-		return errors.AssertionFailedf("job has no database ID or table ID")
+		return errors.Newf("schema change jobs on databases and schemas cannot be reverted")
 	}
 	sc := SchemaChanger{
 		descID:               details.DescID,
@@ -2454,8 +2399,100 @@ func (sc *SchemaChanger) queueCleanupJobs(
 		log.Infof(ctx, "created job %d to drop previous columns and indexes", jobID)
 		scDesc.MutationJobs = append(scDesc.MutationJobs, descpb.TableDescriptor_MutationJob{
 			MutationID: mutationID,
-			JobID:      jobID,
+			JobID:      int64(jobID),
 		})
+	}
+	return nil
+}
+
+func (sc *SchemaChanger) applyZoneConfigChangeForMutation(
+	ctx context.Context,
+	txn *kv.Txn,
+	dbDesc *dbdesc.Immutable,
+	tableDesc *tabledesc.Mutable,
+	mutation descpb.DescriptorMutation,
+	isDone bool,
+) error {
+	if pkSwap := mutation.GetPrimaryKeySwap(); pkSwap != nil {
+		if lcSwap := pkSwap.LocalityConfigSwap; lcSwap != nil {
+			// We will add up to two options - one for the table itself, and one
+			// for all the new indexes associated with the table.
+			opts := make([]applyZoneConfigForMultiRegionTableOption, 0, 2)
+
+			// For locality configs, we need to update the zone configs to match
+			// the new multi-region locality configuration, instead of
+			// copying the old zone configs over.
+			if mutation.Direction == descpb.DescriptorMutation_ADD {
+				// Only apply the zone configuration on the table when the mutation
+				// is complete.
+				if isDone {
+					opts = append(
+						opts,
+						applyZoneConfigForMultiRegionTableOptionTableNewConfig(
+							lcSwap.NewLocalityConfig,
+						),
+					)
+				}
+				switch lcSwap.NewLocalityConfig.Locality.(type) {
+				case *descpb.TableDescriptor_LocalityConfig_Global_,
+					*descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
+					// The table re-writing the LocalityConfig does most of the work for
+					// us here, but if we're coming from REGIONAL BY ROW, it's also
+					// necessary to drop the zone configurations on the index partitions.
+					if lcSwap.OldLocalityConfig.GetRegionalByRow() != nil {
+						opts = append(
+							opts,
+							dropZoneConfigsForMultiRegionIndexes(
+								append(
+									[]descpb.IndexID{pkSwap.OldPrimaryIndexId},
+									pkSwap.OldIndexes...,
+								)...,
+							),
+						)
+					}
+				case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
+					// Apply new zone configurations for all newly partitioned indexes.
+					opts = append(
+						opts,
+						applyZoneConfigForMultiRegionTableOptionNewIndexes(
+							append(
+								[]descpb.IndexID{pkSwap.NewPrimaryIndexId},
+								pkSwap.NewIndexes...,
+							)...,
+						),
+					)
+				default:
+					return errors.AssertionFailedf(
+						"unknown locality on PK swap: %T",
+						lcSwap.NewLocalityConfig.Locality,
+					)
+				}
+			} else {
+				// DROP is hit on cancellation, in which case we must roll back.
+				opts = append(
+					opts,
+					applyZoneConfigForMultiRegionTableOptionTableNewConfig(
+						lcSwap.OldLocalityConfig,
+					),
+				)
+			}
+
+			return ApplyZoneConfigForMultiRegionTable(
+				ctx,
+				txn,
+				sc.execCfg,
+				*dbDesc.RegionConfig,
+				tableDesc,
+				opts...,
+			)
+		}
+
+		// For the plain ALTER PRIMARY KEY case, copy the zone configs over
+		// for any new indexes.
+		// Note this is done even for isDone = true, though not strictly necessary.
+		return maybeUpdateZoneConfigsForPKChange(
+			ctx, txn, sc.execCfg, tableDesc, pkSwap,
+		)
 	}
 	return nil
 }

@@ -13,17 +13,14 @@
 package dbdesc
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -50,78 +47,6 @@ type Mutable struct {
 	ClusterVersion *Immutable
 }
 
-// NewInitialOption is an optional argument for NewInitial.
-type NewInitialOption func(*descpb.DatabaseDescriptor)
-
-// NewInitialOptionDatabaseRegionConfig is an option allowing an optional
-// regional configuration to be set on the database descriptor.
-func NewInitialOptionDatabaseRegionConfig(
-	regionConfig *descpb.DatabaseDescriptor_RegionConfig,
-) NewInitialOption {
-	return func(desc *descpb.DatabaseDescriptor) {
-		desc.RegionConfig = regionConfig
-	}
-}
-
-// NewInitial constructs a new Mutable for an initial version from an id and
-// name with default privileges.
-func NewInitial(
-	id descpb.ID, name string, owner security.SQLUsername, options ...NewInitialOption,
-) *Mutable {
-	return NewInitialWithPrivileges(
-		id,
-		name,
-		descpb.NewDefaultPrivilegeDescriptor(owner),
-		options...,
-	)
-}
-
-// NewInitialWithPrivileges constructs a new Mutable for an initial version
-// from an id and name and custom privileges.
-func NewInitialWithPrivileges(
-	id descpb.ID, name string, privileges *descpb.PrivilegeDescriptor, options ...NewInitialOption,
-) *Mutable {
-	ret := descpb.DatabaseDescriptor{
-		Name:       name,
-		ID:         id,
-		Version:    1,
-		Privileges: privileges,
-	}
-	for _, option := range options {
-		option(&ret)
-	}
-	return NewCreatedMutable(ret)
-}
-
-func makeImmutable(desc descpb.DatabaseDescriptor) Immutable {
-	return Immutable{DatabaseDescriptor: desc}
-}
-
-// NewImmutable makes a new immutable database descriptor.
-func NewImmutable(desc descpb.DatabaseDescriptor) *Immutable {
-	ret := makeImmutable(desc)
-	return &ret
-}
-
-// NewCreatedMutable returns a Mutable from the given database descriptor with
-// a nil cluster version. This is for a database that is created in the same
-// transaction.
-func NewCreatedMutable(desc descpb.DatabaseDescriptor) *Mutable {
-	return &Mutable{
-		Immutable: makeImmutable(desc),
-	}
-}
-
-// NewExistingMutable returns a Mutable from the given database descriptor with
-// the cluster version also set to the descriptor. This is for databases that
-// already exist.
-func NewExistingMutable(desc descpb.DatabaseDescriptor) *Mutable {
-	return &Mutable{
-		Immutable:      makeImmutable(*protoutil.Clone(&desc).(*descpb.DatabaseDescriptor)),
-		ClusterVersion: NewImmutable(desc),
-	}
-}
-
 // SafeMessage makes Immutable a SafeMessager.
 func (desc *Immutable) SafeMessage() string {
 	return formatSafeMessage("dbdesc.Immutable", desc)
@@ -140,9 +65,9 @@ func formatSafeMessage(typeName string, desc catalog.DatabaseDescriptor) string 
 	return buf.String()
 }
 
-// TypeName returns the plain type of this descriptor.
-func (desc *Immutable) TypeName() string {
-	return "database"
+// DescriptorType returns the plain type of this descriptor.
+func (desc *Immutable) DescriptorType() catalog.DescriptorType {
+	return catalog.Database
 }
 
 // DatabaseDesc implements the Descriptor interface.
@@ -214,6 +139,11 @@ func (desc *Immutable) IsMultiRegion() bool {
 	return desc.RegionConfig != nil
 }
 
+// GetRegionConfig returns the region config for the given database.
+func (desc *Immutable) GetRegionConfig() *descpb.DatabaseDescriptor_RegionConfig {
+	return desc.RegionConfig
+}
+
 // RegionNames returns the multi-region regions that have been added to a
 // database.
 func (desc *Immutable) RegionNames() (descpb.RegionNames, error) {
@@ -271,55 +201,110 @@ func (desc *Immutable) ForEachSchemaInfo(
 // ValidateSelf validates that the database descriptor is well formed.
 // Checks include validate the database name, and verifying that there
 // is at least one read and write user.
-func (desc *Immutable) ValidateSelf(_ context.Context) error {
-	if err := catalog.ValidateName(desc.GetName(), "descriptor"); err != nil {
-		return err
+func (desc *Immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
+	// Validate local properties of the descriptor.
+	vea.Report(catalog.ValidateName(desc.GetName(), "descriptor"))
+	if desc.GetID() == descpb.InvalidID {
+		vea.Report(fmt.Errorf("invalid database ID %d", desc.GetID()))
 	}
-	if desc.GetID() == 0 {
-		return fmt.Errorf("invalid database ID %d", desc.GetID())
-	}
-
-	if desc.IsMultiRegion() {
-		// Ensure no regions are duplicated.
-		regions := make(map[descpb.RegionName]struct{})
-		dbRegions, err := desc.RegionNames()
-		if err != nil {
-			return err
-		}
-		for _, region := range dbRegions {
-			if _, seen := regions[region]; seen {
-				return errors.AssertionFailedf("region %q seen twice on db %d", region, desc.GetID())
-			}
-			regions[region] = struct{}{}
-		}
-
-		if desc.RegionConfig.PrimaryRegion == "" {
-			return errors.AssertionFailedf("primary region unset on a multi-region db %d", desc.GetID())
-		}
-
-		if _, found := regions[desc.RegionConfig.PrimaryRegion]; !found {
-			return errors.AssertionFailedf(
-				"primary region not found in list of regions on db %d", desc.GetID())
-		}
-	}
-
-	// Fill in any incorrect privileges that may have been missed due to mixed-versions.
-	// TODO(mberhault): remove this in 2.1 (maybe 2.2) when privilege-fixing migrations have been
-	// run again and mixed-version clusters always write "good" descriptors.
-	descpb.MaybeFixPrivileges(desc.GetID(), desc.Privileges)
 
 	// Validate the privilege descriptor.
-	return desc.Privileges.Validate(desc.GetID(), privilege.Database)
+	vea.Report(desc.Privileges.Validate(desc.GetID(), privilege.Database))
+
+	if desc.IsMultiRegion() {
+		desc.validateMultiRegion(vea)
+	}
 }
 
-// Validate punts to ValidateSelf.
-func (desc *Immutable) Validate(ctx context.Context, _ catalog.DescGetter) error {
-	return desc.ValidateSelf(ctx)
+// validateMultiRegion performs checks specific to multi-region DBs.
+func (desc *Immutable) validateMultiRegion(vea catalog.ValidationErrorAccumulator) {
+
+	// Ensure no regions are duplicated.
+	regions := make(map[descpb.RegionName]struct{})
+	dbRegions, err := desc.RegionNames()
+	if err != nil {
+		vea.Report(err)
+		return
+	}
+
+	for _, region := range dbRegions {
+		if _, seen := regions[region]; seen {
+			vea.Report(errors.AssertionFailedf(
+				"region %q seen twice on db %d", region, desc.GetID()))
+		}
+		regions[region] = struct{}{}
+	}
+
+	if desc.RegionConfig.PrimaryRegion == "" {
+		vea.Report(errors.AssertionFailedf(
+			"primary region unset on a multi-region db %d", desc.GetID()))
+	} else if _, found := regions[desc.RegionConfig.PrimaryRegion]; !found {
+		vea.Report(errors.AssertionFailedf(
+			"primary region not found in list of regions on db %d", desc.GetID()))
+	}
 }
 
-// ValidateTxnCommit punts to Validate.
-func (desc *Immutable) ValidateTxnCommit(ctx context.Context, descGetter catalog.DescGetter) error {
-	return desc.Validate(ctx, descGetter)
+// GetReferencedDescIDs returns the IDs of all descriptors referenced by
+// this descriptor, including itself.
+func (desc *Immutable) GetReferencedDescIDs() catalog.DescriptorIDSet {
+	ids := catalog.MakeDescriptorIDSet(desc.GetID())
+	if id, err := desc.MultiRegionEnumID(); err == nil {
+		ids.Add(id)
+	}
+	for _, schema := range desc.Schemas {
+		ids.Add(schema.ID)
+	}
+	return ids
+}
+
+// ValidateCrossReferences implements the catalog.Descriptor interface.
+func (desc *Immutable) ValidateCrossReferences(
+	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
+) {
+	// Check schema references.
+	for schemaName, schemaInfo := range desc.Schemas {
+		if schemaInfo.Dropped {
+			continue
+		}
+		report := func(err error) {
+			vea.Report(errors.Wrapf(err, "schema mapping entry %q (%d)",
+				errors.Safe(schemaName), schemaInfo.ID))
+		}
+		schemaDesc, err := vdg.GetSchemaDescriptor(schemaInfo.ID)
+		if err != nil {
+			report(err)
+			continue
+		}
+		if schemaDesc.GetName() != schemaName {
+			report(errors.Errorf("schema name is actually %q", errors.Safe(schemaDesc.GetName())))
+		}
+		if schemaDesc.GetParentID() != desc.GetID() {
+			report(errors.Errorf("schema parentID is actually %d", schemaDesc.GetParentID()))
+		}
+	}
+
+	// Check multi-region enum type.
+	if enumID, err := desc.MultiRegionEnumID(); err == nil {
+		report := func(err error) {
+			vea.Report(errors.Wrap(err, "multi-region enum"))
+		}
+		typ, err := vdg.GetTypeDescriptor(enumID)
+		if err != nil {
+			report(err)
+			return
+		}
+		if typ.GetParentID() != desc.GetID() {
+			report(errors.Errorf("parentID is actually %d", typ.GetParentID()))
+		}
+		// Further validation should be handled by the type descriptor itself.
+	}
+}
+
+// ValidateTxnCommit implements the catalog.Descriptor interface.
+func (desc *Immutable) ValidateTxnCommit(
+	_ catalog.ValidationErrorAccumulator, _ catalog.ValidationDescGetter,
+) {
+	// No-op.
 }
 
 // SchemaMeta implements the tree.SchemaMeta interface.
@@ -375,9 +360,7 @@ func (desc *Mutable) OriginalVersion() descpb.DescriptorVersion {
 
 // ImmutableCopy implements the MutableDescriptor interface.
 func (desc *Mutable) ImmutableCopy() catalog.Descriptor {
-	// TODO (lucy): Should the immutable descriptor constructors always make a
-	// copy, so we don't have to do it here?
-	imm := NewImmutable(*protoutil.Clone(desc.DatabaseDesc()).(*descpb.DatabaseDescriptor))
+	imm := NewBuilder(desc.DatabaseDesc()).BuildImmutableDatabase()
 	imm.isUncommittedVersion = desc.IsUncommittedVersion()
 	return imm
 }

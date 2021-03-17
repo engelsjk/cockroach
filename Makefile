@@ -20,6 +20,10 @@
 # double-hash (##) comments throughout this Makefile. Please submit
 # improvements!
 
+ifneq (,$(findstring v3.,v$(MAKE_VERSION)))
+$(info $(yellow)Warning: your version of `make` seems old; your build may fail!$(term-reset))
+endif
+
 # We need to define $(GO) early because it's needed for defs.mk.
 GO      ?= go
 # xgo is needed also for defs.mk.
@@ -1079,7 +1083,7 @@ roachprod-stress roachprod-stressrace: bin/roachprod-stress
 		exit 1; \
 	fi
 	build/builder.sh make bin/.bootstrap
-	build/builder.sh mkrelease amd64-linux-gnu test GOFLAGS="$(GOFLAGS)" TESTFLAGS="-v -c -o $(notdir $(patsubst %/,%,$(PKG))).test" PKG=$(PKG)
+	build/builder.sh mkrelease amd64-linux-gnu test GOFLAGS="$(GOFLAGS)" TESTFLAGS="-v -c -o $(notdir $(patsubst %/,%,$(PKG))).test" PKG=$(PKG) TAGS="$(TAGS)"
 	bin/roachprod-stress $(CLUSTER) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) $(STRESSFLAGS) -- \
 	  -test.run "$(TESTS)" $(filter-out -v,$(TESTFLAGS)) -test.v -test.timeout $(TESTTIMEOUT); \
 

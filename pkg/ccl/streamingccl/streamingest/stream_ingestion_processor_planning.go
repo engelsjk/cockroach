@@ -31,6 +31,7 @@ func distStreamIngestionPlanSpecs(
 	topology streamingccl.Topology,
 	nodes []roachpb.NodeID,
 	initialHighWater hlc.Timestamp,
+	jobID jobspb.JobID,
 ) ([]*execinfrapb.StreamIngestionDataSpec, *execinfrapb.StreamIngestionFrontierSpec, error) {
 
 	// For each stream partition in the topology, assign it to a node.
@@ -43,14 +44,16 @@ func distStreamIngestionPlanSpecs(
 		// the partition addresses.
 		if i < len(nodes) {
 			spec := &execinfrapb.StreamIngestionDataSpec{
-				StreamAddress:      streamAddress,
-				PartitionAddresses: make([]streamingccl.PartitionAddress, 0),
+				JobID:              int64(jobID),
+				StartTime:          initialHighWater,
+				StreamAddress:      string(streamAddress),
+				PartitionAddresses: make([]string, 0),
 			}
 			streamIngestionSpecs = append(streamIngestionSpecs, spec)
 		}
 		n := i % len(nodes)
 		streamIngestionSpecs[n].PartitionAddresses = append(streamIngestionSpecs[n].PartitionAddresses,
-			partition)
+			string(partition))
 		partitionKey := roachpb.Key(partition)
 		// We create "fake" spans to uniquely identify the partition. This is used
 		// to keep track of the resolved ts received for a particular partition in
@@ -73,7 +76,7 @@ func distStreamIngest(
 	ctx context.Context,
 	execCtx sql.JobExecContext,
 	nodes []roachpb.NodeID,
-	jobID int64,
+	jobID jobspb.JobID,
 	planCtx *sql.PlanningCtx,
 	dsp *sql.DistSQLPlanner,
 	streamIngestionSpecs []*execinfrapb.StreamIngestionDataSpec,
@@ -133,20 +136,20 @@ func distStreamIngest(
 
 	// Copy the evalCtx, as dsp.Run() might change it.
 	evalCtxCopy := *evalCtx
-	dsp.Run(planCtx, noTxn, p, recv, &evalCtxCopy, nil /* finishedSetupFn */)
+	dsp.Run(planCtx, noTxn, p, recv, &evalCtxCopy, nil /* finishedSetupFn */)()
 	return rw.Err()
 }
 
 type streamIngestionResultWriter struct {
 	ctx          context.Context
 	registry     *jobs.Registry
-	jobID        int64
+	jobID        jobspb.JobID
 	rowsAffected int
 	err          error
 }
 
 func makeStreamIngestionResultWriter(
-	ctx context.Context, jobID int64, registry *jobs.Registry,
+	ctx context.Context, jobID jobspb.JobID, registry *jobs.Registry,
 ) *streamIngestionResultWriter {
 	return &streamIngestionResultWriter{
 		ctx:      ctx,

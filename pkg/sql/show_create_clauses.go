@@ -45,12 +45,14 @@ type comment struct {
 func selectComment(ctx context.Context, p PlanHookState, tableID descpb.ID) (tc *tableComments) {
 	query := fmt.Sprintf("SELECT type, object_id, sub_id, comment FROM system.comments WHERE object_id = %d", tableID)
 
-	commentRows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
+	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIterator(
 		ctx, "show-tables-with-comment", p.Txn(), query)
 	if err != nil {
 		log.VEventf(ctx, 1, "%q", err)
 	} else {
-		for _, row := range commentRows {
+		var ok bool
+		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+			row := it.Cur()
 			commentType := int(tree.MustBeDInt(row[0]))
 			switch commentType {
 			case keys.TableCommentType, keys.ColumnCommentType, keys.IndexCommentType:
@@ -70,6 +72,10 @@ func selectComment(ctx context.Context, p PlanHookState, tableID descpb.ID) (tc 
 					tc.indexes = append(tc.indexes, comment{subID, cmt})
 				}
 			}
+		}
+		if err != nil {
+			log.VEventf(ctx, 1, "%q", err)
+			tc = nil
 		}
 	}
 
@@ -191,7 +197,7 @@ func showForeignKeyConstraint(
 	} else {
 		refNames = []string{"???"}
 		originNames = []string{"???"}
-		fkTableName = tree.MakeTableName(tree.Name(""), tree.Name(fmt.Sprintf("[%d as ref]", fk.ReferencedTableID)))
+		fkTableName = tree.MakeTableNameWithSchema(tree.Name(""), tree.PublicSchemaName, tree.Name(fmt.Sprintf("[%d as ref]", fk.ReferencedTableID)))
 		fkTableName.ExplicitSchema = false
 	}
 	buf.WriteString("FOREIGN KEY (")
@@ -299,7 +305,7 @@ func showCreateInterleave(
 			return err
 		}
 	} else {
-		parentName = tree.MakeTableName(tree.Name(""), tree.Name(fmt.Sprintf("[%d as parent]", parentTableID)))
+		parentName = tree.MakeTableNameWithSchema(tree.Name(""), tree.PublicSchemaName, tree.Name(fmt.Sprintf("[%d as parent]", parentTableID)))
 		parentName.ExplicitCatalog = false
 		parentName.ExplicitSchema = false
 	}

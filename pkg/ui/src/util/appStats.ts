@@ -15,8 +15,8 @@
 import _ from "lodash";
 import * as protos from "src/js/protos";
 import { FixLong } from "src/util/fixLong";
-import ISensitiveInfo = protos.cockroach.sql.ISensitiveInfo;
 
+export type ISensitiveInfo = protos.cockroach.sql.ISensitiveInfo;
 export type StatementStatistics = protos.cockroach.sql.IStatementStatistics;
 export type ExecStats = protos.cockroach.sql.IExecStats;
 export type CollectedStatementStatistics = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
@@ -122,6 +122,12 @@ function addExecStats(a: ExecStats, b: ExecStats): Required<ExecStats> {
       countA,
       countB,
     ),
+    max_disk_usage: addMaybeUnsetNumericStat(
+      a.max_disk_usage,
+      b.max_disk_usage,
+      countA,
+      countB,
+    ),
   };
 }
 
@@ -173,6 +179,7 @@ export interface ExecutionStatistics {
   vec: boolean;
   opt: boolean;
   implicit_txn: boolean;
+  full_scan: boolean;
   failed: boolean;
   node_id: number;
   stats: StatementStatistics;
@@ -188,6 +195,7 @@ export function flattenStatementStats(
     vec: stmt.key.key_data.vec,
     opt: stmt.key.key_data.opt,
     implicit_txn: stmt.key.key_data.implicit_txn,
+    full_scan: stmt.key.key_data.full_scan,
     failed: stmt.key.key_data.failed,
     node_id: stmt.key.node_id,
     stats: stmt.stats,

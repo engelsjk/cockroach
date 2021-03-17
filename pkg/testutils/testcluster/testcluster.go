@@ -142,7 +142,7 @@ func (tc *TestCluster) stopServers(ctx context.Context) {
 				return nil
 			}
 			var buf strings.Builder
-			buf.WriteString("unexpectedly found active spans:\n")
+			fmt.Fprintf(&buf, "unexpectedly found %d active spans:\n", len(sps))
 			for _, sp := range sps {
 				fmt.Fprintln(&buf, sp.GetRecording())
 				fmt.Fprintln(&buf)
@@ -1394,6 +1394,9 @@ func (tc *TestCluster) GetRaftLeader(t testing.TB, key roachpb.RKey) *kvserver.R
 					return nil
 				}
 				raftStatus := repl.RaftStatus()
+				if raftStatus == nil {
+					return errors.Errorf("raft group is not initialized for replica with key %s", key)
+				}
 				if raftStatus.Term > latestTerm || (raftLeaderRepl == nil && raftStatus.Term == latestTerm) {
 					// If we find any newer term, it means any previous election is
 					// invalid.

@@ -258,7 +258,7 @@ func (stats *Reporter) update(
 // range or nil if none of the node's stores are holding the Meta1 lease.
 func (stats *Reporter) meta1LeaseHolderStore(ctx context.Context) *kvserver.Store {
 	const meta1RangeID = roachpb.RangeID(1)
-	repl, store, err := stats.localStores.GetReplicaForRangeID(meta1RangeID)
+	repl, store, err := stats.localStores.GetReplicaForRangeID(ctx, meta1RangeID)
 	if roachpb.IsRangeNotFoundError(err) {
 		return nil
 	}
@@ -450,7 +450,7 @@ func visitAncestors(
 	if err := descVal.GetProto(&desc); err != nil {
 		return false, err
 	}
-	tableDesc := descpb.TableFromDescriptor(&desc, descVal.Timestamp)
+	tableDesc, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, descVal.Timestamp)
 	// If it's a database, the parent is the default zone.
 	if tableDesc == nil {
 		return visitDefaultZone(ctx, cfg, visitor), nil

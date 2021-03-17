@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
@@ -221,7 +220,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 					if err := params.p.AlterPrimaryKey(
 						params.ctx,
 						n.tableDesc,
-						alterPK,
+						*alterPK,
 						nil, /* localityConfigSwap */
 					); err != nil {
 						return err
@@ -281,7 +280,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			case *tree.CheckConstraintTableDef:
 				var err error
 				params.p.runWithOptions(resolveFlags{contextDatabaseID: n.tableDesc.ParentID}, func() {
-					info, infoErr := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+					info, infoErr := n.tableDesc.GetConstraintInfo()
 					if infoErr != nil {
 						err = infoErr
 						return
@@ -374,7 +373,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			if err := params.p.AlterPrimaryKey(
 				params.ctx,
 				n.tableDesc,
-				t,
+				*t,
 				nil, /* localityConfigSwap */
 			); err != nil {
 				return err
@@ -439,7 +438,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 
-			if err := params.p.dropSequencesOwnedByCol(params.ctx, colToDrop.ColumnDesc(), true /* queueJob */); err != nil {
+			if err := params.p.dropSequencesOwnedByCol(params.ctx, colToDrop.ColumnDesc(), true /* queueJob */, t.DropBehavior); err != nil {
 				return err
 			}
 
@@ -663,14 +662,13 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 					"column %q in the middle of being added, try again later", t.Column)
 			}
-			if err := n.tableDesc.Validate(
-				params.ctx, catalogkv.NewOneLevelUncachedDescGetter(params.p.Txn(), params.ExecCfg().Codec),
-			); err != nil {
+
+			if err := validateDescriptor(params.ctx, params.p, n.tableDesc); err != nil {
 				return err
 			}
 
 		case *tree.AlterTableDropConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+			info, err := n.tableDesc.GetConstraintInfo()
 			if err != nil {
 				return err
 			}
@@ -681,7 +679,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 					continue
 				}
 				return pgerror.Newf(pgcode.UndefinedObject,
-					"constraint %q does not exist", t.Constraint)
+					"constraint %q of relation %q does not exist", t.Constraint, n.tableDesc.Name)
 			}
 			if err := n.tableDesc.DropConstraint(
 				params.ctx,
@@ -692,14 +690,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 			descriptorChanged = true
-			if err := n.tableDesc.Validate(
-				params.ctx, catalogkv.NewOneLevelUncachedDescGetter(params.p.Txn(), params.ExecCfg().Codec),
-			); err != nil {
+			if err := validateDescriptor(params.ctx, params.p, n.tableDesc); err != nil {
 				return err
 			}
 
 		case *tree.AlterTableValidateConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+			info, err := n.tableDesc.GetConstraintInfo()
 			if err != nil {
 				return err
 			}
@@ -707,7 +703,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			constraint, ok := info[name]
 			if !ok {
 				return pgerror.Newf(pgcode.UndefinedObject,
-					"constraint %q does not exist", t.Constraint)
+					"constraint %q of relation %q does not exist", t.Constraint, n.tableDesc.Name)
 			}
 			if !constraint.Unvalidated {
 				continue
@@ -775,7 +771,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 							"constraint %q in the middle of being added, try again later", t.Constraint)
 					}
 					if err := validateUniqueWithoutIndexConstraintInTxn(
-						params.ctx, params.p.LeaseMgr(), params.EvalContext(), n.tableDesc, params.EvalContext().Txn, name,
+						params.ctx, params.EvalContext(), n.tableDesc, params.EvalContext().Txn, name,
 					); err != nil {
 						return err
 					}
@@ -814,6 +810,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 			if t.All {
 				return unimplemented.NewWithIssue(58736, "PARTITION ALL BY not yet implemented")
 			}
+			if n.tableDesc.GetLocalityConfig() != nil {
+				return pgerror.Newf(
+					pgcode.FeatureNotSupported,
+					"cannot set PARTITION BY on a table in a multi-region enabled database",
+				)
+			}
 			if n.tableDesc.IsPartitionAllBy() {
 				return unimplemented.NewWithIssue(58736, "changing partition of table with PARTITION ALL BY not yet implemented")
 			}
@@ -821,7 +823,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			if oldPartitioning.NumImplicitColumns > 0 {
 				return unimplemented.NewWithIssue(
 					58731,
-					"cannot ALTER TABLE PARTITION BY on table which already has implicit column partitioning",
+					"cannot ALTER TABLE PARTITION BY on a table which already has implicit column partitioning",
 				)
 			}
 			newPrimaryIndex, err := CreatePartitioning(
@@ -889,14 +891,14 @@ func (n *alterTableNode) startExec(params runParams) error {
 			descriptorChanged = descriptorChanged || descChanged
 
 		case *tree.AlterTableRenameConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+			info, err := n.tableDesc.GetConstraintInfo()
 			if err != nil {
 				return err
 			}
 			details, ok := info[string(t.Constraint)]
 			if !ok {
 				return pgerror.Newf(pgcode.UndefinedObject,
-					"constraint %q does not exist", tree.ErrString(&t.Constraint))
+					"constraint %q of relation %q does not exist", tree.ErrString(&t.Constraint), n.tableDesc.Name)
 			}
 			if t.Constraint == t.NewName {
 				// Nothing to do.
@@ -1106,7 +1108,7 @@ func applyColumnMutation(
 			}
 		}
 
-		info, err := tableDesc.GetConstraintInfo(params.ctx, nil)
+		info, err := tableDesc.GetConstraintInfo()
 		if err != nil {
 			return err
 		}
@@ -1141,7 +1143,7 @@ func applyColumnMutation(
 					"constraint in the middle of being dropped")
 			}
 		}
-		info, err := tableDesc.GetConstraintInfo(params.ctx, nil)
+		info, err := tableDesc.GetConstraintInfo()
 		if err != nil {
 			return err
 		}
@@ -1161,6 +1163,10 @@ func applyColumnMutation(
 		if !col.IsComputed() {
 			return pgerror.Newf(pgcode.InvalidColumnDefinition,
 				"column %q is not a computed column", col.Name)
+		}
+		if col.Virtual {
+			return pgerror.Newf(pgcode.InvalidColumnDefinition,
+				"column %q is not a stored computed column", col.Name)
 		}
 		col.ComputeExpr = nil
 	}

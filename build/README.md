@@ -30,9 +30,9 @@ executable.
 ### Deployment
 
 The deploy image is a downsized image containing a minimal environment for
-running CockroachDB. It is based on Debian Jessie and contains only the main
-CockroachDB binary. To fetch this image, run `docker pull
-cockroachdb/cockroach` in the usual fashion.
+running CockroachDB. It is based on RedHat's `ubi8/ubi-minimal` image and
+contains only the main CockroachDB binary, libgeos libraries, and licenses. To
+fetch this image, run `docker pull cockroachdb/cockroach` in the usual fashion.
 
 To build the image yourself, use the Dockerfile in the `deploy` directory after
 building a release version of the binary with the development image described in
@@ -45,6 +45,7 @@ usual fashion. To be more specific, the steps to do this are:
 go/src/github.com/cockroachdb/cockroach $ ./build/builder.sh mkrelease linux-gnu
 go/src/github.com/cockroachdb/cockroach $ cp ./cockroach-linux-2.6.32-gnu-amd64 build/deploy/cockroach
 go/src/github.com/cockroachdb/cockroach $ cp ./lib.docker_amd64/libgeos_c.so ./lib.docker_amd64/libgeos.so build/deploy/
+go/src/github.com/cockroachdb/cockroach $ cp -r licenses build/deploy/
 go/src/github.com/cockroachdb/cockroach $ cd build/deploy && docker build -t cockroachdb/cockroach .
 ```
 
@@ -88,6 +89,8 @@ back to this document and perform these steps:
 * [ ] Bump the default installed version of Go in `bootstrap-debian.sh` ([source](./bootstrap/bootstrap-debian.sh#L40-42)).
 * [ ] Replace other mentions of the older version of go (grep for `golang:<old_version>` and `go<old_version>`).
 * [ ] Update the `builder.dockerImage` parameter in the TeamCity [`Cockroach`](https://teamcity.cockroachdb.com/admin/editProject.html?projectId=Cockroach&tab=projectParams) and [`Internal`](https://teamcity.cockroachdb.com/admin/editProject.html?projectId=Internal&tab=projectParams) projects.
+* [ ] Adjust `GO_VERSION` in the TeamCity agent image ([setup script](./packer/teamcity-agent.sh))
+  and ask the Developer Infrastructure team to deploy new images.
 
 You can test the new builder image in TeamCity by using the custom parameters
 UI (the "..." icon next to the "Run" button) to verify the image before

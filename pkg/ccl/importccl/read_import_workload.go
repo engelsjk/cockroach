@@ -157,7 +157,7 @@ func (w *workloadReader) readFiles(
 			}
 		}
 		if t.Name == `` {
-			return errors.Wrapf(err, `unknown table %s for generator %s`, conf.Table, meta.Name)
+			return errors.Errorf(`unknown table %s for generator %s`, conf.Table, meta.Name)
 		}
 
 		wc := NewWorkloadKVConverter(
@@ -166,7 +166,7 @@ func (w *workloadReader) readFiles(
 	}
 
 	for _, wc := range wcs {
-		if err := ctxgroup.GroupWorkers(ctx, runtime.NumCPU(), func(ctx context.Context, _ int) error {
+		if err := ctxgroup.GroupWorkers(ctx, runtime.GOMAXPROCS(0), func(ctx context.Context, _ int) error {
 			evalCtx := w.evalCtx.Copy()
 			return wc.Worker(ctx, evalCtx)
 		}); err != nil {
