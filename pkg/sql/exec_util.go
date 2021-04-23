@@ -50,7 +50,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -64,6 +63,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -331,14 +331,34 @@ var experimentalAlterColumnTypeGeneralMode = settings.RegisterBoolSetting(
 	false,
 )
 
+var clusterStatementTimeout = settings.RegisterDurationSetting(
+	"sql.defaults.statement_timeout",
+	"default value for the statement_timeout; "+
+		"default value for the statement_timeout session setting; controls the "+
+		"duration a query is permitted to run before it is canceled; if set to 0, "+
+		"there is no timeout",
+	0,
+	settings.NonNegativeDuration,
+).WithPublic()
+
 var clusterIdleInSessionTimeout = settings.RegisterDurationSetting(
 	"sql.defaults.idle_in_session_timeout",
 	"default value for the idle_in_session_timeout; "+
-		"enables automatically killing sessions that exceed the "+
-		"idle_in_session_timeout threshold",
+		"default value for the idle_in_session_timeout session setting; controls the "+
+		"duration a session is permitted to idle before the session is terminated; "+
+		"if set to 0, there is no timeout",
 	0,
 	settings.NonNegativeDuration,
-)
+).WithPublic()
+
+var clusterIdleInTransactionSessionTimeout = settings.RegisterDurationSetting(
+	"sql.defaults.idle_in_transaction_session_timeout",
+	"default value for the idle_in_transaction_session_timeout; controls the "+
+		"duration a session is permitted to idle in a transaction before the "+
+		"session is terminated; if set to 0, there is no timeout",
+	0,
+	settings.NonNegativeDuration,
+).WithPublic()
 
 // TODO(rytaft): remove this once unique without index constraints are fully
 // supported.
@@ -369,6 +389,20 @@ var experimentalStreamReplicationEnabled = settings.RegisterBoolSetting(
 	false,
 )
 
+var stubCatalogTablesEnabledClusterValue = settings.RegisterBoolSetting(
+	`sql.defaults.stub_catalog_tables.enabled`,
+	`default value for stub_catalog_tables session setting`,
+	true,
+)
+
+// settingWorkMemBytes is a cluster setting that determines the maximum amount
+// of RAM that a processor can use.
+var settingWorkMemBytes = settings.RegisterByteSizeSetting(
+	"sql.distsql.temp_storage.workmem",
+	"maximum amount of memory in bytes a processor can use before falling back to temp storage",
+	execinfra.DefaultMemoryLimit, /* 64MiB */
+).WithPublic()
+
 // ExperimentalDistSQLPlanningClusterSettingName is the name for the cluster
 // setting that controls experimentalDistSQLPlanningClusterMode below.
 const ExperimentalDistSQLPlanningClusterSettingName = "sql.defaults.experimental_distsql_planning"
@@ -397,24 +431,9 @@ var VectorizeClusterMode = settings.RegisterEnumSetting(
 	"default vectorize mode",
 	"on",
 	map[int64]string{
-		int64(sessiondatapb.VectorizeOff): "off",
-		int64(sessiondatapb.VectorizeOn):  "on",
-	},
-)
-
-// VectorizeRowCountThresholdClusterValue controls the cluster default for the
-// vectorize row count threshold. When it is met, the vectorized execution
-// engine will be used if possible.
-var VectorizeRowCountThresholdClusterValue = settings.RegisterIntSetting(
-	"sql.defaults.vectorize_row_count_threshold",
-	"default vectorize row count threshold",
-	colexec.DefaultVectorizeRowCountThreshold,
-	func(v int64) error {
-		if v < 0 {
-			return pgerror.Newf(pgcode.InvalidParameterValue,
-				"cannot set sql.defaults.vectorize_row_count_threshold to a negative value: %d", v)
-		}
-		return nil
+		int64(sessiondatapb.VectorizeOff):                "off",
+		int64(sessiondatapb.VectorizeOn):                 "on",
+		int64(sessiondatapb.VectorizeExperimentalAlways): "experimental_always",
 	},
 )
 
@@ -958,6 +977,16 @@ type ExecutorTestingKnobs struct {
 	// exact control of the redaction flags (and have each test set it as
 	// necessary).
 	DeterministicExplain bool
+
+	// ForceRealTracingSpans, if set, forces the use of real (i.e. not no-op)
+	// tracing spans for every statement.
+	ForceRealTracingSpans bool
+
+	// DistSQLReceiverPushCallbackFactory, if set, will be called every time a
+	// DistSQLReceiver is created for a new query execution, and it should
+	// return, possibly nil, a callback that will be called every time
+	// DistSQLReceiver.Push is called.
+	DistSQLReceiverPushCallbackFactory func(query string) func(rowenc.EncDatumRow, *execinfrapb.ProducerMetadata)
 }
 
 // PGWireTestingKnobs contains knobs for the pgwire module.
@@ -2198,6 +2227,10 @@ func (m *sessionDataMutator) SetDistSQLMode(val sessiondata.DistSQLExecMode) {
 	m.data.DistSQLMode = val
 }
 
+func (m *sessionDataMutator) SetDistSQLWorkMem(val int64) {
+	m.data.WorkMemLimit = val
+}
+
 func (m *sessionDataMutator) SetForceSavepointRestart(val bool) {
 	m.data.ForceSavepointRestart = val
 }
@@ -2226,10 +2259,6 @@ func (m *sessionDataMutator) SetReorderJoinsLimit(val int) {
 
 func (m *sessionDataMutator) SetVectorize(val sessiondatapb.VectorizeExecMode) {
 	m.data.VectorizeMode = val
-}
-
-func (m *sessionDataMutator) SetVectorizeRowCountThreshold(val uint64) {
-	m.data.VectorizeRowCountThreshold = val
 }
 
 func (m *sessionDataMutator) SetTestingVectorizeInjectPanics(val bool) {
@@ -2369,6 +2398,11 @@ func (m *sessionDataMutator) SetNoticeDisplaySeverity(severity pgnotice.DisplayS
 // initSequenceCache creates an empty sequence cache instance for the session.
 func (m *sessionDataMutator) initSequenceCache() {
 	m.data.SequenceCache = sessiondata.SequenceCache{}
+}
+
+// SetStubCatalogTableEnabled sets default value for stub_catalog_tables.
+func (m *sessionDataMutator) SetStubCatalogTablesEnabled(enabled bool) {
+	m.data.StubCatalogTablesEnabled = enabled
 }
 
 type sqlStatsCollector struct {

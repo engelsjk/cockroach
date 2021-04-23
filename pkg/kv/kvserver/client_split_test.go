@@ -2833,7 +2833,7 @@ func TestStoreCapacityAfterSplit(t *testing.T) {
 	desc := tc.AddVotersOrFatal(t, key, tc.Target(1))
 	tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(1))
 	testutils.SucceedsSoon(t, func() error {
-		repl, err := tc.GetFirstStoreFromServer(t, 1).GetReplica(desc.RangeID)
+		repl, err := s.GetReplica(desc.RangeID)
 		if err != nil {
 			return err
 		}
@@ -2843,7 +2843,7 @@ func TestStoreCapacityAfterSplit(t *testing.T) {
 		return nil
 	})
 
-	cap, err := s.Capacity(context.Background(), false /* useCached */)
+	cap, err := s.Capacity(ctx, false /* useCached */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2865,12 +2865,22 @@ func TestStoreCapacityAfterSplit(t *testing.T) {
 	// Increment the manual clock and do a write to increase the qps above zero.
 	manualClock.Increment(int64(kvserver.MinStatsDuration))
 	pArgs := incrementArgs(key, 10)
-	if _, pErr := kv.SendWrapped(context.Background(), s.TestSender(), pArgs); pErr != nil {
+	if _, pErr := kv.SendWrapped(ctx, s.TestSender(), pArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
-	tc.WaitForValues(t, key, []int64{10, 10})
+	// We want to make sure we can read the value through raft, so we know
+	// the stats are updated.
+	testutils.SucceedsSoon(t, func() error {
+		getArgs := getArgs(key)
+		if reply, err := kv.SendWrapped(ctx, s.TestSender(), getArgs); err != nil {
+			return errors.Errorf("failed to read data: %s", err)
+		} else if e, v := int64(10), mustGetInt(reply.(*roachpb.GetResponse).Value); v != e {
+			return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
+		}
+		return nil
+	})
 
-	cap, err = s.Capacity(context.Background(), false /* useCached */)
+	cap, err = s.Capacity(ctx, false /* useCached */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2904,11 +2914,11 @@ func TestStoreCapacityAfterSplit(t *testing.T) {
 
 	// Split the range to verify stats work properly with more than one range.
 	sArgs := adminSplitArgs(key.Next().Next())
-	if _, pErr := kv.SendWrapped(context.Background(), s.TestSender(), sArgs); pErr != nil {
+	if _, pErr := kv.SendWrapped(ctx, s.TestSender(), sArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
 
-	cap, err = s.Capacity(context.Background(), false /* useCached */)
+	cap, err = s.Capacity(ctx, false /* useCached */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3313,18 +3323,21 @@ func TestSplitTriggerMeetsUnexpectedReplicaID(t *testing.T) {
 	ctx := context.Background()
 
 	blockPromoteCh := make(chan struct{})
-	var skipLearnerSnaps int32
+	var skipSnaps int32
 	withoutLearnerSnap := func(fn func()) {
-		atomic.StoreInt32(&skipLearnerSnaps, 1)
+		atomic.StoreInt32(&skipSnaps, 1)
 		fn()
-		atomic.StoreInt32(&skipLearnerSnaps, 0)
+		atomic.StoreInt32(&skipSnaps, 0)
 	}
 	knobs := base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
-		ReplicaSkipLearnerSnapshot: func() bool {
-			return atomic.LoadInt32(&skipLearnerSnaps) != 0
+		ReplicaSkipInitialSnapshot: func() bool {
+			return atomic.LoadInt32(&skipSnaps) != 0
 		},
-		ReplicaAddStopAfterLearnerSnapshot: func(targets []roachpb.ReplicationTarget) bool {
-			if atomic.LoadInt32(&skipLearnerSnaps) != 0 {
+		RaftSnapshotQueueSkipReplica: func() bool {
+			return atomic.LoadInt32(&skipSnaps) != 0
+		},
+		VoterAddStopAfterLearnerSnapshot: func(targets []roachpb.ReplicationTarget) bool {
+			if atomic.LoadInt32(&skipSnaps) != 0 {
 				return false
 			}
 			if len(targets) > 0 && targets[0].StoreID == 2 {

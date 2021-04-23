@@ -299,17 +299,13 @@ func (r *Registry) NotifyToAdoptJobs(ctx context.Context) error {
 	return nil
 }
 
-// Run starts previously unstarted jobs from a list of scheduled
-// jobs. Canceling ctx interrupts the waiting but doesn't cancel the jobs.
-func (r *Registry) Run(
+// WaitForJobs waits for a given list of jobs to reach some sort
+// of terminal state.
+func (r *Registry) WaitForJobs(
 	ctx context.Context, ex sqlutil.InternalExecutor, jobs []jobspb.JobID,
 ) error {
 	if len(jobs) == 0 {
 		return nil
-	}
-	log.Infof(ctx, "scheduled jobs %+v", jobs)
-	if err := r.NotifyToAdoptJobs(ctx); err != nil {
-		return err
 	}
 	buf := bytes.Buffer{}
 	for i, id := range jobs {
@@ -368,6 +364,25 @@ func (r *Registry) Run(
 		if j.Payload().Error != "" {
 			return errors.Newf("job %d failed with error: %s", jobs[i], j.Payload().Error)
 		}
+	}
+	return nil
+}
+
+// Run starts previously unstarted jobs from a list of scheduled
+// jobs. Canceling ctx interrupts the waiting but doesn't cancel the jobs.
+func (r *Registry) Run(
+	ctx context.Context, ex sqlutil.InternalExecutor, jobs []jobspb.JobID,
+) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	log.Infof(ctx, "scheduled jobs %+v", jobs)
+	if err := r.NotifyToAdoptJobs(ctx); err != nil {
+		return err
+	}
+	err := r.WaitForJobs(ctx, ex, jobs)
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -1200,7 +1215,7 @@ func (r *Registry) stepThroughStateMachine(
 		jm.ResumeFailed.Inc(1)
 		if sErr := (*InvalidStatusError)(nil); errors.As(err, &sErr) {
 			if sErr.status != StatusCancelRequested && sErr.status != StatusPauseRequested {
-				return errors.NewAssertionErrorWithWrappedErrf(jobErr,
+				return errors.NewAssertionErrorWithWrappedErrf(sErr,
 					"job %d: unexpected status %s provided for a running job", job.ID(), sErr.status)
 			}
 			return sErr
@@ -1281,8 +1296,7 @@ func (r *Registry) stepThroughStateMachine(
 			errors.Wrapf(err, "job %d: cannot be reverted, manual cleanup may be required", job.ID()))
 	case StatusFailed:
 		if jobErr == nil {
-			return errors.NewAssertionErrorWithWrappedErrf(jobErr,
-				"job %d: has StatusFailed but no error was provided", job.ID())
+			return errors.AssertionFailedf("job %d: has StatusFailed but no error was provided", job.ID())
 		}
 		if err := job.failed(ctx, nil /* txn */, jobErr, nil /* fn */); err != nil {
 			// If we can't transactionally mark the job as failed then it will be

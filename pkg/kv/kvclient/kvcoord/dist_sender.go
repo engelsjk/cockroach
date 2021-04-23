@@ -613,7 +613,7 @@ func (ds *DistSender) initAndVerifyBatch(
 			case *roachpb.ReverseScanRequest:
 				// Accepted reverse range requests.
 
-			case *roachpb.QueryIntentRequest, *roachpb.EndTxnRequest:
+			case *roachpb.QueryIntentRequest, *roachpb.EndTxnRequest, *roachpb.GetRequest:
 				// Accepted point requests that can be in batches with limit.
 
 			default:
@@ -1482,7 +1482,7 @@ func (ds *DistSender) sendPartialBatch(
 				// order to return the most recent error when we are out of retries.
 				pErr = roachpb.NewError(err)
 				if !rangecache.IsRangeLookupErrorRetryable(err) {
-					return response{pErr: roachpb.NewError(err)}
+					return response{pErr: pErr}
 				}
 				continue
 			}
@@ -1804,6 +1804,8 @@ func (ds *DistSender) sendToReplicas(
 			// we created replicas.
 			log.Eventf(ctx, "leaseholder %s missing from replicas", leaseholder)
 		}
+	} else {
+		log.VEvent(ctx, 2, "routing to nearest replica")
 	}
 
 	opts := SendOptions{

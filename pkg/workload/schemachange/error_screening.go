@@ -56,19 +56,6 @@ func columnExistsOnTable(tx *pgx.Tx, tableName *tree.TableName, columnName strin
    )`, tableName.Schema(), tableName.Object(), columnName)
 }
 
-func typeExists(tx *pgx.Tx, typ *tree.TypeName) (bool, error) {
-	if !strings.Contains(typ.Object(), "enum") {
-		return true, nil
-	}
-
-	return scanBool(tx, `SELECT EXISTS (
-	SELECT ns.nspname, t.typname
-  FROM pg_catalog.pg_namespace AS ns
-  JOIN pg_catalog.pg_type AS t ON t.typnamespace = ns.oid
- WHERE ns.nspname = $1 AND t.typname = $2
-	)`, typ.Schema(), typ.Object())
-}
-
 func tableHasRows(tx *pgx.Tx, tableName *tree.TableName) (bool, error) {
 	return scanBool(tx, fmt.Sprintf(`SELECT EXISTS (SELECT * FROM %s)`, tableName.String()))
 }
@@ -769,4 +756,34 @@ SELECT EXISTS(
            AND "parentSchemaID" NOT IN (SELECT id FROM schema_id)
            AND id NOT IN (SELECT id FROM dependent)
        );`, schemaName)
+}
+
+// enumMemberPresent determines whether val is a member of the enum.
+// This includes non-public members.
+func enumMemberPresent(tx *pgx.Tx, enum string, val string) (bool, error) {
+	return scanBool(tx, `
+WITH enum_members AS (
+	SELECT
+				json_array_elements(
+						crdb_internal.pb_to_json(
+								'cockroach.sql.sqlbase.Descriptor',
+								descriptor
+						)->'type'->'enumMembers'
+				)->>'logicalRepresentation'
+				AS v
+		FROM
+				system.descriptor
+		WHERE
+				id = ($1::REGTYPE::INT8 - 100000)
+)
+SELECT
+	CASE WHEN EXISTS (
+		SELECT v FROM enum_members WHERE v = $2::string
+	) THEN true
+	ELSE false
+	END AS exists
+`,
+		enum,
+		val,
+	)
 }

@@ -102,6 +102,7 @@ var validationMap = []struct {
 			"DependsOn": {
 				status: todoIAmKnowinglyAddingTechDebt,
 				reason: "initial import: TODO(features): add validation"},
+			"DependsOnTypes": {status: iSolemnlySwearThisFieldIsValidated},
 			"DependedOnBy": {
 				status: todoIAmKnowinglyAddingTechDebt,
 				reason: "initial import: TODO(features): add validation"},
@@ -1475,16 +1476,17 @@ func TestValidateCrossTableReferences(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		descs := catalog.MapDescGetter{}
-		descs[1] = dbdesc.NewBuilder(&descpb.DatabaseDescriptor{ID: 1}).BuildImmutable()
+		descs := catalog.MakeMapDescGetter()
+		descs.Descriptors[1] = dbdesc.NewBuilder(&descpb.DatabaseDescriptor{ID: 1}).BuildImmutable()
 		for _, otherDesc := range test.otherDescs {
 			otherDesc.Privileges = descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName())
-			descs[otherDesc.ID] = NewBuilder(&otherDesc).BuildImmutable()
+			descs.Descriptors[otherDesc.ID] = NewBuilder(&otherDesc).BuildImmutable()
 		}
 		desc := NewBuilder(&test.desc).BuildImmutable()
 		expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), test.err)
-		const validateCrossReferencesOnly = catalog.ValidationLevelSelfAndCrossReferences &^ (catalog.ValidationLevelSelfAndCrossReferences >> 1)
-		if err := catalog.Validate(ctx, descs, validateCrossReferencesOnly, desc).CombinedError(); err == nil {
+		const validateCrossReferencesOnly = catalog.ValidationLevelCrossReferences &^ (catalog.ValidationLevelCrossReferences >> 1)
+		results := catalog.Validate(ctx, descs, catalog.NoValidationTelemetry, validateCrossReferencesOnly, desc)
+		if err := results.CombinedError(); err == nil {
 			if test.err != "" {
 				t.Errorf("%d: expected \"%s\", but found success: %+v", i, expectedErr, test.desc)
 			}

@@ -77,7 +77,7 @@ func TestExportImportBank(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	db, dir, cleanup := setupExportableBank(t, 3, 100)
+	db, _, cleanup := setupExportableBank(t, 3, 100)
 	defer cleanup()
 
 	// Add some unicode to prove FmtExport works as advertised.
@@ -85,32 +85,26 @@ func TestExportImportBank(t *testing.T) {
 	db.Exec(t, "UPDATE bank SET payload = NULL WHERE id % 2 = 0")
 
 	chunkSize := 13
+	baseExportDir := "userfile:///t/"
 	for _, null := range []string{"", "NULL"} {
 		nullAs := fmt.Sprintf(", nullas = '%s'", null)
 		nullIf := fmt.Sprintf(", nullif = '%s'", null)
 
 		t.Run("null="+null, func(t *testing.T) {
-			var files []string
+			exportDir := filepath.Join(baseExportDir, t.Name())
 
 			var asOf string
 			db.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&asOf)
 
-			for _, row := range db.QueryStr(t,
-				fmt.Sprintf(`EXPORT INTO CSV 'nodelocal://0/t'
-					WITH chunk_rows = $1, delimiter = '|' %s
-					FROM SELECT * FROM bank AS OF SYSTEM TIME %s`, nullAs, asOf), chunkSize,
-			) {
-				files = append(files, row[0])
-				f, err := ioutil.ReadFile(filepath.Join(dir, "t", row[0]))
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Log(string(f))
-			}
+			db.Exec(t,
+				fmt.Sprintf(`EXPORT INTO CSV $1
+				WITH chunk_rows = $2, delimiter = '|' %s
+				FROM SELECT * FROM bank AS OF SYSTEM TIME %s`, nullAs, asOf), exportDir, chunkSize,
+			)
 
 			schema := bank.FromRows(1).Tables()[0].Schema
-			fileList := "'nodelocal://0/t/" + strings.Join(files, "', 'nodelocal://0/t/") + "'"
-			db.Exec(t, fmt.Sprintf(`IMPORT TABLE bank2 %s CSV DATA (%s) WITH delimiter = '|'%s`, schema, fileList, nullIf))
+			exportedFiles := filepath.Join(exportDir, "*")
+			db.Exec(t, fmt.Sprintf(`IMPORT TABLE bank2 %s CSV DATA ($1) WITH delimiter = '|'%s`, schema, nullIf), exportedFiles)
 
 			db.CheckQueryResults(t,
 				fmt.Sprintf(`SELECT * FROM bank AS OF SYSTEM TIME %s ORDER BY id`, asOf), db.QueryStr(t, `SELECT * FROM bank2 ORDER BY id`),
@@ -198,8 +192,11 @@ func TestMultiNodeExportStmt(t *testing.T) {
 			totalBytes += bytes
 			nodesSeen[strings.SplitN(filename, ".", 2)[0]] = true
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("unexpected error during export: %s", err.Error())
+		}
 		if totalRows != exportRows {
-			t.Fatalf("Expected %d rows, got %d", exportRows, totalRows)
+			t.Fatalf("expected %d rows, got %d", exportRows, totalRows)
 		}
 		if expected := exportRows / chunkSize; files < expected {
 			t.Fatalf("expected at least %d files, got %d", expected, files)
@@ -408,7 +405,6 @@ func TestExportVectorized(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	sqlDB.Exec(t, `CREATE TABLE t(a INT PRIMARY KEY)`)
-	sqlDB.Exec(t, `SET vectorize_row_count_threshold=0`)
 	sqlDB.Exec(t, `EXPORT INTO CSV 'http://0.1:37957/exp_1' FROM TABLE t`)
 }
 

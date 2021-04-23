@@ -28,10 +28,12 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder" // for ExprFmtHideScalars.
@@ -219,6 +221,9 @@ type Flags struct {
 	// MemoGroupLimit is used by the check-size command to check whether
 	// more than MemoGroupLimit memo groups are constructed during optimization.
 	MemoGroupLimit int64
+
+	// QueryArgs are values for placeholders, used for assign-placeholders-*.
+	QueryArgs []string
 }
 
 // New constructs a new instance of the OptTester for the given SQL statement.
@@ -274,6 +279,23 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //
 //    Builds an expression tree from a SQL query, fully optimizes it using the
 //    memo, and then outputs the lowest cost tree.
+//
+//  - assign-placeholders-norm query-args=(...)
+//
+//    Builds a query that has placeholders (with normalization enabled), then
+//    assigns placeholders to the given query arguments. Normalization rules are
+//    enabled when assigning placeholders.
+//
+//  - assign-placeholders-opt query-args=(...)
+//
+//    Builds a query that has placeholders (with normalization enabled), then
+//    assigns placeholders to the given query arguments and fully optimizes it.
+//
+//  - placeholder-fast-path [flags]
+//
+//    Builds an expression tree from a SQL query which contains placeholders and
+//    attempts to use the placeholder fast path to obtain a fully optimized
+//    expression with placeholders.
 //
 //  - build-cascades [flags]
 //
@@ -440,14 +462,17 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 	}
+	ot.Flags.Verbose = datadriven.Verbose()
+
+	ot.semaCtx.Placeholders = tree.PlaceholderInfo{}
 
 	ot.evalCtx.SessionData.ReorderJoinsLimit = ot.Flags.JoinLimit
 	ot.evalCtx.SessionData.PreferLookupJoinsForFKs = ot.Flags.PreferLookupJoinsForFKs
 
-	ot.Flags.Verbose = datadriven.Verbose()
 	ot.evalCtx.TestingKnobs.OptimizerCostPerturbation = ot.Flags.PerturbCost
 	ot.evalCtx.Locality = ot.Flags.Locality
 	ot.evalCtx.SessionData.SaveTablesPrefix = ot.Flags.SaveTablesPrefix
+	ot.evalCtx.Placeholders = nil
 
 	switch d.Cmd {
 	case "exec-ddl":
@@ -507,6 +532,25 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
+		return ot.FormatExpr(e)
+
+	case "assign-placeholders-norm", "assign-placeholders-opt":
+		explore := d.Cmd == "assign-placeholders-opt"
+		e, err := ot.AssignPlaceholders(ot.Flags.QueryArgs, explore)
+		if err != nil {
+			d.Fatalf(tb, "%+v", err)
+		}
+		ot.postProcess(tb, d, e)
+		return ot.FormatExpr(e)
+
+	case "placeholder-fast-path":
+		e, ok, err := ot.PlaceholderFastPath()
+		if err != nil {
+			d.Fatalf(tb, "%+v", err)
+		}
+		if !ok {
+			return "no fast path"
+		}
 		return ot.FormatExpr(e)
 
 	case "build-cascades":
@@ -925,6 +969,9 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 		}
 		f.MemoGroupLimit = limit
 
+	case "query-args":
+		f.QueryArgs = arg.Vals
+
 	default:
 		return fmt.Errorf("unknown argument: %s", arg.Key)
 	}
@@ -954,9 +1001,6 @@ func (ot *OptTester) OptNorm() (opt.Expr, error) {
 		}
 		return true
 	})
-	o.NotifyOnAppliedRule(func(ruleName opt.RuleName, source, target opt.Expr) {
-		ot.appliedRules.Add(int(ruleName))
-	})
 	if !ot.Flags.NoStableFolds {
 		o.Factory().FoldingControl().AllowStableFolds()
 	}
@@ -971,15 +1015,90 @@ func (ot *OptTester) Optimize() (opt.Expr, error) {
 	o.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
 		return !ot.Flags.DisableRules.Contains(int(ruleName))
 	})
-	o.NotifyOnAppliedRule(func(ruleName opt.RuleName, source, target opt.Expr) {
-		// Exploration rules are marked as "applied" if they generate one or
-		// more new expressions.
-		if target != nil {
-			ot.appliedRules.Add(int(ruleName))
-		}
-	})
 	o.Factory().FoldingControl().AllowStableFolds()
 	return ot.optimizeExpr(o)
+}
+
+// AssignPlaceholders builds the given query with placeholders, then assigns the
+// placeholders to the given argument values, and optionally runs exploration.
+//
+// The arguments are parsed as SQL expressions.
+func (ot *OptTester) AssignPlaceholders(queryArgs []string, explore bool) (opt.Expr, error) {
+	o := ot.makeOptimizer()
+
+	// Build the prepared memo. Note that placeholders don't have values yet, so
+	// they won't be replaced.
+	err := ot.buildExpr(o.Factory())
+	if err != nil {
+		return nil, err
+	}
+	prepMemo := o.DetachMemo()
+
+	// Construct placeholder values.
+	if exp := len(ot.semaCtx.Placeholders.Types); len(queryArgs) != exp {
+		return nil, errors.Errorf("expected %d arguments, got %d", exp, len(queryArgs))
+	}
+	ot.semaCtx.Placeholders.Values = make(tree.QueryArguments, len(queryArgs))
+	for i, arg := range queryArgs {
+		var parg tree.Expr
+		parg, err := parser.ParseExpr(fmt.Sprintf("%v", arg))
+		if err != nil {
+			return nil, err
+		}
+
+		id := tree.PlaceholderIdx(i)
+		typ, _ := ot.semaCtx.Placeholders.ValueType(id)
+		texpr, err := schemaexpr.SanitizeVarFreeExpr(
+			context.Background(),
+			parg,
+			typ,
+			"", /* context */
+			&ot.semaCtx,
+			tree.VolatilityVolatile,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		ot.semaCtx.Placeholders.Values[i] = texpr
+	}
+	ot.evalCtx.Placeholders = &ot.semaCtx.Placeholders
+
+	// We want expect/expect-not to refer only to rules that run during
+	// AssignPlaceholders.
+	ot.appliedRules = RuleSet{}
+	// Now assign placeholders.
+	o = ot.makeOptimizer()
+	o.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
+		if !explore && !ruleName.IsNormalize() {
+			return false
+		}
+		if ot.Flags.DisableRules.Contains(int(ruleName)) {
+			return false
+		}
+		return true
+	})
+
+	o.Factory().FoldingControl().AllowStableFolds()
+	if err := o.Factory().AssignPlaceholders(prepMemo); err != nil {
+		return nil, err
+	}
+	return o.Optimize()
+}
+
+// PlaceholderFastPath tests TryPlaceholderFastPath; it should be used on
+// queries with placeholders.
+func (ot *OptTester) PlaceholderFastPath() (_ opt.Expr, ok bool, _ error) {
+	o := ot.makeOptimizer()
+	o.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
+		return !ot.Flags.DisableRules.Contains(int(ruleName))
+	})
+
+	err := ot.buildExpr(o.Factory())
+	if err != nil {
+		return nil, false, err
+	}
+	return o.TryPlaceholderFastPath()
 }
 
 // Memo returns a string that shows the memo data structure that is constructed
@@ -1322,16 +1441,28 @@ func (ot *OptTester) Import(tb testing.TB) {
 	if ot.Flags.File == "" {
 		tb.Fatal("file not specified")
 	}
-	// Find the file to be imported in opttester/testfixtures.
-	_, optTesterFile, _, ok := runtime.Caller(1)
-	if !ok {
-		tb.Fatalf("unable to find file %s", ot.Flags.File)
-	}
-	path := filepath.Join(filepath.Dir(optTesterFile), "testfixtures", ot.Flags.File)
+	path := ot.testFixturePath(tb, ot.Flags.File)
 	datadriven.RunTest(tb.(*testing.T), path, func(t *testing.T, d *datadriven.TestData) string {
 		tester := New(ot.catalog, d.Input)
 		return tester.RunCommand(t, d)
 	})
+}
+
+// testFixturePath returns the path of a fixture inside opttester/testfixtures.
+func (ot *OptTester) testFixturePath(tb testing.TB, file string) string {
+	if bazel.BuiltWithBazel() {
+		runfile, err := bazel.Runfile("pkg/sql/opt/testutils/opttester/testfixtures/" + file)
+		if err != nil {
+			tb.Fatalf("%s; is your package missing a dependency on \"//pkg/sql/opt/testutils/opttester:testfixtures\"?", err)
+		}
+		return runfile
+	}
+	// Get the path to this file from the runtime.
+	_, thisFilePath, _, ok := runtime.Caller(0)
+	if !ok {
+		tb.Fatal("unable to get caller information")
+	}
+	return filepath.Join(filepath.Dir(thisFilePath), "testfixtures", file)
 }
 
 // InjectStats constructs and executes an ALTER TABLE INJECT STATISTICS
@@ -1632,9 +1763,18 @@ func (ot *OptTester) buildExpr(factory *norm.Factory) error {
 	return b.Build()
 }
 
+// makeOptimizer initializes a new optimizer and sets up an applied rule
+// notifier that updates ot.appliedRules.
 func (ot *OptTester) makeOptimizer() *xform.Optimizer {
 	var o xform.Optimizer
 	o.Init(&ot.evalCtx, ot.catalog)
+	o.NotifyOnAppliedRule(func(ruleName opt.RuleName, source, target opt.Expr) {
+		// Exploration rules are marked as "applied" if they generate one or
+		// more new expressions.
+		if target != nil {
+			ot.appliedRules.Add(int(ruleName))
+		}
+	})
 	return &o
 }
 

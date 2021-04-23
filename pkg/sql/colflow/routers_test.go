@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
@@ -737,7 +738,12 @@ func TestHashRouterComputesDestination(t *testing.T) {
 		}
 	}
 
-	r := newHashRouterWithOutputs(in, []uint32{0}, nil /* ch */, outputs, nil /* toDrain */, nil /* toClose */)
+	r := newHashRouterWithOutputs(
+		colexecargs.OpWithMetaInfo{Root: in},
+		[]uint32{0}, /* hashCols */
+		nil,         /* unblockEventsChan */
+		outputs,
+	)
 	for r.processNextBatch(ctx) {
 	}
 
@@ -780,7 +786,12 @@ func TestHashRouterCancellation(t *testing.T) {
 	in := colexecop.NewRepeatableBatchSource(tu.testAllocator, batch, typs)
 
 	unbufferedCh := make(chan struct{})
-	r := newHashRouterWithOutputs(in, []uint32{0}, unbufferedCh, routerOutputs, nil /* toDrain */, nil /* toClose */)
+	r := newHashRouterWithOutputs(
+		colexecargs.OpWithMetaInfo{Root: in},
+		[]uint32{0}, /* hashCols */
+		unbufferedCh,
+		routerOutputs,
+	)
 
 	t.Run("BeforeRun", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -881,7 +892,18 @@ func TestHashRouterOneOutput(t *testing.T) {
 			tu.testAllocator.ReleaseMemory(tu.testAllocator.Used())
 			diskAcc := tu.testDiskMonitor.MakeBoundAccount()
 			defer diskAcc.Close(ctx)
-			r, routerOutputs := NewHashRouter([]*colmem.Allocator{tu.testAllocator}, colexectestutils.NewOpFixedSelTestInput(tu.testAllocator, sel, len(sel), data, typs), typs, []uint32{0}, mtc.bytes, queueCfg, colexecop.NewTestingSemaphore(2), []*mon.BoundAccount{&diskAcc}, nil /* toDrain */, nil /* toClose */)
+			r, routerOutputs := NewHashRouter(
+				[]*colmem.Allocator{tu.testAllocator},
+				colexecargs.OpWithMetaInfo{
+					Root: colexectestutils.NewOpFixedSelTestInput(tu.testAllocator, sel, len(sel), data, typs),
+				},
+				typs,
+				[]uint32{0}, /* hashCols */
+				mtc.bytes,
+				queueCfg,
+				colexecop.NewTestingSemaphore(2),
+				[]*mon.BoundAccount{&diskAcc},
+			)
 
 			if len(routerOutputs) != 1 {
 				t.Fatalf("expected 1 router output but got %d", len(routerOutputs))
@@ -1068,18 +1090,19 @@ func TestHashRouterRandom(t *testing.T) {
 
 				const hashRouterMetadataMsg = "hash router test metadata"
 				r := newHashRouterWithOutputs(
-					inputs[0],
-					hashCols,
-					unblockEventsChan,
-					outputs,
-					[]execinfrapb.MetadataSource{
-						execinfrapb.CallbackMetadataSource{
-							DrainMetaCb: func(_ context.Context) []execinfrapb.ProducerMetadata {
-								return []execinfrapb.ProducerMetadata{{Err: errors.New(hashRouterMetadataMsg)}}
+					colexecargs.OpWithMetaInfo{
+						Root: inputs[0],
+						MetadataSources: []colexecop.MetadataSource{
+							colexectestutils.CallbackMetadataSource{
+								DrainMetaCb: func(_ context.Context) []execinfrapb.ProducerMetadata {
+									return []execinfrapb.ProducerMetadata{{Err: errors.New(hashRouterMetadataMsg)}}
+								},
 							},
 						},
 					},
-					nil, /* toClose */
+					hashCols,
+					unblockEventsChan,
+					outputs,
 				)
 
 				var (
@@ -1295,7 +1318,16 @@ func BenchmarkHashRouter(b *testing.B) {
 					diskAccounts[i] = &diskAcc
 					defer diskAcc.Close(ctx)
 				}
-				r, outputs := NewHashRouter(allocators, input, typs, []uint32{0}, 64<<20, queueCfg, &colexecop.TestingSemaphore{}, diskAccounts, nil /* toDrain */, nil /* toClose */)
+				r, outputs := NewHashRouter(
+					allocators,
+					colexecargs.OpWithMetaInfo{Root: input},
+					typs,
+					[]uint32{0}, /* hashCols */
+					64<<20,      /* memoryLimit */
+					queueCfg,
+					&colexecop.TestingSemaphore{},
+					diskAccounts,
+				)
 				b.SetBytes(8 * int64(coldata.BatchSize()) * int64(numInputBatches))
 				// We expect distribution to not change. This is a sanity check that
 				// we're resetting properly.

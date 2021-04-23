@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/errors"
@@ -242,11 +241,6 @@ func flagSetForCmd(cmd *cobra.Command) *pflag.FlagSet {
 
 func init() {
 	initCLIDefaults()
-	defer func() {
-		if err := processEnvVarDefaults(); err != nil {
-			panic(err)
-		}
-	}()
 
 	// Every command but start will inherit the following setting.
 	AddPersistentPreRunE(cockroachCmd, func(cmd *cobra.Command, _ []string) error {
@@ -290,6 +284,15 @@ func init() {
 		pf.AddFlag(flag)
 	})
 
+	{
+		// Since cobra v0.0.7, cobra auto-adds `-v` if not defined. We don't
+		// want that: we will likely want to add --verbose for some sub-commands,
+		// and -v should remain reserved as an alias for --verbose.
+		var unused bool
+		pf.BoolVarP(&unused, "verbose", "v", false, "")
+		_ = pf.MarkHidden("verbose")
+	}
+
 	// Logging flags common to all commands.
 	{
 		// Logging configuration.
@@ -299,37 +302,37 @@ func init() {
 		// TODO(knz): Remove this.
 		varFlag(pf, &cliCtx.deprecatedLogOverrides.stderrThreshold, cliflags.DeprecatedStderrThreshold)
 		_ = pf.MarkDeprecated(cliflags.DeprecatedStderrThreshold.Name,
-			"use --"+cliflags.Log.Name+" instead to specify sinks.stderr.filter.")
+			"use --"+cliflags.Log.Name+" instead to specify 'sinks: {stderr: {filter: ...}}'.")
 		// This flag can also be specified without an explicit argument.
 		pf.Lookup(cliflags.DeprecatedStderrThreshold.Name).NoOptDefVal = "DEFAULT"
 
 		varFlag(pf, &cliCtx.deprecatedLogOverrides.stderrNoColor, cliflags.DeprecatedStderrNoColor)
 		_ = pf.MarkDeprecated(cliflags.DeprecatedStderrNoColor.Name,
-			"use --"+cliflags.Log.Name+" instead to specify sinks.stderr.no-color.")
+			"use --"+cliflags.Log.Name+" instead to specify 'sinks: {stderr: {no-color: true}}'")
 
 		varFlag(pf, &cliCtx.deprecatedLogOverrides.logDir, cliflags.DeprecatedLogDir)
 		_ = pf.MarkDeprecated(cliflags.DeprecatedLogDir.Name,
-			"use --"+cliflags.Log.Name+" instead to specify file-defaults.dir.")
+			"use --"+cliflags.Log.Name+" instead to specify 'file-defaults: {dir: ...}'")
 
 		varFlag(pf, cliCtx.deprecatedLogOverrides.fileMaxSizeVal, cliflags.DeprecatedLogFileMaxSize)
 		_ = pf.MarkDeprecated(cliflags.DeprecatedLogFileMaxSize.Name,
-			"use --"+cliflags.Log.Name+" instead to specify file-defaults.max-file-size.")
+			"use --"+cliflags.Log.Name+" instead to specify 'file-defaults: {max-file-size: ...}'")
 
 		varFlag(pf, cliCtx.deprecatedLogOverrides.maxGroupSizeVal, cliflags.DeprecatedLogGroupMaxSize)
 		_ = pf.MarkDeprecated(cliflags.DeprecatedLogGroupMaxSize.Name,
-			"use --"+cliflags.Log.Name+" instead to specify file-defaults.max-group-size.")
+			"use --"+cliflags.Log.Name+" instead to specify 'file-defaults: {max-group-size: ...}'")
 
 		varFlag(pf, &cliCtx.deprecatedLogOverrides.fileThreshold, cliflags.DeprecatedFileThreshold)
 		_ = pf.MarkDeprecated(cliflags.DeprecatedFileThreshold.Name,
-			"use --"+cliflags.Log.Name+" instead to specify file-defaults.filter.")
+			"use --"+cliflags.Log.Name+" instead to specify 'file-defaults: {filter: ...}'")
 
 		varFlag(pf, &cliCtx.deprecatedLogOverrides.redactableLogs, cliflags.DeprecatedRedactableLogs)
 		_ = pf.MarkDeprecated(cliflags.DeprecatedRedactableLogs.Name,
-			"use --"+cliflags.Log.Name+" instead to specify file-defaults:redactable-logs.")
+			"use --"+cliflags.Log.Name+" instead to specify 'file-defaults: {redactable: ...}")
 
 		varFlag(pf, &cliCtx.deprecatedLogOverrides.sqlAuditLogDir, cliflags.DeprecatedSQLAuditLogDir)
 		_ = pf.MarkDeprecated(cliflags.DeprecatedSQLAuditLogDir.Name,
-			"use --"+cliflags.Log.Name+" instead to specify sinks:file-groups:sql-audit.")
+			"use --"+cliflags.Log.Name+" instead to specify 'sinks: {file-groups: {sql-audit: {channels: SENSITIVE_ACCESS, dir: ...}}}")
 	}
 
 	// Remember we are starting in the background as the `start` command will
@@ -552,7 +555,10 @@ func init() {
 		debugGossipValuesCmd,
 		debugTimeSeriesDumpCmd,
 		debugZipCmd,
-		doctorClusterCmd,
+		debugListFilesCmd,
+		doctorExamineClusterCmd,
+		doctorExamineFallbackClusterCmd,
+		doctorRecreateClusterCmd,
 		genHAProxyCmd,
 		initCmd,
 		quitCmd,
@@ -561,7 +567,6 @@ func init() {
 	}
 	clientCmds = append(clientCmds, authCmds...)
 	clientCmds = append(clientCmds, nodeCmds...)
-	clientCmds = append(clientCmds, systemBenchCmds...)
 	clientCmds = append(clientCmds, nodeLocalCmds...)
 	clientCmds = append(clientCmds, importCmds...)
 	clientCmds = append(clientCmds, userFileCmds...)
@@ -593,7 +598,9 @@ func init() {
 		statusNodeCmd,
 		lsNodesCmd,
 		debugZipCmd,
-		doctorClusterCmd,
+		doctorExamineClusterCmd,
+		doctorExamineFallbackClusterCmd,
+		doctorRecreateClusterCmd,
 		// If you add something here, make sure the actual implementation
 		// of the command uses `cmdTimeoutContext(.)` or it will ignore
 		// the timeout.
@@ -612,39 +619,18 @@ func init() {
 		boolFlag(f, &nodeCtx.statusShowDecommission, cliflags.NodeDecommission)
 	}
 
-	// HDD Bench command.
-	{
-		f := seqWriteBench.Flags()
-		varFlag(f, humanizeutil.NewBytesValue(&systemBenchCtx.writeSize), cliflags.WriteSize)
-		varFlag(f, humanizeutil.NewBytesValue(&systemBenchCtx.syncInterval), cliflags.SyncInterval)
-	}
-
-	// Network Bench command.
-	{
-		f := networkBench.Flags()
-		boolFlag(f, &networkBenchCtx.server, cliflags.BenchServer)
-		intFlag(f, &networkBenchCtx.port, cliflags.BenchPort)
-		stringSliceFlag(f, &networkBenchCtx.addresses, cliflags.BenchAddresses)
-		boolFlag(f, &networkBenchCtx.latency, cliflags.BenchLatency)
-	}
-
-	// Bench command.
-	{
-		for _, cmd := range systemBenchCmds {
-			f := cmd.Flags()
-			intFlag(f, &systemBenchCtx.concurrency, cliflags.BenchConcurrency)
-			durationFlag(f, &systemBenchCtx.duration, cliflags.BenchDuration)
-			stringFlag(f, &systemBenchCtx.tempDir, cliflags.TempDir)
-		}
-	}
-
 	// Zip command.
 	{
 		f := debugZipCmd.Flags()
-		varFlag(f, &zipCtx.nodes.inclusive, cliflags.ZipNodes)
-		varFlag(f, &zipCtx.nodes.exclusive, cliflags.ZipExcludeNodes)
 		boolFlag(f, &zipCtx.redactLogs, cliflags.ZipRedactLogs)
 		durationFlag(f, &zipCtx.cpuProfDuration, cliflags.ZipCPUProfileDuration)
+		intFlag(f, &zipCtx.concurrency, cliflags.ZipConcurrency)
+	}
+	// List-nodes + Zip commands.
+	for _, cmd := range []*cobra.Command{debugZipCmd, debugListFilesCmd} {
+		f := cmd.Flags()
+		varFlag(f, &zipCtx.nodes.inclusive, cliflags.ZipNodes)
+		varFlag(f, &zipCtx.nodes.exclusive, cliflags.ZipExcludeNodes)
 	}
 
 	// Decommission command.
@@ -678,7 +664,9 @@ func init() {
 	sqlCmds := []*cobra.Command{
 		sqlShellCmd,
 		demoCmd,
-		doctorClusterCmd,
+		doctorExamineClusterCmd,
+		doctorExamineFallbackClusterCmd,
+		doctorRecreateClusterCmd,
 		lsNodesCmd,
 		statusNodeCmd,
 	}
@@ -733,7 +721,13 @@ func init() {
 
 	// Commands that print tables.
 	tableOutputCommands := append(
-		[]*cobra.Command{sqlShellCmd, genSettingsListCmd, demoCmd, debugTimeSeriesDumpCmd},
+		[]*cobra.Command{
+			sqlShellCmd,
+			genSettingsListCmd,
+			demoCmd,
+			debugListFilesCmd,
+			debugTimeSeriesDumpCmd,
+		},
 		demoCmd.Commands()...)
 	tableOutputCommands = append(tableOutputCommands, nodeCmds...)
 	tableOutputCommands = append(tableOutputCommands, authCmds...)
@@ -773,7 +767,9 @@ func init() {
 		_ = f.MarkHidden(cliflags.Global.Name)
 		// The --empty flag is only valid for the top level demo command,
 		// so we use the regular flag set.
-		boolFlag(demoCmd.Flags(), &demoCtx.useEmptyDatabase, cliflags.UseEmptyDatabase)
+		boolFlag(demoCmd.Flags(), &demoCtx.noExampleDatabase, cliflags.UseEmptyDatabase)
+		_ = f.MarkDeprecated(cliflags.UseEmptyDatabase.Name, "use --no-workload-database")
+		boolFlag(demoCmd.Flags(), &demoCtx.noExampleDatabase, cliflags.NoExampleDatabase)
 		// We also support overriding the GEOS library path for 'demo'.
 		// Even though the demoCtx uses mostly different configuration
 		// variables from startCtx, this is one case where we afford
@@ -852,6 +848,21 @@ func init() {
 		f := debugBallastCmd.Flags()
 		varFlag(f, &debugCtx.ballastSize, cliflags.Size)
 	}
+	{
+		for _, c := range []*cobra.Command{
+			doctorExamineClusterCmd,
+			doctorExamineZipDirCmd,
+			doctorExamineFallbackClusterCmd,
+			doctorExamineFallbackZipDirCmd,
+			doctorRecreateClusterCmd,
+			doctorRecreateZipDirCmd,
+		} {
+			f := c.Flags()
+			if f.Lookup(cliflags.Verbose.Name) == nil {
+				boolFlag(f, &debugCtx.verbose, cliflags.Verbose)
+			}
+		}
+	}
 
 	// Multi-tenancy commands.
 	{
@@ -909,64 +920,52 @@ func (w *tenantIDWrapper) Type() string {
 // to the flags, during initialization and before the command line is
 // actually parsed. For example, it will inject the value of
 // $COCKROACH_URL into the urlParser object linked to the --url flag.
-func processEnvVarDefaults() error {
-	for _, d := range envVarDefaults {
-		f := d.flagSet.Lookup(d.flagName)
-		if f == nil {
-			panic(errors.AssertionFailedf("unknown flag: %s", d.flagName))
+func processEnvVarDefaults(cmd *cobra.Command) error {
+	fl := flagSetForCmd(cmd)
+
+	var retErr error
+	fl.VisitAll(func(f *pflag.Flag) {
+		envv, ok := f.Annotations[envValueAnnotationKey]
+		if !ok || len(envv) < 2 {
+			// No env var associated. Nothing to do.
+			return
 		}
-		var err error
-		if url, ok := f.Value.(urlParser); ok {
-			// URLs are a special case: they can emit a warning if there's
-			// excess configuration for certain commands.
-			// Since the env-var initialization is ran for all commands
-			// all the time, regardless of which particular command is
-			// currently active, we want to silence this warning here.
-			//
-			// TODO(knz): rework this code to only pull env var values
-			// for the current command.
-			err = url.setInternal(d.envValue, false /* warn */)
-		} else {
-			err = d.flagSet.Set(d.flagName, d.envValue)
+		varName, value := envv[0], envv[1]
+		if err := fl.Set(f.Name, value); err != nil {
+			retErr = errors.CombineErrors(retErr,
+				errors.Wrapf(err, "setting --%s from %s", f.Name, varName))
 		}
-		if err != nil {
-			return errors.Wrapf(err, "setting --%s from %s", d.flagName, d.envVar)
-		}
-	}
-	return nil
+	})
+	return retErr
 }
 
-// envVarDefault describes a delayed default initialization of the
-// setting covered by a flag from the value of an environment
-// variable.
-type envVarDefault struct {
-	envVar   string
-	envValue string
-	flagName string
-	flagSet  *pflag.FlagSet
-}
-
-// envVarDefaults records the initializations from environment variables
-// for processing at the end of initialization, before flag parsing.
-var envVarDefaults []envVarDefault
+const (
+	// envValueAnnotationKey is the map key used in pflag.Flag instances
+	// to associate flags with a possible default value set by an
+	// env var.
+	envValueAnnotationKey = "envvalue"
+)
 
 // registerEnvVarDefault registers a deferred initialization of a flag
 // from an environment variable.
+// The caller is responsible for ensuring that the flagInfo has been
+// efined in the FlagSet already.
 func registerEnvVarDefault(f *pflag.FlagSet, flagInfo cliflags.FlagInfo) {
 	if flagInfo.EnvVar == "" {
 		return
 	}
+
 	value, set := envutil.EnvString(flagInfo.EnvVar, 2)
 	if !set {
-		// Env var not set. Nothing to do.
+		// Env var is not set. Nothing to do.
 		return
 	}
-	envVarDefaults = append(envVarDefaults, envVarDefault{
-		envVar:   flagInfo.EnvVar,
-		envValue: value,
-		flagName: flagInfo.Name,
-		flagSet:  f,
-	})
+
+	if err := f.SetAnnotation(flagInfo.Name, envValueAnnotationKey, []string{flagInfo.EnvVar, value}); err != nil {
+		// This should never happen: an error is only returned if the flag
+		// name was not defined yet.
+		panic(err)
+	}
 }
 
 // extraServerFlagInit configures the server.Config based on the command-line flags.

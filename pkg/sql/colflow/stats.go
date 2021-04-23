@@ -15,24 +15,20 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow/colrpc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
-// vectorizedStatsCollector is the common interface implemented by collectors.
-type vectorizedStatsCollector interface {
-	colexecop.Operator
-	getStats() *execinfrapb.ComponentStats
-}
-
 // childStatsCollector gives access to the stopwatches of a
-// vectorizedStatsCollector's childStatsCollectors.
+// colexecop.VectorizedStatsCollector's childStatsCollectors.
 type childStatsCollector interface {
 	getElapsedTime() time.Duration
 }
@@ -118,25 +114,27 @@ func (bic *batchInfoCollector) getElapsedTime() time.Duration {
 	return bic.stopwatch.Elapsed()
 }
 
-// newVectorizedStatsCollector creates a vectorizedStatsCollector which wraps
-// 'op' that corresponds to a component with either ProcessorID or StreamID 'id'
-// (with 'idTagKey' distinguishing between the two). 'kvReader' is a component
-// (either an operator or a wrapped processor) that performs KV reads that is
-// present in the chain of operators rooted at 'op'.
+// newVectorizedStatsCollector creates a colexecop.VectorizedStatsCollector
+// which wraps 'op' that corresponds to a component with either ProcessorID or
+// StreamID 'id' (with 'idTagKey' distinguishing between the two). 'kvReader' is
+// a component (either an operator or a wrapped processor) that performs KV
+// reads that is present in the chain of operators rooted at 'op'.
 func newVectorizedStatsCollector(
 	op colexecop.Operator,
 	kvReader colexecop.KVReader,
+	columnarizer colexecop.VectorizedStatsCollector,
 	id execinfrapb.ComponentID,
 	inputWatch *timeutil.StopWatch,
 	memMonitors []*mon.BytesMonitor,
 	diskMonitors []*mon.BytesMonitor,
 	inputStatsCollectors []childStatsCollector,
-) vectorizedStatsCollector {
+) colexecop.VectorizedStatsCollector {
 	// TODO(cathymw): Refactor to have specialized stats collectors for
 	// memory/disk stats and IO operators.
 	return &vectorizedStatsCollectorImpl{
 		batchInfoCollector: makeBatchInfoCollector(op, id, inputWatch, inputStatsCollectors),
 		kvReader:           kvReader,
+		columnarizer:       columnarizer,
 		memMonitors:        memMonitors,
 		diskMonitors:       diskMonitors,
 	}
@@ -148,15 +146,25 @@ type vectorizedStatsCollectorImpl struct {
 	batchInfoCollector
 
 	kvReader     colexecop.KVReader
+	columnarizer colexecop.VectorizedStatsCollector
 	memMonitors  []*mon.BytesMonitor
 	diskMonitors []*mon.BytesMonitor
 }
 
-// getStats is part of the vectorizedStatsCollector interface.
-func (vsc *vectorizedStatsCollectorImpl) getStats() *execinfrapb.ComponentStats {
+// GetStats is part of the colexecop.VectorizedStatsCollector interface.
+func (vsc *vectorizedStatsCollectorImpl) GetStats() *execinfrapb.ComponentStats {
 	numBatches, numTuples, time := vsc.batchInfoCollector.finish()
 
-	s := &execinfrapb.ComponentStats{Component: vsc.componentID}
+	var s *execinfrapb.ComponentStats
+	if vsc.columnarizer != nil {
+		s = vsc.columnarizer.GetStats()
+	}
+	if s == nil {
+		// Either there was no root columnarizer or it has been
+		// removed from the flow (in which case the columnarizer will return
+		// nil). Create a new stats object.
+		s = &execinfrapb.ComponentStats{Component: vsc.componentID}
+	}
 
 	for _, memMon := range vsc.memMonitors {
 		s.Exec.MaxAllocatedMem.Add(memMon.MaximumBytes())
@@ -187,16 +195,16 @@ func (vsc *vectorizedStatsCollectorImpl) getStats() *execinfrapb.ComponentStats 
 	return s
 }
 
-// newNetworkVectorizedStatsCollector creates a new vectorizedStatsCollector
-// for streams. In addition to the base stats, newNetworkVectorizedStatsCollector
-// collects the network latency for a stream.
+// newNetworkVectorizedStatsCollector creates a new
+// colexecop.VectorizedStatsCollector for streams. In addition to the base stats,
+// newNetworkVectorizedStatsCollector collects the network latency for a stream.
 func newNetworkVectorizedStatsCollector(
 	op colexecop.Operator,
 	id execinfrapb.ComponentID,
 	inputWatch *timeutil.StopWatch,
 	inbox *colrpc.Inbox,
 	latency time.Duration,
-) vectorizedStatsCollector {
+) colexecop.VectorizedStatsCollector {
 	return &networkVectorizedStatsCollectorImpl{
 		batchInfoCollector: makeBatchInfoCollector(op, id, inputWatch, nil /* childStatsCollectors */),
 		inbox:              inbox,
@@ -213,8 +221,8 @@ type networkVectorizedStatsCollectorImpl struct {
 	latency time.Duration
 }
 
-// getStats is part of the vectorizedStatsCollector interface.
-func (nvsc *networkVectorizedStatsCollectorImpl) getStats() *execinfrapb.ComponentStats {
+// GetStats is part of the colexecop.VectorizedStatsCollector interface.
+func (nvsc *networkVectorizedStatsCollectorImpl) GetStats() *execinfrapb.ComponentStats {
 	numBatches, numTuples, time := nvsc.batchInfoCollector.finish()
 
 	s := &execinfrapb.ComponentStats{Component: nvsc.componentID}
@@ -230,4 +238,46 @@ func (nvsc *networkVectorizedStatsCollectorImpl) getStats() *execinfrapb.Compone
 	s.Output.NumTuples.Set(numTuples)
 
 	return s
+}
+
+// maybeAddStatsInvariantChecker will add a statsInvariantChecker to both
+// StatsCollectors and MetadataSources of op if crdb_test build tag is
+// specified. See comment on statsInvariantChecker for the kind of invariants
+// checked.
+func maybeAddStatsInvariantChecker(op *colexecargs.OpWithMetaInfo) {
+	if util.CrdbTestBuild {
+		c := &statsInvariantChecker{}
+		op.StatsCollectors = append(op.StatsCollectors, c)
+		op.MetadataSources = append(op.MetadataSources, c)
+	}
+}
+
+// statsInvariantChecker is a dummy colexecop.VectorizedStatsCollector as well
+// as colexecop.MetadataSource which asserts that GetStats is called before
+// DrainMeta. It should only be used in the test environment.
+type statsInvariantChecker struct {
+	colexecop.ZeroInputNode
+
+	statsRetrieved bool
+}
+
+var _ colexecop.VectorizedStatsCollector = &statsInvariantChecker{}
+var _ colexecop.MetadataSource = &statsInvariantChecker{}
+
+func (i *statsInvariantChecker) Init() {}
+
+func (i *statsInvariantChecker) Next(context.Context) coldata.Batch {
+	return coldata.ZeroBatch
+}
+
+func (i *statsInvariantChecker) GetStats() *execinfrapb.ComponentStats {
+	i.statsRetrieved = true
+	return &execinfrapb.ComponentStats{}
+}
+
+func (i *statsInvariantChecker) DrainMeta(context.Context) []execinfrapb.ProducerMetadata {
+	if !i.statsRetrieved {
+		return []execinfrapb.ProducerMetadata{{Err: errors.New("GetStats wasn't called before DrainMeta")}}
+	}
+	return nil
 }

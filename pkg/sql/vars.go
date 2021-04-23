@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -413,6 +414,27 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	`distsql_workmem`: {
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			limit, err := humanizeutil.ParseBytes(s)
+			if err != nil {
+				return err
+			}
+			if limit <= 0 {
+				return errors.New("distsql_workmem can only be set to a positive value")
+			}
+			m.SetDistSQLWorkMem(limit)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return humanizeutil.IBytes(evalCtx.SessionData.WorkMemLimit)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return humanizeutil.IBytes(settingWorkMemBytes.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
 	`experimental_distsql_planning`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`experimental_distsql_planning`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
@@ -529,29 +551,6 @@ var varGen = map[string]sessionVar{
 		GlobalDefault: func(sv *settings.Values) string {
 			return sessiondatapb.VectorizeExecMode(
 				VectorizeClusterMode.Get(sv)).String()
-		},
-	},
-
-	// CockroachDB extension.
-	`vectorize_row_count_threshold`: {
-		GetStringVal: makeIntGetStringValFn(`vectorize_row_count_threshold`),
-		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := strconv.ParseInt(s, 10, 64)
-			if err != nil {
-				return err
-			}
-			if b < 0 {
-				return pgerror.Newf(pgcode.InvalidParameterValue,
-					"cannot set vectorize_row_count_threshold to a negative value: %d", b)
-			}
-			m.SetVectorizeRowCountThreshold(uint64(b))
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) string {
-			return strconv.FormatInt(int64(evalCtx.SessionData.VectorizeRowCountThreshold), 10)
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return strconv.FormatInt(VectorizeRowCountThresholdClusterValue.Get(sv), 10)
 		},
 	},
 
@@ -726,6 +725,25 @@ var varGen = map[string]sessionVar{
 		GlobalDefault: func(sv *settings.Values) string {
 			return sessiondata.SerialNormalizationMode(
 				SerialNormalizationMode.Get(sv)).String()
+		},
+	},
+
+	// CockroachDB extension.
+	`stub_catalog_tables`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`stub_catalog_tables`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("stub_catalog_tables", s)
+			if err != nil {
+				return err
+			}
+			m.SetStubCatalogTablesEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.StubCatalogTablesEnabled)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(stubCatalogTablesEnabledClusterValue.Get(sv))
 		},
 	},
 
@@ -976,7 +994,9 @@ var varGen = map[string]sessionVar{
 			ms := evalCtx.SessionData.StmtTimeout.Nanoseconds() / int64(time.Millisecond)
 			return strconv.FormatInt(ms, 10)
 		},
-		GlobalDefault: func(sv *settings.Values) string { return "0" },
+		GlobalDefault: func(sv *settings.Values) string {
+			return clusterStatementTimeout.String(sv)
+		},
 	},
 
 	`idle_in_session_timeout`: {
@@ -998,7 +1018,9 @@ var varGen = map[string]sessionVar{
 			ms := evalCtx.SessionData.IdleInTransactionSessionTimeout.Nanoseconds() / int64(time.Millisecond)
 			return strconv.FormatInt(ms, 10)
 		},
-		GlobalDefault: func(sv *settings.Values) string { return "0" },
+		GlobalDefault: func(sv *settings.Values) string {
+			return clusterIdleInTransactionSessionTimeout.String(sv)
+		},
 	},
 
 	// See https://www.postgresql.org/docs/10/static/runtime-config-client.html#GUC-TIMEZONE

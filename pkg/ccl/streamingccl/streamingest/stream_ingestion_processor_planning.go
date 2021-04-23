@@ -131,6 +131,7 @@ func distStreamIngest(
 		nil, /* clockUpdater */
 		evalCtx.Tracing,
 		execCfg.ContentionRegistry,
+		nil, /* testingPushCallback */
 	)
 	defer recv.Release()
 
@@ -171,21 +172,19 @@ func (s *streamIngestionResultWriter) AddRow(ctx context.Context, row tree.Datum
 	if err != nil {
 		return err
 	}
-	return job.HighWaterProgressed(s.ctx, nil /* txn */, func(ctx context.Context, txn *kv.Txn,
-		details jobspb.ProgressDetails) (hlc.Timestamp, error) {
+	return job.Update(s.ctx, nil /* txn */, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 		// Decode the row and write the ts.
 		var ingestedHighWatermark hlc.Timestamp
 		if err := protoutil.Unmarshal([]byte(*row[0].(*tree.DBytes)),
 			&ingestedHighWatermark); err != nil {
-			return ingestedHighWatermark, errors.NewAssertionErrorWithWrappedErrf(err,
-				`unmarshalling resolved timestamp`)
+			return errors.NewAssertionErrorWithWrappedErrf(err, `unmarshalling resolved timestamp`)
 		}
-		return ingestedHighWatermark, nil
+		return jobs.UpdateHighwaterProgressed(ingestedHighWatermark, md, ju)
 	})
 }
 
 // IncrementRowsAffected implements the sql.rowResultWriter interface.
-func (s *streamIngestionResultWriter) IncrementRowsAffected(n int) {
+func (s *streamIngestionResultWriter) IncrementRowsAffected(ctx context.Context, n int) {
 	s.rowsAffected += n
 }
 

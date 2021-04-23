@@ -99,7 +99,6 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
-        "//pkg/build",
         "//pkg/clusterversion",
         "//pkg/config",
         "//pkg/config/zonepb",
@@ -245,6 +244,7 @@ go_test(
         "replica_application_cmd_buf_test.go",
         "replica_application_state_machine_test.go",
         "replica_batch_updates_test.go",
+        "replica_closedts_internal_test.go",
         "replica_closedts_test.go",
         "replica_command_test.go",
         "replica_consistency_test.go",

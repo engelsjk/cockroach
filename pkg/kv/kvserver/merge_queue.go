@@ -304,10 +304,8 @@ func (mq *mergeQueue) process(
 		// these ranges and only try to collocate them if they're not in violation,
 		// which would help us make better guarantees about not transiently
 		// violating constraints during a merge.
-		voterTargets, nonVoterTargets, err := GetTargetsToCollocateRHSForMerge(ctx, lhsDesc.Replicas(), rhsDesc.Replicas())
-		if err != nil {
-			return false, err
-		}
+		voterTargets := lhsDesc.Replicas().Voters().ReplicationTargets()
+		nonVoterTargets := lhsDesc.Replicas().NonVoters().ReplicationTargets()
 
 		// AdminRelocateRange moves the lease to the first target in the list, so
 		// sort the existing leaseholder there to leave it unchanged.
@@ -354,6 +352,10 @@ func (mq *mergeQueue) process(
 	} else if err != nil {
 		// While range merges are unstable, be extra cautious and mark every error
 		// as purgatory-worthy.
+		//
+		// TODO(aayush): Merges are indeed stable now, we can be smarter here about
+		// which errors should be marked as purgatory-worthy.
+		log.Warningf(ctx, "%v", err)
 		return false, rangeMergePurgatoryError{err}
 	}
 	if testingAggressiveConsistencyChecks {

@@ -50,10 +50,15 @@ var errNoZoneConfigApplies = errors.New("no zone config applies")
 //
 // If getInheritedDefault is true, the direct zone configuration, if it exists, is
 // ignored, and the default that would apply if it did not exist is returned instead.
+//
+// If mayBeTable is true then we will attempt to decode the id into a table
+// descriptor in order to find its parent. If false, we'll assume that this
+// already is a parent and we'll not decode a descriptor.
 func getZoneConfig(
 	id config.SystemTenantObjectID,
 	getKey func(roachpb.Key) (*roachpb.Value, error),
 	getInheritedDefault bool,
+	mayBeTable bool,
 ) (
 	config.SystemTenantObjectID,
 	*zonepb.ZoneConfig,
@@ -86,28 +91,38 @@ func getZoneConfig(
 
 	// No zone config for this ID. We need to figure out if it's a table, so we
 	// look up its descriptor.
-	if descVal, err := getKey(catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, descpb.ID(id))); err != nil {
-		return 0, nil, 0, nil, err
-	} else if descVal != nil {
-		var desc descpb.Descriptor
-		if err := descVal.GetProto(&desc); err != nil {
+	if mayBeTable {
+		if descVal, err := getKey(catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, descpb.ID(id))); err != nil {
 			return 0, nil, 0, nil, err
-		}
-		tableDesc, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, descVal.Timestamp)
-		if tableDesc != nil {
-			// This is a table descriptor. Look up its parent database zone config.
-			dbID, zone, _, _, err := getZoneConfig(config.SystemTenantObjectID(tableDesc.ParentID), getKey, false /* getInheritedDefault */)
-			if err != nil {
+		} else if descVal != nil {
+			var desc descpb.Descriptor
+			if err := descVal.GetProto(&desc); err != nil {
 				return 0, nil, 0, nil, err
 			}
-			return dbID, zone, placeholderID, placeholder, nil
+			tableDesc, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, descVal.Timestamp)
+			if tableDesc != nil {
+				// This is a table descriptor. Look up its parent database zone config.
+				dbID, zone, _, _, err := getZoneConfig(
+					config.SystemTenantObjectID(tableDesc.ParentID),
+					getKey,
+					false, /* getInheritedDefault */
+					false /* mayBeTable */)
+				if err != nil {
+					return 0, nil, 0, nil, err
+				}
+				return dbID, zone, placeholderID, placeholder, nil
+			}
 		}
 	}
 
 	// Retrieve the default zone config, but only as long as that wasn't the ID
 	// we were trying to retrieve (avoid infinite recursion).
 	if id != keys.RootNamespaceID {
-		rootID, zone, _, _, err := getZoneConfig(keys.RootNamespaceID, getKey, false /* getInheritedDefault */)
+		rootID, zone, _, _, err := getZoneConfig(
+			keys.RootNamespaceID,
+			getKey,
+			false, /* getInheritedDefault */
+			false /* mayBeTable */)
 		if err != nil {
 			return 0, nil, 0, nil, err
 		}
@@ -142,7 +157,8 @@ func completeZoneConfig(
 		}
 		tableDesc, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, descVal.Timestamp)
 		if tableDesc != nil {
-			_, dbzone, _, _, err := getZoneConfig(config.SystemTenantObjectID(tableDesc.ParentID), getKey, false /* getInheritedDefault */)
+			_, dbzone, _, _, err := getZoneConfig(
+				config.SystemTenantObjectID(tableDesc.ParentID), getKey, false /* getInheritedDefault */, false /* mayBeTable */)
 			if err != nil {
 				return err
 			}
@@ -154,7 +170,7 @@ func completeZoneConfig(
 	if cfg.IsComplete() {
 		return nil
 	}
-	_, defaultZone, _, _, err := getZoneConfig(keys.RootNamespaceID, getKey, false /* getInheritedDefault */)
+	_, defaultZone, _, _, err := getZoneConfig(keys.RootNamespaceID, getKey, false /* getInheritedDefault */, false /* mayBeTable */)
 	if err != nil {
 		return err
 	}
@@ -175,8 +191,9 @@ func zoneConfigHook(
 	getKey := func(key roachpb.Key) (*roachpb.Value, error) {
 		return cfg.GetValue(key), nil
 	}
+	const mayBeTable = true
 	zoneID, zone, _, placeholder, err := getZoneConfig(
-		id, getKey, false /* getInheritedDefault */)
+		id, getKey, false /* getInheritedDefault */, mayBeTable)
 	if errors.Is(err, errNoZoneConfigApplies) {
 		return nil, nil, true, nil
 	} else if err != nil {
@@ -199,7 +216,7 @@ func GetZoneConfigInTxn(
 	ctx context.Context,
 	txn *kv.Txn,
 	id config.SystemTenantObjectID,
-	index *descpb.IndexDescriptor,
+	index catalog.Index,
 	partition string,
 	getInheritedDefault bool,
 ) (config.SystemTenantObjectID, *zonepb.ZoneConfig, *zonepb.Subzone, error) {
@@ -211,7 +228,7 @@ func GetZoneConfigInTxn(
 		return kv.Value, nil
 	}
 	zoneID, zone, placeholderID, placeholder, err := getZoneConfig(
-		id, getKey, getInheritedDefault)
+		id, getKey, getInheritedDefault, true /* mayBeTable */)
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -220,17 +237,18 @@ func GetZoneConfigInTxn(
 	}
 	var subzone *zonepb.Subzone
 	if index != nil {
+		indexID := uint32(index.GetID())
 		if placeholder != nil {
-			if subzone = placeholder.GetSubzone(uint32(index.ID), partition); subzone != nil {
-				if indexSubzone := placeholder.GetSubzone(uint32(index.ID), ""); indexSubzone != nil {
+			if subzone = placeholder.GetSubzone(indexID, partition); subzone != nil {
+				if indexSubzone := placeholder.GetSubzone(indexID, ""); indexSubzone != nil {
 					subzone.Config.InheritFromParent(&indexSubzone.Config)
 				}
 				subzone.Config.InheritFromParent(zone)
 				return placeholderID, placeholder, subzone, nil
 			}
 		} else {
-			if subzone = zone.GetSubzone(uint32(index.ID), partition); subzone != nil {
-				if indexSubzone := zone.GetSubzone(uint32(index.ID), ""); indexSubzone != nil {
+			if subzone = zone.GetSubzone(indexID, partition); subzone != nil {
+				if indexSubzone := zone.GetSubzone(indexID, ""); indexSubzone != nil {
 					subzone.Config.InheritFromParent(&indexSubzone.Config)
 				}
 				subzone.Config.InheritFromParent(zone)
@@ -311,7 +329,7 @@ func resolveZone(ctx context.Context, txn *kv.Txn, zs *tree.ZoneSpecifier) (desc
 
 func resolveSubzone(
 	zs *tree.ZoneSpecifier, table catalog.TableDescriptor,
-) (*descpb.IndexDescriptor, string, error) {
+) (catalog.Index, string, error) {
 	if !zs.TargetsTable() || zs.TableOrIndex.Index == "" && zs.Partition == "" {
 		return nil, "", nil
 	}
@@ -331,19 +349,19 @@ func resolveSubzone(
 
 	partitionName := string(zs.Partition)
 	if partitionName != "" {
-		if partitioning := tabledesc.FindIndexPartitionByName(index.IndexDesc(), partitionName); partitioning == nil {
+		if partitioning := tabledesc.FindIndexPartitionByName(index, partitionName); partitioning == nil {
 			return nil, "", fmt.Errorf("partition %q does not exist on index %q", partitionName, indexName)
 		}
 	}
 
-	return index.IndexDesc(), partitionName, nil
+	return index, partitionName, nil
 }
 
 func deleteRemovedPartitionZoneConfigs(
 	ctx context.Context,
 	txn *kv.Txn,
 	tableDesc catalog.TableDescriptor,
-	idxDesc *descpb.IndexDescriptor,
+	indexID descpb.IndexID,
 	oldPartDesc *descpb.PartitioningDescriptor,
 	newPartDesc *descpb.PartitioningDescriptor,
 	execCfg *ExecutorConfig,
@@ -368,7 +386,7 @@ func deleteRemovedPartitionZoneConfigs(
 		zone = zonepb.NewZoneConfig()
 	}
 	for _, n := range removedNames {
-		zone.DeleteSubzone(uint32(idxDesc.ID), n)
+		zone.DeleteSubzone(uint32(indexID), n)
 	}
 	hasNewSubzones := false
 	_, err = writeZoneConfig(ctx, txn, tableDesc.GetID(), tableDesc, zone, execCfg, hasNewSubzones)

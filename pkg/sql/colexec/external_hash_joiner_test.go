@@ -207,6 +207,7 @@ func newIntColumns(nCols int, length int) []coldata.Vec {
 }
 
 func BenchmarkExternalHashJoiner(b *testing.B) {
+	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
@@ -294,7 +295,7 @@ func createDiskBackedHashJoiner(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	spec *execinfrapb.ProcessorSpec,
-	inputs []colexecop.Operator,
+	sources []colexecop.Operator,
 	spillingCallbackFn func(),
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	numForcedRepartitions int,
@@ -303,7 +304,7 @@ func createDiskBackedHashJoiner(
 ) (colexecop.Operator, []*mon.BoundAccount, []*mon.BytesMonitor, []colexecop.Closer, error) {
 	args := &colexecargs.NewColOperatorArgs{
 		Spec:                spec,
-		Inputs:              inputs,
+		Inputs:              colexectestutils.MakeInputs(sources),
 		StreamingMemAccount: testMemAcc,
 		DiskQueueCfg:        diskQueueCfg,
 		FDSemaphore:         testingSemaphore,
@@ -315,5 +316,5 @@ func createDiskBackedHashJoiner(
 	args.TestingKnobs.NumForcedRepartitions = numForcedRepartitions
 	args.TestingKnobs.DelegateFDAcquisitions = delegateFDAcquisitions
 	result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
-	return result.Op, result.OpAccounts, result.OpMonitors, result.ToClose, err
+	return result.Root, result.OpAccounts, result.OpMonitors, result.ToClose, err
 }

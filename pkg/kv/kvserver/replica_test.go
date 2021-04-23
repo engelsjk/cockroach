@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -5593,6 +5594,7 @@ func TestPushTxnQueryPusheeHasNewerVersion(t *testing.T) {
 // heartbeat within its transaction liveness threshold can be pushed/aborted.
 func TestPushTxnHeartbeatTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderBazelWithIssue(t, 62860, "flaky test")
 	defer log.Scope(t).Close(t)
 	tc := testContext{manualClock: hlc.NewManualClock(123)}
 	stopper := stop.NewStopper()
@@ -6245,6 +6247,7 @@ func TestRangeStatsComputation(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 	tc.Start(t, stopper)
+	ctx := context.Background()
 
 	baseStats := initialStats()
 	// The initial stats contain an empty lease and no prior read summary, but
@@ -6311,7 +6314,7 @@ func TestRangeStatsComputation(t *testing.T) {
 		// Account for TxnDidNotUpdateMeta
 		expMS.LiveBytes += 2
 		expMS.ValBytes += 2
-		if tc.engine.IsSeparatedIntentsEnabledForTesting() {
+		if tc.engine.IsSeparatedIntentsEnabledForTesting(ctx) {
 			expMS.SeparatedIntentCount++
 		}
 	}
@@ -8487,7 +8490,7 @@ func TestFailureToProcessCommandClearsLocalResult(t *testing.T) {
 	r.mu.Unlock()
 
 	tr := tc.store.ClusterSettings().Tracer
-	tr.TestingIncludeAsyncSpansInRecordings() // we assert on async span traces in this test
+	tr.TestingRecordAsyncSpans() // we assert on async span traces in this test
 	opCtx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, tr, "test-recording")
 	defer cancel()
 
@@ -11366,8 +11369,8 @@ func TestTxnRecordLifecycleTransitions(t *testing.T) {
 				return sendWrappedWithErr(roachpb.Header{}, &pt)
 			},
 			expTxn: func(txn *roachpb.Transaction, pushTs hlc.Timestamp) roachpb.TransactionRecord {
-				record := txn.AsRecord()
-				record.WriteTimestamp.Forward(pushTs)
+				record := txnWithStatus(roachpb.ABORTED)(txn, pushTs)
+				record.WriteTimestamp = record.WriteTimestamp.Add(0, 1)
 				record.Priority = pusher.Priority - 1
 				return record
 			},
@@ -12818,7 +12821,7 @@ func TestReplicateQueueProcessOne(t *testing.T) {
 	tc.repl.mu.destroyStatus.Set(errBoom, destroyReasonMergePending)
 	tc.repl.mu.Unlock()
 
-	requeue, err := tc.store.replicateQueue.processOneChange(ctx, tc.repl, func() bool { return false }, true /* dryRun */)
+	requeue, err := tc.store.replicateQueue.processOneChange(ctx, tc.repl, func(ctx context.Context, repl *Replica) bool { return false }, true /* dryRun */)
 	require.Equal(t, errBoom, err)
 	require.False(t, requeue)
 }

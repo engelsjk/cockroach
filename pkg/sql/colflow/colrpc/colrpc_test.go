@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
@@ -33,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -226,7 +228,7 @@ func TestOutboxInbox(t *testing.T) {
 		defer outboxMemAcc.Close(ctx)
 		outbox, err := NewOutbox(
 			colmem.NewAllocator(ctx, &outboxMemAcc, coldata.StandardColumnFactory),
-			input, typs, nil /* metadataSource */, nil /* toClose */, nil, /* getStats */
+			input, typs, nil /* getStats */, nil /* metadataSources */, nil, /* toClose */
 		)
 		require.NoError(t, err)
 
@@ -503,13 +505,13 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 			}
 			outbox, err := NewOutbox(
 				colmem.NewAllocator(ctx, &outboxMemAcc, coldata.StandardColumnFactory),
-				input, typs, []execinfrapb.MetadataSource{
-					execinfrapb.CallbackMetadataSource{
+				input, typs, nil /* getStats */, []colexecop.MetadataSource{
+					colexectestutils.CallbackMetadataSource{
 						DrainMetaCb: func(context.Context) []execinfrapb.ProducerMetadata {
 							return expectedMetadata
 						},
 					},
-				}, nil /* toClose */, nil /* getStats */)
+				}, nil /* toClose */)
 			require.NoError(t, err)
 
 			inboxMemAcc := testMemMonitor.MakeBoundAccount()
@@ -549,6 +551,7 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 }
 
 func BenchmarkOutboxInbox(b *testing.B) {
+	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -583,7 +586,7 @@ func BenchmarkOutboxInbox(b *testing.B) {
 	defer outboxMemAcc.Close(ctx)
 	outbox, err := NewOutbox(
 		colmem.NewAllocator(ctx, &outboxMemAcc, coldata.StandardColumnFactory),
-		input, typs, nil /* metadataSources */, nil /* toClose */, nil, /* getStats */
+		input, typs, nil /* getStats */, nil /* metadataSources */, nil, /* toClose */
 	)
 	require.NoError(b, err)
 
@@ -647,7 +650,7 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 	defer outboxMemAcc.Close(ctx)
 	outbox, err := NewOutbox(
 		colmem.NewAllocator(ctx, &outboxMemAcc, coldata.StandardColumnFactory),
-		input, typs, nil /* metadataSources */, nil /* toClose */, nil, /* getStats */
+		input, typs, nil /* getStats */, nil /* metadataSources */, nil, /* toClose */
 	)
 	require.NoError(t, err)
 

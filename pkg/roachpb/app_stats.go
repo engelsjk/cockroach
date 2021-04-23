@@ -125,6 +125,7 @@ func (s *StatementStatistics) Add(other *StatementStatistics) {
 	if other.MaxRetries > s.MaxRetries {
 		s.MaxRetries = other.MaxRetries
 	}
+	s.SQLType = other.SQLType
 	s.NumRows.Add(other.NumRows, s.Count, other.Count)
 	s.ParseLat.Add(other.ParseLat, s.Count, other.Count)
 	s.PlanLat.Add(other.PlanLat, s.Count, other.Count)
@@ -142,6 +143,10 @@ func (s *StatementStatistics) Add(other *StatementStatistics) {
 
 	if s.SensitiveInfo.MostRecentPlanTimestamp.Before(other.SensitiveInfo.MostRecentPlanTimestamp) {
 		s.SensitiveInfo = other.SensitiveInfo
+	}
+
+	if s.LastExecTimestamp.Before(other.LastExecTimestamp) {
+		s.LastExecTimestamp = other.LastExecTimestamp
 	}
 
 	s.Count += other.Count

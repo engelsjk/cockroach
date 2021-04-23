@@ -23,6 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow/colrpc"
@@ -162,7 +164,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					numInboxes           = numHashRouterOutputs + 3
 					inboxes              = make([]*colrpc.Inbox, 0, numInboxes+1)
 					handleStreamErrCh    = make([]chan error, numInboxes+1)
-					synchronizerInputs   = make([]colexec.SynchronizerInput, 0, numInboxes)
+					synchronizerInputs   = make([]colexecargs.OpWithMetaInfo, 0, numInboxes)
 					streamID             = 0
 					addAnotherRemote     = rng.Float64() < 0.5
 				)
@@ -178,8 +180,8 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					diskAccounts[i] = &diskAcc
 					defer diskAcc.Close(ctxRemote)
 				}
-				createMetadataSourceForID := func(id int) execinfrapb.MetadataSource {
-					return execinfrapb.CallbackMetadataSource{
+				createMetadataSourceForID := func(id int) colexecop.MetadataSource {
+					return colexectestutils.CallbackMetadataSource{
 						DrainMetaCb: func(ctx context.Context) []execinfrapb.ProducerMetadata {
 							return []execinfrapb.ProducerMetadata{{Err: errors.Errorf("%d", id)}}
 						},
@@ -189,21 +191,22 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				// outboxes that drain these outputs. The outboxes will drain the router
 				// outputs which should in turn drain the HashRouter that will return
 				// this metadata.
-				toDrain := make([]execinfrapb.MetadataSource, numHashRouterOutputs)
+				toDrain := make([]colexecop.MetadataSource, numHashRouterOutputs)
 				for i := range toDrain {
 					toDrain[i] = createMetadataSourceForID(i)
 				}
 				hashRouter, hashRouterOutputs := colflow.NewHashRouter(
 					allocators,
-					hashRouterInput,
+					colexecargs.OpWithMetaInfo{
+						Root:            hashRouterInput,
+						MetadataSources: toDrain,
+					},
 					typs,
-					[]uint32{0},
-					64<<20,
+					[]uint32{0}, /* hashCols */
+					64<<20,      /* memoryLimit */
 					queueCfg,
 					&colexecop.TestingSemaphore{},
 					diskAccounts,
-					toDrain,
-					nil, /* toClose */
 				)
 				for i := 0; i < numInboxes; i++ {
 					inboxMemAccount := testMemMonitor.MakeBoundAccount()
@@ -218,14 +221,14 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					inboxes = append(inboxes, inbox)
 					synchronizerInputs = append(
 						synchronizerInputs,
-						colexec.SynchronizerInput{
-							Op:              colexecop.Operator(inbox),
-							MetadataSources: []execinfrapb.MetadataSource{inbox},
+						colexecargs.OpWithMetaInfo{
+							Root:            colexecop.Operator(inbox),
+							MetadataSources: []colexecop.MetadataSource{inbox},
 						},
 					)
 				}
 				synchronizer := colexec.NewParallelUnorderedSynchronizer(synchronizerInputs, &wg)
-				materializerMetadataSource := execinfrapb.MetadataSource(synchronizer)
+				materializerMetadataSource := colexecop.MetadataSource(synchronizer)
 				flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 
 				// idToClosed keeps track of whether Close was called for a given id.
@@ -241,20 +244,23 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					outboxInput colexecop.Operator,
 					inbox *colrpc.Inbox,
 					id int,
-					outboxMetadataSources []execinfrapb.MetadataSource,
+					outboxMetadataSources []colexecop.MetadataSource,
 				) {
 					idToClosed.Lock()
 					idToClosed.mapping[id] = false
 					idToClosed.Unlock()
 					outbox, err := colrpc.NewOutbox(
-						colmem.NewAllocator(ctx, outboxMemAcc, testColumnFactory), outboxInput, typs, outboxMetadataSources,
+						colmem.NewAllocator(ctx, outboxMemAcc, testColumnFactory),
+						outboxInput,
+						typs,
+						nil, /* getStats */
+						outboxMetadataSources,
 						[]colexecop.Closer{callbackCloser{closeCb: func() error {
 							idToClosed.Lock()
 							idToClosed.mapping[id] = true
 							idToClosed.Unlock()
 							return nil
 						}}},
-						nil, /* getStats */
 					)
 
 					require.NoError(t, err)
@@ -294,7 +300,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					outboxMemAccount := testMemMonitor.MakeBoundAccount()
 					defer outboxMemAccount.Close(ctxRemote)
 					if i < numHashRouterOutputs {
-						runOutboxInbox(ctxRemote, cancelRemote, &outboxMemAccount, hashRouterOutputs[i], inboxes[i], streamID, []execinfrapb.MetadataSource{hashRouterOutputs[i]})
+						runOutboxInbox(ctxRemote, cancelRemote, &outboxMemAccount, hashRouterOutputs[i], inboxes[i], streamID, []colexecop.MetadataSource{hashRouterOutputs[i]})
 					} else {
 						sourceMemAccount := testMemMonitor.MakeBoundAccount()
 						defer sourceMemAccount.Close(ctxRemote)
@@ -308,7 +314,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 							colexecop.NewRepeatableBatchSource(remoteAllocator, batch, typs),
 							inboxes[i],
 							streamID,
-							[]execinfrapb.MetadataSource{createMetadataSourceForID(streamID)},
+							[]colexecop.MetadataSource{createMetadataSourceForID(streamID)},
 						)
 					}
 					streamID++
@@ -337,7 +343,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 						synchronizer,
 						inbox,
 						streamID,
-						[]execinfrapb.MetadataSource{materializerMetadataSource, createMetadataSourceForID(streamID)},
+						[]colexecop.MetadataSource{materializerMetadataSource, createMetadataSourceForID(streamID)},
 					)
 					streamID++
 					// There is now only a single Inbox on the "local" node which is the
@@ -353,15 +359,16 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				materializer, err := colexec.NewMaterializer(
 					flowCtx,
 					1, /* processorID */
-					materializerInput,
+					colexecargs.OpWithMetaInfo{
+						Root:            materializerInput,
+						MetadataSources: colexecop.MetadataSources{materializerMetadataSource},
+						ToClose: colexecop.Closers{callbackCloser{closeCb: func() error {
+							materializerCalledClose = true
+							return nil
+						}}},
+					},
 					typs,
 					nil, /* output */
-					[]execinfrapb.MetadataSource{materializerMetadataSource},
-					[]colexecop.Closer{callbackCloser{closeCb: func() error {
-						materializerCalledClose = true
-						return nil
-					}}}, /* toClose */
-					nil, /* getStats */
 					func() context.CancelFunc { return cancelLocal },
 				)
 				require.NoError(t, err)

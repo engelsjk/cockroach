@@ -38,6 +38,8 @@ type tableReader struct {
 	limitHint   int64
 	parallelize bool
 
+	scanStarted bool
+
 	// See TableReaderSpec.MaxTimestampAgeNanos.
 	maxTimestampAge time.Duration
 
@@ -54,7 +56,6 @@ type tableReader struct {
 
 var _ execinfra.Processor = &tableReader{}
 var _ execinfra.RowSource = &tableReader{}
-var _ execinfrapb.MetadataSource = &tableReader{}
 var _ execinfra.Releasable = &tableReader{}
 var _ execinfra.OpNode = &tableReader{}
 
@@ -87,7 +88,7 @@ func newTableReader(
 	tr.parallelize = spec.Parallelize && tr.limitHint == 0
 	tr.maxTimestampAge = time.Duration(spec.MaxTimestampAgeNanos)
 
-	tableDesc := tabledesc.NewBuilder(&spec.Table).BuildImmutableTable()
+	tableDesc := spec.BuildTableDescriptor()
 	virtualColumn := tabledesc.FindVirtualColumn(tableDesc, spec.VirtualColumn)
 	cols := tableDesc.PublicColumns()
 	if spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic {
@@ -182,8 +183,13 @@ func (tr *tableReader) Start(ctx context.Context) {
 		log.Fatalf(ctx, "tableReader outside of txn")
 	}
 
+	// Keep ctx assignment so we remember StartInternal can make a new one.
 	ctx = tr.StartInternal(ctx, tableReaderProcName)
+	// Appease the linter.
+	_ = ctx
+}
 
+func (tr *tableReader) startScan(ctx context.Context) error {
 	limitBatches := !tr.parallelize
 	log.VEventf(ctx, 1, "starting scan with limitBatches %t", limitBatches)
 	var err error
@@ -201,10 +207,8 @@ func (tr *tableReader) Start(ctx context.Context) {
 			tr.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 		)
 	}
-
-	if err != nil {
-		tr.MoveToDraining(err)
-	}
+	tr.scanStarted = true
+	return err
 }
 
 // Release releases this tableReader back to the pool.
@@ -233,6 +237,13 @@ func TestingSetScannedRowProgressFrequency(val int64) func() {
 // Next is part of the RowSource interface.
 func (tr *tableReader) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	for tr.State == execinfra.StateRunning {
+		if !tr.scanStarted {
+			err := tr.startScan(tr.Ctx)
+			if err != nil {
+				tr.MoveToDraining(err)
+				break
+			}
+		}
 		// Check if it is time to emit a progress update.
 		if tr.rowsRead >= tableReaderProgressFrequency {
 			meta := execinfrapb.GetProducerMeta()
@@ -310,11 +321,6 @@ func (tr *tableReader) generateMeta(ctx context.Context) []execinfrapb.ProducerM
 	meta.Metrics.BytesRead = tr.fetcher.GetBytesRead()
 	meta.Metrics.RowsRead = tr.rowsRead
 	return append(trailingMeta, *meta)
-}
-
-// DrainMeta is part of the MetadataSource interface.
-func (tr *tableReader) DrainMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
-	return tr.generateMeta(ctx)
 }
 
 // ChildCount is part of the execinfra.OpNode interface.

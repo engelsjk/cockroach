@@ -49,6 +49,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/constraint"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -1201,7 +1202,7 @@ func (r *Replica) redirectOnOrAcquireLeaseForRequest(
 							var err error
 							if _, descErr := r.GetReplicaDescriptor(); descErr != nil {
 								err = descErr
-							} else if st := r.CurrentLeaseStatus(ctx); st.IsValid() {
+							} else if st := r.CurrentLeaseStatus(ctx); !st.IsValid() {
 								err = newNotLeaseHolderError(roachpb.Lease{}, r.store.StoreID(), r.Desc(),
 									"lease acquisition attempt lost to another lease, which has expired in the meantime")
 							} else {
@@ -1274,4 +1275,27 @@ func (r *Replica) maybeExtendLeaseAsync(ctx context.Context, st kvserverpb.Lease
 	}
 	// We explicitly ignore the returned handle as we won't block on it.
 	_ = r.requestLeaseLocked(ctx, st)
+}
+
+// checkLeaseRespectsPreferences checks if current replica owns the lease and
+// if it respects the lease preferences defined in the zone config. If there are no
+// preferences defined then it will return true and consider that to be in-conformance.
+func (r *Replica) checkLeaseRespectsPreferences(ctx context.Context) (bool, error) {
+	if !r.OwnsValidLease(ctx, r.store.cfg.Clock.NowAsClockTimestamp()) {
+		return false, errors.Errorf("replica %s is not the leaseholder, cannot check lease preferences", r)
+	}
+	_, zone := r.DescAndZone()
+	if len(zone.LeasePreferences) == 0 {
+		return true, nil
+	}
+	storeDesc, err := r.store.Descriptor(ctx, false /* useCached */)
+	if err != nil {
+		return false, err
+	}
+	for _, preference := range zone.LeasePreferences {
+		if constraint.ConjunctionsCheck(*storeDesc, preference.Constraints) {
+			return true, nil
+		}
+	}
+	return false, nil
 }

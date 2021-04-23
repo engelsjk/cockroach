@@ -461,13 +461,18 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	})
 	registry.AddMetricStruct(nodeLiveness.Metrics())
 
+	nodeLivenessFn := kvserver.MakeStorePoolNodeLivenessFunc(nodeLiveness)
+	if nodeLivenessKnobs, ok := cfg.TestingKnobs.Store.(*kvserver.NodeLivenessTestingKnobs); ok &&
+		nodeLivenessKnobs.StorePoolNodeLivenessFn != nil {
+		nodeLivenessFn = nodeLivenessKnobs.StorePoolNodeLivenessFn
+	}
 	storePool := kvserver.NewStorePool(
 		cfg.AmbientCtx,
 		st,
 		g,
 		clock,
 		nodeLiveness.GetNodeCount,
-		kvserver.MakeStorePoolNodeLivenessFunc(nodeLiveness),
+		nodeLivenessFn,
 		/* deterministic */ false,
 	)
 
@@ -1276,10 +1281,26 @@ func (s *Server) PreStart(ctx context.Context) error {
 	if s.cfg.TestingKnobs.Server != nil {
 		knobs := s.cfg.TestingKnobs.Server.(*TestingKnobs)
 		if knobs.SignalAfterGettingRPCAddress != nil {
+			log.Infof(ctx, "signaling caller that RPC address is ready")
 			close(knobs.SignalAfterGettingRPCAddress)
 		}
 		if knobs.PauseAfterGettingRPCAddress != nil {
-			<-knobs.PauseAfterGettingRPCAddress
+			log.Infof(ctx, "waiting for signal from caller to proceed with initialization")
+			select {
+			case <-knobs.PauseAfterGettingRPCAddress:
+				// Normal case. Just continue below.
+
+			case <-ctx.Done():
+				// Test timeout or some other condition in the caller, by which
+				// we are instructed to stop.
+				return errors.CombineErrors(errors.New("server stopping prematurely from context shutdown"), ctx.Err())
+
+			case <-s.stopper.ShouldQuiesce():
+				// The server is instructed to stop before it even finished
+				// starting up.
+				return errors.New("server stopping prematurely")
+			}
+			log.Infof(ctx, "caller is letting us proceed with initialization")
 		}
 	}
 
@@ -1829,6 +1850,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 	if err := s.debug.RegisterEngines(s.cfg.Stores.Specs, s.engines); err != nil {
 		return errors.Wrapf(err, "failed to register engines with debug server")
 	}
+	s.debug.RegisterClosedTimestampSideTransport(s.ctSender, s.node.storeCfg.ClosedTimestampReceiver)
 
 	s.ctSender.Run(ctx, state.nodeID)
 

@@ -44,7 +44,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -69,7 +68,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
 	"google.golang.org/grpc"
@@ -338,6 +336,14 @@ func (ts *TestServer) Gossip() *gossip.Gossip {
 	return nil
 }
 
+// RangeFeedFactory is part of serverutils.TestServerInterface.
+func (ts *TestServer) RangeFeedFactory() interface{} {
+	if ts != nil {
+		return ts.sqlServer.execCfg.RangeFeedFactory
+	}
+	return (*rangefeed.Factory)(nil)
+}
+
 // Clock returns the clock used by the TestServer.
 func (ts *TestServer) Clock() *hlc.Clock {
 	if ts != nil {
@@ -454,8 +460,7 @@ func (ts *TestServer) NodeDialer() *nodedialer.Dialer {
 // TestServer.ServingRPCAddr() after Start() for client connections.
 // Use TestServer.Stopper().Stop() to shutdown the server after the test
 // completes.
-func (ts *TestServer) Start() error {
-	ctx := context.Background()
+func (ts *TestServer) Start(ctx context.Context) error {
 	return ts.Server.Start(ctx)
 }
 
@@ -633,10 +638,6 @@ func makeSQLServerArgs(
 		circularJobRegistry:      &jobs.Registry{},
 		protectedtsProvider:      protectedTSProvider,
 		rangeFeedFactory:         rangeFeedFactory,
-		sqlStatusServer: newTenantStatusServer(
-			baseCfg.AmbientCtx, &adminPrivilegeChecker{ie: circularInternalExecutor},
-			sessionRegistry, contentionRegistry, baseCfg.Settings,
-		),
 	}, nil
 }
 
@@ -669,6 +670,11 @@ func (t *TestTenant) PGServer() interface{} {
 // DiagnosticsReporter is part of the TestTenantInterface interface.
 func (t *TestTenant) DiagnosticsReporter() interface{} {
 	return t.diagnosticsReporter
+}
+
+// StatusServer is part of the TestTenantInterface interface.
+func (t *TestTenant) StatusServer() interface{} {
+	return t.execCfg.SQLStatusServer
 }
 
 // SetupIdleMonitor will monitor the active connections and if there are none,
@@ -744,157 +750,6 @@ func (ts *TestServer) StartTenant(
 		sqlCfg,
 	)
 	return &TestTenant{SQLServer: sqlServer, sqlAddr: addr, httpAddr: httpAddr}, err
-}
-
-// StartTenant starts a stand-alone SQL server against a KV backend.
-func StartTenant(
-	ctx context.Context,
-	stopper *stop.Stopper,
-	kvClusterName string, // NB: gone after https://github.com/cockroachdb/cockroach/issues/42519
-	baseCfg BaseConfig,
-	sqlCfg SQLConfig,
-) (sqlServer *SQLServer, pgAddr string, httpAddr string, _ error) {
-	args, err := makeSQLServerArgs(stopper, kvClusterName, baseCfg, sqlCfg)
-	if err != nil {
-		return nil, "", "", err
-	}
-	s, err := newSQLServer(ctx, args)
-	if err != nil {
-		return nil, "", "", err
-	}
-
-	// TODO(asubiotto): remove this. Right now it is needed to initialize the
-	// SpanResolver.
-	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: 0})
-
-	connManager := netutil.MakeServer(
-		args.stopper,
-		// The SQL server only uses connManager.ServeWith. The both below
-		// are unused.
-		nil, // tlsConfig
-		nil, // handler
-	)
-	knobs := baseCfg.TestingKnobs.TenantTestingKnobs
-	if tenantKnobs, ok := knobs.(*sql.TenantTestingKnobs); ok && tenantKnobs.IdleExitCountdownDuration != 0 {
-		SetupIdleMonitor(ctx, args.stopper, baseCfg.IdleExitAfter, connManager, tenantKnobs.IdleExitCountdownDuration)
-	} else {
-		SetupIdleMonitor(ctx, args.stopper, baseCfg.IdleExitAfter, connManager)
-	}
-
-	pgL, err := ListenAndUpdateAddrs(ctx, &args.Config.SQLAddr, &args.Config.SQLAdvertiseAddr, "sql")
-	if err != nil {
-		return nil, "", "", err
-	}
-
-	{
-		waitQuiesce := func(ctx context.Context) {
-			<-args.stopper.ShouldQuiesce()
-			// NB: we can't do this as a Closer because (*Server).ServeWith is
-			// running in a worker and usually sits on accept(pgL) which unblocks
-			// only when pgL closes. In other words, pgL needs to close when
-			// quiescing starts to allow that worker to shut down.
-			_ = pgL.Close()
-		}
-		if err := args.stopper.RunAsyncTask(ctx, "wait-quiesce-pgl", waitQuiesce); err != nil {
-			waitQuiesce(ctx)
-			return nil, "", "", err
-		}
-	}
-
-	httpL, err := ListenAndUpdateAddrs(ctx, &args.Config.HTTPAddr, &args.Config.HTTPAdvertiseAddr, "http")
-	if err != nil {
-		return nil, "", "", err
-	}
-
-	{
-		waitQuiesce := func(ctx context.Context) {
-			<-args.stopper.ShouldQuiesce()
-			_ = httpL.Close()
-		}
-		if err := args.stopper.RunAsyncTask(ctx, "wait-quiesce-http", waitQuiesce); err != nil {
-			waitQuiesce(ctx)
-			return nil, "", "", err
-		}
-	}
-
-	pgLAddr := pgL.Addr().String()
-	httpLAddr := httpL.Addr().String()
-	args.recorder.AddNode(
-		args.registry,
-		roachpb.NodeDescriptor{},
-		timeutil.Now().UnixNano(),
-		pgLAddr,   // advertised addr
-		httpLAddr, // http addr
-		pgLAddr,   // sql addr
-	)
-
-	if err := args.stopper.RunAsyncTask(ctx, "serve-http", func(ctx context.Context) {
-		mux := http.NewServeMux()
-		debugServer := debug.NewServer(args.Settings, s.pgServer.HBADebugFn())
-		mux.Handle("/", debugServer)
-		mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
-			// Return Bad Request if called with arguments.
-			if err := req.ParseForm(); err != nil || len(req.Form) != 0 {
-				http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-				return
-			}
-		})
-		f := varsHandler{metricSource: args.recorder, st: args.Settings}.handleVars
-		mux.Handle(statusVars, http.HandlerFunc(f))
-		_ = http.Serve(httpL, mux)
-	}); err != nil {
-		return nil, "", "", err
-	}
-
-	const (
-		socketFile = "" // no unix socket
-	)
-	orphanedLeasesTimeThresholdNanos := args.clock.Now().WallTime
-
-	// TODO(tbg): the log dir is not configurable at this point
-	// since it is integrated too tightly with the `./cockroach start` command.
-	if err := startSampleEnvironment(ctx, sampleEnvironmentCfg{
-		st:                   args.Settings,
-		stopper:              args.stopper,
-		minSampleInterval:    base.DefaultMetricsSampleInterval,
-		goroutineDumpDirName: args.GoroutineDumpDirName,
-		heapProfileDirName:   args.HeapProfileDirName,
-		runtime:              args.runtime,
-	}); err != nil {
-		return nil, "", "", err
-	}
-
-	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: roachpb.NodeID(args.nodeIDContainer.SQLInstanceID())})
-
-	if err := s.preStart(ctx,
-		args.stopper,
-		args.TestingKnobs,
-		connManager,
-		pgL,
-		socketFile,
-		orphanedLeasesTimeThresholdNanos,
-	); err != nil {
-		return nil, "", "", err
-	}
-
-	// Register the server's identifiers so that log events are
-	// decorated with the server's identity. This helps when gathering
-	// log events from multiple servers into the same log collector.
-	//
-	// We do this only here, as the identifiers may not be known before this point.
-	clusterID := args.rpcContext.ClusterID.Get().String()
-	log.SetNodeIDs(clusterID, 0 /* nodeID is not known for a SQL-only server. */)
-	log.SetTenantIDs(args.TenantID.String(), int32(s.SQLInstanceID()))
-
-	if err := s.startServeSQL(ctx,
-		args.stopper,
-		s.connManager,
-		s.pgL,
-		socketFile); err != nil {
-		return nil, "", "", err
-	}
-
-	return s, pgLAddr, httpLAddr, nil
 }
 
 // ExpectedInitialRangeCount returns the expected number of ranges that should
@@ -986,6 +841,12 @@ func (ts *TestServer) SQLAddr() string {
 // DrainClients exports the drainClients() method for use by tests.
 func (ts *TestServer) DrainClients(ctx context.Context) error {
 	return ts.drainClients(ctx, nil /* reporter */)
+}
+
+// Readiness returns nil when the server's health probe reports
+// readiness, a readiness error otherwise.
+func (ts *TestServer) Readiness(ctx context.Context) error {
+	return ts.admin.checkReadinessForHealthCheck(ctx)
 }
 
 // WriteSummaries implements TestServerInterface.
@@ -1377,13 +1238,46 @@ func (ts *TestServer) SplitRange(
 	return ts.SplitRangeWithExpiration(splitKey, hlc.MaxTimestamp)
 }
 
-// GetRangeLease returns the current lease for the range containing key, and a
-// timestamp taken from the node.
+// LeaseInfo describes a range's current and potentially future lease.
+type LeaseInfo struct {
+	cur, next roachpb.Lease
+}
+
+// Current returns the range's current lease.
+func (l LeaseInfo) Current() roachpb.Lease {
+	return l.cur
+}
+
+// CurrentOrProspective returns the range's potential next lease, if a lease
+// request is in progress, or the current lease otherwise.
+func (l LeaseInfo) CurrentOrProspective() roachpb.Lease {
+	if !l.next.Empty() {
+		return l.next
+	}
+	return l.cur
+}
+
+// LeaseInfoOpt enumerates options for GetRangeLease.
+type LeaseInfoOpt int
+
+const (
+	// AllowQueryToBeForwardedToDifferentNode specifies that, if the current node
+	// doesn't have a voter replica, the lease info can come from a different
+	// node.
+	AllowQueryToBeForwardedToDifferentNode LeaseInfoOpt = iota
+	// QueryLocalNodeOnly specifies that an error should be returned if the node
+	// is not able to serve the lease query (because it doesn't have a voting
+	// replica).
+	QueryLocalNodeOnly
+)
+
+// GetRangeLease returns information on the lease for the range containing key, and a
+// timestamp taken from the node. The lease is returned regardless of its status.
 //
-// The lease is returned regardless of its status.
+// queryPolicy specifies if its OK to forward the request to a different node.
 func (ts *TestServer) GetRangeLease(
-	ctx context.Context, key roachpb.Key,
-) (_ roachpb.Lease, now hlc.ClockTimestamp, _ error) {
+	ctx context.Context, key roachpb.Key, queryPolicy LeaseInfoOpt,
+) (_ LeaseInfo, now hlc.ClockTimestamp, _ error) {
 	leaseReq := roachpb.LeaseInfoRequest{
 		RequestHeader: roachpb.RequestHeader{
 			Key: key,
@@ -1401,10 +1295,25 @@ func (ts *TestServer) GetRangeLease(
 		&leaseReq,
 	)
 	if pErr != nil {
-		return roachpb.Lease{}, hlc.ClockTimestamp{}, pErr.GoError()
+		return LeaseInfo{}, hlc.ClockTimestamp{}, pErr.GoError()
 	}
-	return leaseResp.(*roachpb.LeaseInfoResponse).Lease, ts.Clock().NowAsClockTimestamp(), nil
-
+	// Adapt the LeaseInfoResponse format to LeaseInfo.
+	resp := leaseResp.(*roachpb.LeaseInfoResponse)
+	if queryPolicy == QueryLocalNodeOnly && resp.EvaluatedBy != ts.GetFirstStoreID() {
+		// TODO(andrei): Figure out how to deal with nodes with multiple stores.
+		// This API API should permit addressing the query to a particular store.
+		return LeaseInfo{}, hlc.ClockTimestamp{}, errors.Errorf(
+			"request not evaluated locally; evaluated by s%d instead of local s%d",
+			resp.EvaluatedBy, ts.GetFirstStoreID())
+	}
+	var l LeaseInfo
+	if resp.CurrentLease != nil {
+		l.cur = *resp.CurrentLease
+		l.next = resp.Lease
+	} else {
+		l.cur = resp.Lease
+	}
+	return l, ts.Clock().NowAsClockTimestamp(), nil
 }
 
 // ExecutorConfig is part of the TestServerInterface.

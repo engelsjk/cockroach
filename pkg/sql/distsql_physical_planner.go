@@ -395,10 +395,11 @@ func checkSupportForPlanNode(node planNode) (distRecommendation, error) {
 		if err := checkExpr(n.onExpr); err != nil {
 			return cannotDistribute, err
 		}
-		if _, err := checkSupportForPlanNode(n.input); err != nil {
+		rec, err := checkSupportForPlanNode(n.input)
+		if err != nil {
 			return cannotDistribute, err
 		}
-		return shouldDistribute, nil
+		return rec.compose(shouldDistribute), nil
 
 	case *joinNode:
 		if err := checkExpr(n.pred.onCond); err != nil {
@@ -442,10 +443,11 @@ func checkSupportForPlanNode(node planNode) (distRecommendation, error) {
 		if err := checkExpr(n.onCond); err != nil {
 			return cannotDistribute, err
 		}
-		if _, err := checkSupportForPlanNode(n.input); err != nil {
+		rec, err := checkSupportForPlanNode(n.input)
+		if err != nil {
 			return cannotDistribute, err
 		}
-		return shouldDistribute, nil
+		return rec.compose(shouldDistribute), nil
 
 	case *ordinalityNode:
 		// WITH ORDINALITY never gets distributed so that the gateway node can
@@ -620,7 +622,7 @@ type PlanningCtx struct {
 	// else (like sub- and postqueries, or EXPLAIN ANALYZE) should set this to
 	// true to avoid double closes of the planNode tree.
 	ignoreClose bool
-	stmtType    tree.StatementType
+	stmtType    tree.StatementReturnType
 	// planDepth is set to the current depth of the planNode tree. It's used to
 	// keep track of whether it's valid to run a root node in a special fast path
 	// mode.
@@ -905,7 +907,21 @@ func (dsp *DistSQLPlanner) PartitionSpans(
 	// nodeMap maps a nodeID to an index inside the partitions array.
 	nodeMap := make(map[roachpb.NodeID]int)
 	it := planCtx.spanIter
-	for _, span := range spans {
+	for i := range spans {
+
+		span := spans[i]
+		if len(span.EndKey) == 0 {
+			// If we see a span to partition that has no end key, it means that we're
+			// going to do a point lookup on the start key of this span.
+			//
+			// The code below us doesn't really tolerate spans without an EndKey, so
+			// we manufacture a single-key span for this case.
+			span = roachpb.Span{
+				Key:    span.Key,
+				EndKey: span.Key.Next(),
+			}
+		}
+
 		// rSpan is the span we are currently partitioning.
 		rSpan, err := keys.SpanAddr(span)
 		if err != nil {
@@ -1009,10 +1025,9 @@ func (dsp *DistSQLPlanner) nodeVersionIsCompatible(nodeID roachpb.NodeID) bool {
 	return distsql.FlowVerIsCompatible(dsp.planVersion, v.MinAcceptedVersion, v.Version)
 }
 
-func getIndexIdx(index *descpb.IndexDescriptor, desc catalog.TableDescriptor) (uint32, error) {
-	foundIndex, _ := desc.FindIndexWithID(index.ID)
-	if foundIndex != nil && foundIndex.Public() {
-		return uint32(foundIndex.Ordinal()), nil
+func getIndexIdx(index catalog.Index, desc catalog.TableDescriptor) (uint32, error) {
+	if index.Public() {
+		return uint32(index.Ordinal()), nil
 	}
 	return 0, errors.Errorf("invalid index %v (table %s)", index, desc.GetName())
 }
@@ -1323,11 +1338,9 @@ func (dsp *DistSQLPlanner) planTableReaders(
 
 		tr.Parallelize = info.parallelize
 		p.TotalEstimatedScannedRows += info.estimatedRowCount
-		if info.estimatedRowCount > p.MaxEstimatedRowCount {
-			p.MaxEstimatedRowCount = info.estimatedRowCount
-		}
 
 		corePlacement[i].NodeID = sp.Node
+		corePlacement[i].EstimatedRowCount = info.estimatedRowCount
 		corePlacement[i].Core.TableReader = tr
 	}
 
@@ -1593,12 +1606,17 @@ func (dsp *DistSQLPlanner) planAggregators(
 	var finalAggsSpec execinfrapb.AggregatorSpec
 	var finalAggsPost execinfrapb.PostProcessSpec
 
+	// Note that we pass in nil as the second argument because we will have a
+	// simple 1-to-1 PlanToStreamColMap in the end.
+	finalOutputOrdering := dsp.convertOrdering(info.reqOrdering, nil /* planToStreamColMap */)
+
 	if !multiStage {
 		finalAggsSpec = execinfrapb.AggregatorSpec{
 			Type:             aggType,
 			Aggregations:     info.aggregations,
 			GroupCols:        groupCols,
 			OrderedGroupCols: orderedGroupCols,
+			OutputOrdering:   finalOutputOrdering,
 		}
 	} else {
 		// Some aggregations might need multiple aggregation as part of
@@ -1768,7 +1786,7 @@ func (dsp *DistSQLPlanner) planAggregators(
 		finalOrderedGroupCols := make([]uint32, 0, len(orderedGroupCols))
 		for i, groupColIdx := range groupCols {
 			agg := execinfrapb.AggregatorSpec_Aggregation{
-				Func:   execinfrapb.AggregatorSpec_ANY_NOT_NULL,
+				Func:   execinfrapb.AnyNotNull,
 				ColIdx: []uint32{groupColIdx},
 			}
 			// See if there already is an aggregation like the one
@@ -1820,6 +1838,7 @@ func (dsp *DistSQLPlanner) planAggregators(
 			Aggregations:     localAggs,
 			GroupCols:        groupCols,
 			OrderedGroupCols: orderedGroupCols,
+			OutputOrdering:   execinfrapb.Ordering{Columns: ordCols},
 		}
 
 		p.AddNoGroupingStage(
@@ -1834,6 +1853,7 @@ func (dsp *DistSQLPlanner) planAggregators(
 			Aggregations:     finalAggs,
 			GroupCols:        finalGroupCols,
 			OrderedGroupCols: finalOrderedGroupCols,
+			OutputOrdering:   finalOutputOrdering,
 		}
 
 		if needRender {
@@ -2026,7 +2046,7 @@ func (dsp *DistSQLPlanner) createPlanForIndexJoin(
 	plan.PlanToStreamColMap = identityMap(plan.PlanToStreamColMap, len(n.cols))
 
 	for i := range n.cols {
-		ord := tableOrdinal(n.table.desc, n.cols[i].ID, n.table.colCfg.visibility)
+		ord := tableOrdinal(n.table.desc, n.cols[i].GetID(), n.table.colCfg.visibility)
 		post.OutputColumns[i] = uint32(ord)
 	}
 
@@ -3310,15 +3330,8 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 		return nil, err
 	}
 
-	if len(leftPlan.MergeOrdering.Columns) != 0 || len(rightPlan.MergeOrdering.Columns) != 0 {
-		return nil, errors.AssertionFailedf("set op inputs should have no orderings")
-	}
-
-	// TODO(radu): for INTERSECT and EXCEPT, the mergeOrdering should be set when
-	// we can use merge joiners below. The optimizer needs to be modified to take
-	// advantage of this optimization and pass down merge orderings. Tracked by
-	// #40797.
-	var mergeOrdering execinfrapb.Ordering
+	// Set the merge ordering.
+	mergeOrdering := dsp.convertOrdering(n.reqOrdering, p.PlanToStreamColMap)
 
 	// Merge processors, streams, result routers, and stage counter.
 	leftRouters := leftPlan.ResultRouters
@@ -3388,9 +3401,6 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 				// result, the plan will end up with a serial unordered synchronizer,
 				// which has exactly the behavior that we want (in particular, it won't
 				// execute the right child if the limit is reached by the left child).
-				// TODO(rytaft,yuzefovich): This currently only works with the
-				// vectorized engine. We should consider adding support for the serial
-				// unordered synchronizer in the row-based engine (see #61081).
 				p.EnsureSingleStreamPerNode(
 					false, /* forceSerialization */
 					execinfrapb.PostProcessSpec{Limit: n.hardLimit},
@@ -3456,11 +3466,6 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 				leftPlan.MergeOrdering, rightPlan.MergeOrdering,
 				leftRouters, rightRouters, resultTypes,
 			)
-		}
-
-		// An EXCEPT ALL is like a left outer join, so there is no guaranteed ordering.
-		if n.unionType == tree.ExceptOp {
-			mergeOrdering = execinfrapb.Ordering{}
 		}
 
 		p.SetMergeOrdering(mergeOrdering)

@@ -44,6 +44,7 @@ import {
   trackStatementsSearchAction,
   trackTableSortAction,
 } from "src/redux/analyticsActions";
+import { resetSQLStatsAction } from "src/redux/sqlStats";
 
 type ICollectedStatementStatistics = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 type IStatementDiagnosticsReport = protos.cockroach.server.serverpb.IStatementDiagnosticsReport;
@@ -78,7 +79,7 @@ export const selectStatements = createSelector(
     const isInternal = (statement: ExecutionStatistics) =>
       statement.app.startsWith(state.data.internal_app_name_prefix);
 
-    if (app) {
+    if (app && app !== "All") {
       let criteria = decodeURIComponent(app);
       let showInternal = false;
       if (criteria === "(unset)") {
@@ -90,10 +91,6 @@ export const selectStatements = createSelector(
       statements = statements.filter(
         (statement: ExecutionStatistics) =>
           (showInternal && isInternal(statement)) || statement.app === criteria,
-      );
-    } else {
-      statements = statements.filter(
-        (statement: ExecutionStatistics) => !isInternal(statement),
       );
     }
 
@@ -198,6 +195,7 @@ export default withRouter(
     {
       refreshStatements,
       refreshStatementDiagnosticsRequests,
+      resetSQLStats: resetSQLStatsAction,
       dismissAlertMessage: () =>
         createStatementDiagnosticsAlertLocalSetting.set({ show: false }),
       onActivateStatementDiagnostics: createStatementDiagnosticsReportAction,

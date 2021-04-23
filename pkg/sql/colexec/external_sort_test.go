@@ -455,7 +455,7 @@ func BenchmarkExternalSort(b *testing.B) {
 func createDiskBackedSorter(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
-	input []colexecop.Operator,
+	sources []colexecop.Operator,
 	typs []*types.T,
 	ordCols []execinfrapb.Ordering_Column,
 	matchLen int,
@@ -482,17 +482,14 @@ func createDiskBackedSorter(
 	}
 	args := &colexecargs.NewColOperatorArgs{
 		Spec:                spec,
-		Inputs:              input,
+		Inputs:              colexectestutils.MakeInputs(sources),
 		StreamingMemAccount: testMemAcc,
 		DiskQueueCfg:        diskQueueCfg,
 		FDSemaphore:         testingSemaphore,
 	}
-	// External sorter relies on different memory accounts to
-	// understand when to start a new partition, so we will not use
-	// the streaming memory account.
 	args.TestingKnobs.SpillingCallbackFn = spillingCallbackFn
 	args.TestingKnobs.NumForcedRepartitions = numForcedRepartitions
 	args.TestingKnobs.DelegateFDAcquisitions = delegateFDAcquisitions
 	result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
-	return result.Op, result.OpAccounts, result.OpMonitors, result.ToClose, err
+	return result.Root, result.OpAccounts, result.OpMonitors, result.ToClose, err
 }

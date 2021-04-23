@@ -56,12 +56,14 @@ import (
 )
 
 const (
-	backupOptRevisionHistory = "revision_history"
-	backupOptEncPassphrase   = "encryption_passphrase"
-	backupOptEncKMS          = "kms"
-	backupOptWithPrivileges  = "privileges"
-	localityURLParam         = "COCKROACH_LOCALITY"
-	defaultLocalityValue     = "default"
+	backupOptRevisionHistory    = "revision_history"
+	backupOptIncludeInterleaves = "include_deprecated_interleaves"
+	backupOptEncPassphrase      = "encryption_passphrase"
+	backupOptEncKMS             = "kms"
+	backupOptWithPrivileges     = "privileges"
+	backupOptAsJSON             = "as_json"
+	localityURLParam            = "COCKROACH_LOCALITY"
+	defaultLocalityValue        = "default"
 )
 
 type encryptionMode int
@@ -182,29 +184,41 @@ func getLogicallyMergedTableSpans(
 	endTime hlc.Timestamp,
 	checkForKVInBounds func(start, end roachpb.Key, endTime hlc.Timestamp) (bool, error),
 ) ([]roachpb.Span, error) {
-	var nonDropIndexIDs []descpb.IndexID
-	if err := catalog.ForEachNonDropIndex(table, func(idx catalog.Index) error {
+	// Spans with adding indexes are not safe to include in the backup since
+	// they may see non-transactional AddSST traffic. Future incremental backups
+	// will not have a way of incrementally backing up the data until #62585 is
+	// resolved.
+	addingIndexIDs := make(map[descpb.IndexID]struct{})
+	var publicIndexIDs []descpb.IndexID
+
+	allPhysicalIndexOpts := catalog.IndexOpts{DropMutations: true, AddMutations: true}
+	if err := catalog.ForEachIndex(table, allPhysicalIndexOpts, func(idx catalog.Index) error {
 		key := tableAndIndex{tableID: table.GetID(), indexID: idx.GetID()}
 		if added[key] {
 			return nil
 		}
 		added[key] = true
-		nonDropIndexIDs = append(nonDropIndexIDs, idx.GetID())
+		if idx.Public() {
+			publicIndexIDs = append(publicIndexIDs, idx.GetID())
+		}
+		if idx.Adding() {
+			addingIndexIDs[idx.GetID()] = struct{}{}
+		}
 		return nil
 	}); err != nil {
 		return nil, err
 	}
 
-	if len(nonDropIndexIDs) == 0 {
+	if len(publicIndexIDs) == 0 {
 		return nil, nil
 	}
 
 	// There is no merging possible with only a single index, short circuit.
-	if len(nonDropIndexIDs) == 1 {
-		return []roachpb.Span{table.IndexSpan(codec, nonDropIndexIDs[0])}, nil
+	if len(publicIndexIDs) == 1 {
+		return []roachpb.Span{table.IndexSpan(codec, publicIndexIDs[0])}, nil
 	}
 
-	sort.Sort(sortedIndexIDs(nonDropIndexIDs))
+	sort.Sort(sortedIndexIDs(publicIndexIDs))
 
 	var mergedIndexSpans []roachpb.Span
 
@@ -218,10 +232,10 @@ func getLogicallyMergedTableSpans(
 	// mergedSpan to encompass the lhsSpan as that is the furthest we can go.
 	// After recording the new "merged" span, we update mergedSpan to be the
 	// rhsSpan, and start processing the next logically mergeable span set.
-	mergedSpan := table.IndexSpan(codec, nonDropIndexIDs[0])
-	for curIndex := 0; curIndex < len(nonDropIndexIDs)-1; curIndex++ {
-		lhsIndexID := nonDropIndexIDs[curIndex]
-		rhsIndexID := nonDropIndexIDs[curIndex+1]
+	mergedSpan := table.IndexSpan(codec, publicIndexIDs[0])
+	for curIndex := 0; curIndex < len(publicIndexIDs)-1; curIndex++ {
+		lhsIndexID := publicIndexIDs[curIndex]
+		rhsIndexID := publicIndexIDs[curIndex+1]
 
 		lhsSpan := table.IndexSpan(codec, lhsIndexID)
 		rhsSpan := table.IndexSpan(codec, rhsIndexID)
@@ -244,17 +258,27 @@ func getLogicallyMergedTableSpans(
 			mergedSpan = rhsSpan
 		} else {
 			var foundDroppedKV bool
-			// Iterate over all index IDs between the two candidates (lhs and rhs)
-			// which may be logically merged. These index IDs represent dropped
-			// indexes between the two non-drop index spans.
+			// Iterate over all index IDs between the two candidates (lhs and
+			// rhs) which may be logically merged. These index IDs represent
+			// non-public (and perhaps dropped) indexes between the two public
+			// index spans.
 			for i := lhsIndexID + 1; i < rhsIndexID; i++ {
-				// If we find an index which has been dropped but not gc'ed, we cannot
-				// merge the lhs and rhs spans.
+				// If we find an index which has been dropped but not gc'ed, we
+				// cannot merge the lhs and rhs spans.
 				foundDroppedKV, err = checkForKVInBounds(lhsSpan.EndKey, rhsSpan.Key, endTime)
 				if err != nil {
 					return nil, err
 				}
-				if foundDroppedKV {
+				// If we find an index that is being added, don't merge the
+				// spans. We don't want to backup data that is being backfilled
+				// until the backfill is complete. Even if the backfill has not
+				// started yet and there is not data we should not include this
+				// span in the spans to back up since we want these spans to
+				// appear as introduced when the index becomes PUBLIC.
+				// The indexes will appear in introduced spans because indexes
+				// will never go from PUBLIC to ADDING.
+				_, foundAddingIndex := addingIndexIDs[i]
+				if foundDroppedKV || foundAddingIndex {
 					mergedSpan.EndKey = lhsSpan.EndKey
 					mergedIndexSpans = append(mergedIndexSpans, mergedSpan)
 					mergedSpan = rhsSpan
@@ -264,9 +288,9 @@ func getLogicallyMergedTableSpans(
 		}
 
 		// The loop will terminate after this iteration and so we must update the
-		// current mergedSpan to encompass the last element in the nonDropIndexIDs
+		// current mergedSpan to encompass the last element in the indexIDs
 		// slice as well.
-		if curIndex == len(nonDropIndexIDs)-2 {
+		if curIndex == len(publicIndexIDs)-2 {
 			mergedSpan.EndKey = rhsSpan.EndKey
 			mergedIndexSpans = append(mergedIndexSpans, mergedSpan)
 		}
@@ -330,10 +354,8 @@ func spansForAllTableIndexes(
 		// at least 2 revisions, and the first one should have the table in a PUBLIC
 		// state. We want (and do) ignore tables that have been dropped for the
 		// entire interval. DROPPED tables should never later become PUBLIC.
-		// TODO(pbardea): Consider and test the interaction between revision_history
-		// backups and OFFLINE tables.
 		rawTbl, _, _, _ := descpb.FromDescriptor(rev.Desc)
-		if rawTbl != nil && rawTbl.State != descpb.DescriptorState_DROP {
+		if rawTbl != nil && rawTbl.State == descpb.DescriptorState_PUBLIC {
 			tbl := tabledesc.NewBuilder(rawTbl).BuildImmutableTable()
 			revSpans, err := getLogicallyMergedTableSpans(tbl, added, execCfg.Codec, rev.Time,
 				checkForKVInBounds)
@@ -360,10 +382,9 @@ func spansForAllTableIndexes(
 	})
 
 	// Attempt to merge any contiguous spans generated from the tables and revs.
-	mergedSpans, distinct := roachpb.MergeSpans(spans)
-	if !distinct {
-		return nil, errors.NewAssertionErrorWithWrappedErrf(errors.New("expected all resolved spans for the BACKUP to be distinct"), "IndexSpan")
-	}
+	// No need to check if the spans are distinct, since some of the merged
+	// indexes may overlap between different revisions of the same descriptor.
+	mergedSpans, _ := roachpb.MergeSpans(spans)
 
 	knobs := execCfg.BackupRestoreTestingKnobs
 	if knobs != nil && knobs.CaptureResolvedTableDescSpans != nil {
@@ -834,6 +855,16 @@ func backupPlanHook(
 			return errors.AssertionFailedf("unexpected descriptor coverage %v", backupStmt.Coverage())
 		}
 
+		if !backupStmt.Options.IncludeDeprecatedInterleaves {
+			for _, desc := range targetDescs {
+				if table, ok := desc.(catalog.TableDescriptor); ok {
+					if table.IsInterleaved() {
+						return errors.Errorf("interleaved tables are deprecated and backups containing interleaved tables will not be able to be RESTORE'd by future versions -- use option %q to backup interleaved tables anyway %q", backupOptIncludeInterleaves, table.TableDesc().Name)
+					}
+				}
+			}
+		}
+
 		// Check BACKUP privileges.
 		err = checkPrivilegesForBackup(ctx, backupStmt, p, targetDescs, to)
 		if err != nil {
@@ -1036,9 +1067,8 @@ func backupPlanHook(
 			_, coveredTime, err := makeImportSpans(
 				spans,
 				prevBackups,
-				nil, /*backupLocalityInfo*/
-				keys.MinKey,
-				p.User(),
+				nil,         /*backupLocalityMaps*/
+				keys.MinKey, /* lowWatermark */
 				func(span covering.Range, start, end hlc.Timestamp) error {
 					if start.IsEmpty() {
 						newSpans = append(newSpans, roachpb.Span{Key: span.Start, EndKey: span.End})
@@ -1050,6 +1080,13 @@ func backupPlanHook(
 			if err != nil {
 				return errors.Wrap(err, "invalid previous backups")
 			}
+
+			tableSpans, err := getReintroducedSpans(ctx, p, prevBackups, tables, revs, endTime)
+			if err != nil {
+				return err
+			}
+			newSpans = append(newSpans, tableSpans...)
+
 			if coveredTime != startTime {
 				return errors.Errorf("expected previous backups to cover until time %v, got %v", startTime, coveredTime)
 			}
@@ -1078,6 +1115,7 @@ func backupPlanHook(
 			IntroducedSpans:     newSpans,
 			FormatVersion:       BackupFormatDescriptorTrackingVersion,
 			BuildInfo:           build.GetInfo(),
+			ClusterVersion:      p.ExecCfg().Settings.Version.ActiveVersion(ctx).Version,
 			ClusterID:           p.ExecCfg().ClusterID(),
 			StatisticsFilenames: statsFiles,
 			DescriptorCoverage:  backupStmt.Coverage(),
@@ -1091,7 +1129,6 @@ func backupPlanHook(
 			append(prevBackups, backupManifest),
 			nil, /*backupLocalityInfo*/
 			keys.MinKey,
-			p.User(),
 			errOnMissingRange,
 		); err != nil {
 			return err
@@ -1266,24 +1303,39 @@ func backupPlanHook(
 			return nil
 		}
 
+		// We create the job record in the planner's transaction to ensure that
+		// the job record creation happens transactionally.
+		plannerTxn := p.ExtendedEvalContext().Txn
+
+		// Construct the job and commit the transaction. Perform this work in a
+		// closure to ensure that the job is cleaned up if an error occurs.
 		var sj *jobs.StartableJob
-		jobID := p.ExecCfg().JobRegistry.MakeJobID()
-		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-			if err := p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, txn, jr); err != nil {
+		if err := func() (err error) {
+			defer func() {
+				if err == nil || sj == nil {
+					return
+				}
+				if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
+					log.Errorf(ctx, "failed to cleanup job: %v", cleanupErr)
+				}
+			}()
+			jobID := p.ExecCfg().JobRegistry.MakeJobID()
+			if err := p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, plannerTxn, jr); err != nil {
 				return err
 			}
 			if err := doWriteBackupManifestCheckpoint(ctx, jobID); err != nil {
 				return err
 			}
-
-			return protectTimestampForBackup(ctx, p, txn, jobID, spans, startTime, endTime,
-				backupDetails)
-		}); err != nil {
-			if sj != nil {
-				if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
-					log.Warningf(ctx, "failed to cleanup StartableJob: %v", cleanupErr)
-				}
+			if err := protectTimestampForBackup(ctx, p, plannerTxn, jobID, spans, startTime, endTime, backupDetails); err != nil {
+				return err
 			}
+
+			// We commit the transaction here so that the job can be started. This
+			// is safe because we're in an implicit transaction. If we were in an
+			// explicit transaction the job would have to be run with the detached
+			// option and would have been handled above.
+			return plannerTxn.Commit(ctx)
+		}(); err != nil {
 			return err
 		}
 
@@ -1301,6 +1353,77 @@ func backupPlanHook(
 		return fn, utilccl.DetachedJobExecutionResultHeader, nil, false, nil
 	}
 	return fn, utilccl.BulkJobExecutionResultHeader, nil, false, nil
+}
+
+// getReintroducedSpans checks to see if any spans need to be re-backed up from
+// ts = 0. This may be the case if a span was OFFLINE in the previous backup and
+// has come back online since. The entire span needs to be re-backed up because
+// we may otherwise miss AddSSTable requests which write to a timestamp older
+// than the last incremental.
+func getReintroducedSpans(
+	ctx context.Context,
+	p sql.PlanHookState,
+	prevBackups []BackupManifest,
+	tables []catalog.TableDescriptor,
+	revs []BackupManifest_DescriptorRevision,
+	endTime hlc.Timestamp,
+) ([]roachpb.Span, error) {
+	reintroducedTables := make(map[descpb.ID]struct{})
+
+	offlineInLastBackup := make(map[descpb.ID]struct{})
+	lastBackup := prevBackups[len(prevBackups)-1]
+	for _, desc := range lastBackup.Descriptors {
+		// TODO(pbardea): Also check that lastWriteTime is set once those are
+		// populated on the table descriptor.
+		if table, _, _, _ := descpb.FromDescriptor(&desc); table != nil && table.Offline() {
+			offlineInLastBackup[table.GetID()] = struct{}{}
+		}
+	}
+
+	// If the table was offline in the last backup, but becomes PUBLIC, then it
+	// needs to be re-included since we may have missed non-transactional writes.
+	tablesToReinclude := make([]catalog.TableDescriptor, 0)
+	for _, desc := range tables {
+		if _, wasOffline := offlineInLastBackup[desc.GetID()]; wasOffline && desc.Public() {
+			tablesToReinclude = append(tablesToReinclude, desc)
+			reintroducedTables[desc.GetID()] = struct{}{}
+		}
+	}
+
+	// Tables should be re-introduced if any revision of the table was PUBLIC. A
+	// table may have been OFFLINE at the time of the last backup, and OFFLINE at
+	// the time of the current backup, but may have been PUBLIC at some time in
+	// between.
+	for _, rev := range revs {
+		rawTable, _, _, _ := descpb.FromDescriptor(rev.Desc)
+		if rawTable == nil {
+			continue
+		}
+		table := tabledesc.NewBuilder(rawTable).BuildImmutableTable()
+		if _, wasOffline := offlineInLastBackup[table.GetID()]; wasOffline && table.Public() {
+			tablesToReinclude = append(tablesToReinclude, table)
+			reintroducedTables[table.GetID()] = struct{}{}
+		}
+	}
+
+	// All revisions of the table that we're re-introducing must also be
+	// considered.
+	allRevs := make([]BackupManifest_DescriptorRevision, 0, len(revs))
+	for _, rev := range revs {
+		rawTable, _, _, _ := descpb.FromDescriptor(rev.Desc)
+		if rawTable == nil {
+			continue
+		}
+		if _, ok := reintroducedTables[rawTable.GetID()]; ok {
+			allRevs = append(allRevs, rev)
+		}
+	}
+
+	tableSpans, err := spansForAllTableIndexes(ctx, p.ExecCfg(), endTime, tablesToReinclude, allRevs)
+	if err != nil {
+		return nil, err
+	}
+	return tableSpans, nil
 }
 
 func makeNewEncryptionOptions(

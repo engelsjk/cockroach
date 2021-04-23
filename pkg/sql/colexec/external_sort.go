@@ -17,10 +17,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -236,7 +238,7 @@ func NewExternalSorter(
 		// If memory limit is 1, we're likely in a "force disk spill"
 		// scenario, but we don't want to artificially limit batches when we
 		// have already spilled, so we'll use a larger limit.
-		memoryLimit = colexecop.DefaultMemoryLimit
+		memoryLimit = execinfra.DefaultMemoryLimit
 	}
 	// Each disk queue will use up to BufferSizeBytes of RAM, so we reduce the
 	// memoryLimit of the partitions to sort in memory by those cache sizes.
@@ -310,6 +312,7 @@ func (s *externalSorter) Next(ctx context.Context) coldata.Batch {
 				// since externalSorterSpillPartition will check and re-merge if
 				// not. Proceed to the final merging state.
 				s.state = externalSorterFinalMerging
+				log.VEvent(ctx, 1, "external sorter consumed its input")
 				continue
 			}
 			if s.partitioner == nil {
@@ -372,10 +375,7 @@ func (s *externalSorter) Next(ctx context.Context) coldata.Batch {
 				}
 				n++
 			}
-			merger, err := s.createMergerForPartitions(ctx, n)
-			if err != nil {
-				colexecerror.InternalError(err)
-			}
+			merger := s.createMergerForPartitions(ctx, n)
 			merger.Init()
 			s.numPartitions -= n
 			s.partitionsInfo.totalSize[s.numPartitions] = 0
@@ -410,11 +410,7 @@ func (s *externalSorter) Next(ctx context.Context) coldata.Batch {
 				s.createPartitionerToOperators(s.numPartitions)
 				s.emitter = s.partitionerToOperators[0]
 			} else {
-				var err error
-				s.emitter, err = s.createMergerForPartitions(ctx, s.numPartitions)
-				if err != nil {
-					colexecerror.InternalError(err)
-				}
+				s.emitter = s.createMergerForPartitions(ctx, s.numPartitions)
 			}
 			s.emitter.Init()
 			s.state = externalSorterEmitting
@@ -536,6 +532,7 @@ func (s *externalSorter) Close(ctx context.Context) error {
 	if !s.CloserHelper.Close() {
 		return nil
 	}
+	log.VEvent(ctx, 1, "external sorter is closed")
 	var lastErr error
 	if s.partitioner != nil {
 		lastErr = s.partitioner.Close(ctx)
@@ -574,13 +571,11 @@ func (s *externalSorter) createPartitionerToOperators(n int) {
 
 // createMergerForPartitions creates an ordered synchronizer that will merge
 // the last n current partitions.
-func (s *externalSorter) createMergerForPartitions(
-	ctx context.Context, n int,
-) (colexecop.Operator, error) {
+func (s *externalSorter) createMergerForPartitions(ctx context.Context, n int) colexecop.Operator {
 	s.createPartitionerToOperators(n)
-	syncInputs := make([]SynchronizerInput, n)
+	syncInputs := make([]colexecargs.OpWithMetaInfo, n)
 	for i := range syncInputs {
-		syncInputs[i].Op = s.partitionerToOperators[i]
+		syncInputs[i].Root = s.partitionerToOperators[i]
 	}
 	if log.V(2) {
 		var b strings.Builder

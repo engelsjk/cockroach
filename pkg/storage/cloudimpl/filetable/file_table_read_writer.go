@@ -268,7 +268,7 @@ func NewFileToTableSystem(
 		// TODO(adityamaru): Handle scenario where the user has already created
 		// tables with the same names not via the FileToTableSystem
 		// object. Not sure if we want to error out or work around it.
-		tablesExist, err := f.checkIfFileAndPayloadTableExist(ctx, e.ie)
+		tablesExist, err := f.checkIfFileAndPayloadTableExist(ctx, txn, e.ie)
 		if err != nil {
 			return err
 		}
@@ -697,7 +697,9 @@ func newFileTableReader(
 			return nil, 0, errors.Wrap(err, "failed to read returned file metadata")
 		}
 		fileID = vals[0].([]byte)
-		sz = vals[1].(int64)
+		if vals[1] != nil {
+			sz = vals[1].(int64)
+		}
 	default:
 		panic("unknown executor")
 	}
@@ -779,7 +781,7 @@ func (f *FileToTableSystem) ReadFile(
 }
 
 func (f *FileToTableSystem) checkIfFileAndPayloadTableExist(
-	ctx context.Context, ie *sql.InternalExecutor,
+	ctx context.Context, txn *kv.Txn, ie *sql.InternalExecutor,
 ) (bool, error) {
 	tablePrefix, err := f.GetTableName()
 	if err != nil {
@@ -808,7 +810,7 @@ func (f *FileToTableSystem) checkIfFileAndPayloadTableExist(
 	tableExistenceQuery := fmt.Sprintf(
 		`SELECT table_name FROM [SHOW TABLES FROM %s] WHERE table_name=$1 OR table_name=$2`,
 		databaseSchema)
-	numRows, err := ie.ExecEx(ctx, "tables-exist", nil,
+	numRows, err := ie.ExecEx(ctx, "tables-exist", txn,
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		tableExistenceQuery, fileTableName, payloadTableName)
 	if err != nil {

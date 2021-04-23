@@ -40,7 +40,7 @@ func TestSafeMessage(t *testing.T) {
 				State:         descpb.DescriptorState_OFFLINE,
 				OfflineReason: "foo",
 			}).BuildImmutableDatabase(),
-			exp: "dbdesc.Immutable: {ID: 12, Version: 1, ModificationTime: \"0,0\", State: OFFLINE, OfflineReason: \"foo\"}",
+			exp: "dbdesc.immutable: {ID: 12, Version: 1, ModificationTime: \"0,0\", State: OFFLINE, OfflineReason: \"foo\"}",
 		},
 		{
 			desc: NewBuilder(&descpb.DatabaseDescriptor{
@@ -99,45 +99,12 @@ func TestValidateDatabaseDesc(t *testing.T) {
 			},
 		},
 		{
-			`region "us-east-1" seen twice on db 200`,
-			descpb.DatabaseDescriptor{
-				Name: "multi-region-db",
-				ID:   200,
-				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
-					Regions: []descpb.DatabaseDescriptor_RegionConfig_Region{
-						{Name: "us-east-1"},
-						{Name: "us-east-1"},
-					},
-					PrimaryRegion: "us-east-1",
-				},
-				Privileges: descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
-			},
-		},
-		{
 			`primary region unset on a multi-region db 200`,
 			descpb.DatabaseDescriptor{
-				Name: "multi-region-db",
-				ID:   200,
-				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
-					Regions: []descpb.DatabaseDescriptor_RegionConfig_Region{
-						{Name: "us-east-1"},
-					},
-				},
-				Privileges: descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
-			},
-		},
-		{
-			`primary region not found in list of regions on db 200`,
-			descpb.DatabaseDescriptor{
-				Name: "multi-region-db",
-				ID:   200,
-				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
-					Regions: []descpb.DatabaseDescriptor_RegionConfig_Region{
-						{Name: "us-east-1"},
-					},
-					PrimaryRegion: "us-east-2",
-				},
-				Privileges: descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
+				Name:         "multi-region-db",
+				ID:           200,
+				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{},
+				Privileges:   descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
 			},
 		},
 	}
@@ -245,7 +212,8 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				ID:   51,
 				Name: "db1",
 				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
-					RegionEnumID: 500,
+					RegionEnumID:  500,
+					PrimaryRegion: "us-east-1",
 				},
 			},
 		},
@@ -255,7 +223,8 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				ID:   51,
 				Name: "db1",
 				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
-					RegionEnumID: 52,
+					RegionEnumID:  52,
+					PrimaryRegion: "us-east-1",
 				},
 			},
 			multiRegionEnum: descpb.TypeDescriptor{
@@ -264,7 +233,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 			},
 		},
 		{ // 8
-			err: `schema mapping entry "schema1" (53): referenced schema ID 53: descriptor is a *typedesc.Immutable: unexpected descriptor type`,
+			err: `schema mapping entry "schema1" (53): referenced schema ID 53: descriptor is a *typedesc.immutable: unexpected descriptor type`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
 				Name: "db1",
@@ -278,12 +247,13 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 			},
 		},
 		{ // 9
-			err: `multi-region enum: referenced type ID 53: descriptor is a *schemadesc.Immutable: unexpected descriptor type`,
+			err: `multi-region enum: referenced type ID 53: descriptor is a *schemadesc.immutable: unexpected descriptor type`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
 				Name: "db1",
 				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
-					RegionEnumID: 53,
+					RegionEnumID:  53,
+					PrimaryRegion: "us-east-1",
 				},
 			},
 			schemaDescs: []descpb.SchemaDescriptor{
@@ -298,19 +268,27 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 
 	for i, test := range tests {
 		privilege := descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName())
-		descs := catalog.MapDescGetter{}
+		descs := catalog.MakeMapDescGetter()
 		test.desc.Privileges = privilege
 		desc := NewBuilder(&test.desc).BuildImmutable()
-		descs[test.desc.ID] = desc
+		descs.Descriptors[test.desc.ID] = desc
 		test.multiRegionEnum.Privileges = privilege
-		descs[test.multiRegionEnum.ID] = typedesc.NewBuilder(&test.multiRegionEnum).BuildImmutable()
+		descs.Descriptors[test.multiRegionEnum.ID] = typedesc.NewBuilder(&test.multiRegionEnum).BuildImmutable()
 		for _, schemaDesc := range test.schemaDescs {
 			schemaDesc.Privileges = privilege
-			descs[schemaDesc.ID] = schemadesc.NewBuilder(&schemaDesc).BuildImmutable()
+			descs.Descriptors[schemaDesc.ID] = schemadesc.NewBuilder(&schemaDesc).BuildImmutable()
+		}
+		for _, desc := range descs.Descriptors {
+			namespaceKey := descpb.NameInfo{
+				ParentID:       desc.GetParentID(),
+				ParentSchemaID: desc.GetParentSchemaID(),
+				Name:           desc.GetName(),
+			}
+			descs.Namespace[namespaceKey] = desc.GetID()
 		}
 		expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), test.err)
-		const validateCrossReferencesOnly = catalog.ValidationLevelSelfAndCrossReferences &^ (catalog.ValidationLevelSelfAndCrossReferences >> 1)
-		if err := catalog.Validate(ctx, descs, validateCrossReferencesOnly, desc).CombinedError(); err == nil {
+		results := catalog.Validate(ctx, descs, catalog.NoValidationTelemetry, catalog.ValidationLevelAllPreTxnCommit, desc)
+		if err := results.CombinedError(); err == nil {
 			if test.err != "" {
 				t.Errorf("%d: expected \"%s\", but found success: %+v", i, expectedErr, test.desc)
 			}

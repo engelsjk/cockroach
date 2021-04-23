@@ -17,7 +17,7 @@ import (
 )
 
 var pgxReleaseTagRegex = regexp.MustCompile(`^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var supportedPGXTag = "v4.6.0"
+var supportedPGXTag = "v4.11.0"
 
 // This test runs pgx's full test suite against a single cockroach node.
 
@@ -45,7 +45,7 @@ func registerPgx(r *testRegistry) {
 		}
 
 		t.Status("setting up go")
-		installLatestGolang(ctx, t, c, node)
+		installGolang(ctx, t, c, node)
 
 		t.Status("getting pgx")
 		if err := repeatGitCloneE(

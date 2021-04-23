@@ -25,12 +25,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/internal/codeowners"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	_ "github.com/cockroachdb/cockroach/pkg/testutils/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/errors"
 	"github.com/ghemawat/stream"
 	"github.com/jordanlewis/gcassert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -428,7 +430,7 @@ func TestLint(t *testing.T) {
 					":!ccl/backupccl/backup_test.go",
 					":!storage/cloudimpl",
 					":!ccl/workloadccl/fixture_test.go",
-					":!internal/gopath/gopath.go",
+					":!internal/reporoot/reporoot.go",
 					":!cmd",
 					":!util/cgroups/cgroups.go",
 					":!nightly",
@@ -706,6 +708,7 @@ func TestLint(t *testing.T) {
 			":!util/tracing/span.go",
 			":!util/tracing/crdbspan.go",
 			":!util/tracing/tracer.go",
+			":!cmd/roachtest/gorm_helpers.go",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -813,7 +816,6 @@ func TestLint(t *testing.T) {
 			":!rpc/context.go",
 			":!rpc/nodedialer/nodedialer_test.go",
 			":!util/grpcutil/grpc_util_test.go",
-			":!cli/systembench/network_test_server.go",
 			":!server/testserver.go",
 			":!util/tracing/*_test.go",
 		)
@@ -999,6 +1001,8 @@ func TestLint(t *testing.T) {
 			":!sql/*.pb.go",
 			":!util/protoutil/marshal.go",
 			":!util/protoutil/marshaler.go",
+			":!rpc/codec.go",
+			":!rpc/codec_test.go",
 			":!settings/settings_test.go",
 			":!sql/types/types_jsonpb.go",
 			":!sql/schemachanger/scbuild/builder_test.go",
@@ -1043,6 +1047,8 @@ func TestLint(t *testing.T) {
 			":!util/protoutil/marshaler.go",
 			":!util/encoding/encoding.go",
 			":!util/hlc/timestamp.go",
+			":!rpc/codec.go",
+			":!rpc/codec_test.go",
 			":!sql/types/types_jsonpb.go",
 		)
 		if err != nil {
@@ -1482,6 +1488,7 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`cockroach/pkg/util/log: github\.com/pkg/errors$`),
 			stream.GrepNot(`cockroach/pkg/(base|release|security|util/(log|randutil|stop)): log$`),
 			stream.GrepNot(`cockroach/pkg/(server/serverpb|ts/tspb): github\.com/golang/protobuf/proto$`),
+			stream.GrepNot(`cockroachdb/cockroach/pkg/rpc: github\.com/golang/protobuf/proto$`),
 			stream.GrepNot(`cockroachdb/cockroach/pkg/sql/lex/allkeywords: log$`),
 			stream.GrepNot(`cockroachdb/cockroach/pkg/util/timeutil/gen: log$`),
 			stream.GrepNot(`cockroachdb/cockroach/pkg/roachpb/gen: log$`),
@@ -1593,6 +1600,7 @@ func TestLint(t *testing.T) {
 				stream.GrepNot("sql/.*exported func .* returns unexported type sql.planNode"),
 				stream.GrepNot("pkg/sql/types/types.go.* var Uuid should be UUID"),
 				stream.GrepNot("pkg/sql/oidext/oidext.go.*don't use underscores in Go names; const T_"),
+				stream.GrepNot("server/api_v2.go.*package comment should be of the form"),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {
@@ -1609,12 +1617,16 @@ func TestLint(t *testing.T) {
 	t.Run("TestStaticCheck", func(t *testing.T) {
 		// staticcheck uses 2.4GB of ram (as of 2019-05-10), so don't parallelize it.
 		skip.UnderShort(t)
+		var args []string
+		if pkgSpecified {
+			args = []string{pkgScope}
+		} else {
+			args = []string{"-unused.whole-program", pkgScope}
+		}
 		cmd, stderr, filter, err := dirCmd(
 			crdb.Dir,
 			"staticcheck",
-			"-unused.whole-program",
-			pkgScope,
-		)
+			args...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1650,6 +1662,8 @@ func TestLint(t *testing.T) {
 				stream.GrepNot(`pkg/.*.go:.* func .*\.Cause is unused`),
 				// Using deprecated WireLength call.
 				stream.GrepNot(`pkg/rpc/stats_handler.go:.*v.WireLength is deprecated: This field is never set.*`),
+				// rpc/codec.go imports the same proto package that grpc-go imports (as of crdb@dd87d1145 and grpc-go@7b167fd6).
+				stream.GrepNot(`pkg/rpc/codec.go:.*package github.com/golang/protobuf/proto is deprecated: Use the "google.golang.org/protobuf/proto" package instead.`),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {
@@ -2048,6 +2062,8 @@ func TestLint(t *testing.T) {
 			// roachtest is not collecting redactable logs so we don't care
 			// about printf hygiene there as much.
 			stream.GrepNot(`pkg/cmd/roachtest/log\.go:.*format argument is not a constant expression`),
+			// We purposefully produce nil dereferences in this file to test crash conditions
+			stream.GrepNot(`pkg/util/log/logcrash/crash_reporting_test\.go:.*nil dereference in type assertion`),
 		}
 
 		const vetTool = "roachvet"
@@ -2059,5 +2075,13 @@ func TestLint(t *testing.T) {
 			[]string{"vet", "-vettool", vetToolPath, "-all", "-printf.funcs", printfuncs, pkgScope},
 			filters)
 
+	})
+
+	t.Run("CODEOWNERS", func(t *testing.T) {
+		co, err := codeowners.DefaultLoadCodeOwners()
+		require.NoError(t, err)
+		const verbose = false
+		repoRoot := filepath.Join("../../../")
+		codeowners.LintEverythingIsOwned(t, verbose, co, repoRoot, "pkg")
 	})
 }

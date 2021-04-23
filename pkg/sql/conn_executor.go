@@ -270,6 +270,8 @@ type Server struct {
 	InternalMetrics Metrics
 }
 
+var _ tree.SQLStatsResetter = &Server{}
+
 // Metrics collects timeseries data about SQL activity.
 type Metrics struct {
 	// EngineMetrics is exported as required by the metrics.Struct magic we use
@@ -576,8 +578,9 @@ func (s *Server) newConnExecutor(
 		sessionData: sd,
 		dataMutator: sdMutator,
 		state: txnState{
-			mon:     txnMon,
-			connCtx: ctx,
+			mon:                          txnMon,
+			connCtx:                      ctx,
+			testingForceRealTracingSpans: s.cfg.TestingKnobs.ForceRealTracingSpans,
 		},
 		transitionCtx: transitionCtx{
 			db:           s.cfg.DB,
@@ -760,6 +763,16 @@ func (s *Server) PeriodicallyClearSQLStats(
 			}
 		}
 	})
+}
+
+// ResetClusterSQLStats resets the collected cluster-wide SQL statistics by calling into the statusServer.
+func (s *Server) ResetClusterSQLStats(ctx context.Context) error {
+	req := &serverpb.ResetSQLStatsRequest{}
+	_, err := s.cfg.SQLStatusServer.ResetSQLStats(ctx, req)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 type closeType int
@@ -1080,9 +1093,9 @@ type connExecutor struct {
 
 		schemaChangerState SchemaChangerState
 
-		// shouldCollectExecutionStats specifies whether the statements in this
-		// transaction should collect execution stats.
-		shouldCollectExecutionStats bool
+		// shouldCollectTxnExecutionStats specifies whether the statements in
+		// this transaction should collect execution stats.
+		shouldCollectTxnExecutionStats bool
 		// accumulatedStats are the accumulated stats of all statements.
 		accumulatedStats execstats.QueryLevelStats
 		// rowsRead and bytesRead are separate from QueryLevelStats because they are
@@ -1988,7 +2001,7 @@ func (ex *connExecutor) execCopyIn(
 // stmtHasNoData returns true if describing a result of the input statement
 // type should return NoData.
 func stmtHasNoData(stmt tree.Statement) bool {
-	return stmt == nil || stmt.StatementType() != tree.Rows
+	return stmt == nil || stmt.StatementReturnType() != tree.Rows
 }
 
 // generateID generates a unique ID based on the SQL instance ID and its current
@@ -2179,6 +2192,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			ClientNoticeSender: p,
 			Sequence:           p,
 			Tenant:             p,
+			JoinTokenCreator:   p,
 			SessionData:        ex.sessionData,
 			Settings:           ex.server.cfg.Settings,
 			TestingKnobs:       ex.server.cfg.EvalContextTestingKnobs,
@@ -2191,6 +2205,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			InternalExecutor:   &ie,
 			DB:                 ex.server.cfg.DB,
 			SQLLivenessReader:  ex.server.cfg.SQLLivenessReader,
+			SQLStatsResetter:   ex.server,
 		},
 		SessionMutator:       ex.dataMutator,
 		VirtualSchemas:       ex.server.cfg.VirtualSchemas,
@@ -2398,7 +2413,7 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 // initStatementResult initializes res according to a query.
 //
 // cols represents the columns of the result rows. Should be nil if
-// stmt.AST.StatementType() != tree.Rows.
+// stmt.AST.StatementReturnType() != tree.Rows.
 //
 // If an error is returned, it is to be considered a query execution error.
 func (ex *connExecutor) initStatementResult(
@@ -2409,7 +2424,7 @@ func (ex *connExecutor) initStatementResult(
 			return err
 		}
 	}
-	if ast.StatementType() == tree.Rows {
+	if ast.StatementReturnType() == tree.Rows {
 		// Note that this call is necessary even if cols is nil.
 		res.SetColumns(ctx, cols)
 	}
@@ -2660,7 +2675,7 @@ type StatementCounters struct {
 	ReleaseRestartSavepointCount    telemetry.CounterWithMetric
 	RollbackToRestartSavepointCount telemetry.CounterWithMetric
 
-	// DdlCount counts all statements whose StatementType is DDL.
+	// DdlCount counts all statements whose StatementReturnType is DDL.
 	DdlCount telemetry.CounterWithMetric
 
 	// MiscCount counts all statements not covered by a more specific stat above.

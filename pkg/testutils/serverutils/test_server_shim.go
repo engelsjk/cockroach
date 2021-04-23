@@ -47,7 +47,7 @@ import (
 type TestServerInterface interface {
 	Stopper() *stop.Stopper
 
-	Start() error
+	Start(context.Context) error
 
 	// Node returns the server.Node as an interface{}.
 	Node() interface{}
@@ -99,6 +99,10 @@ type TestServerInterface interface {
 	// GossipI returns the gossip used by the TestServer.
 	// The real return type is *gossip.Gossip.
 	GossipI() interface{}
+
+	// RangeFeedFactory returns the range feed factory used by the TestServer.
+	// The real return type is *rangefeed.Factory.
+	RangeFeedFactory() interface{}
 
 	// Clock returns the clock used by the TestServer.
 	Clock() *hlc.Clock
@@ -256,7 +260,7 @@ func StartServer(
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
-	if err := server.Start(); err != nil {
+	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("%+v", err)
 	}
 	goDB := OpenDBConn(
@@ -324,7 +328,7 @@ func StartServerRaw(args base.TestServerArgs) (TestServerInterface, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := server.Start(); err != nil {
+	if err := server.Start(context.Background()); err != nil {
 		return nil, err
 	}
 	return server, nil

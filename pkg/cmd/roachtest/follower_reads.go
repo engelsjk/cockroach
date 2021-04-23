@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -162,9 +163,10 @@ func runFollowerReadsTest(
 
 	// Wait until the table has completed up-replication.
 	t.l.Printf("waiting for up-replication...")
-	tStart := timeutil.Now()
-	for {
-		const q = `
+	require.NoError(t, retry.ForDuration(5*time.Minute, func() error {
+		// Check that the table has the expected number of voting and non-voting
+		// replicas.
+		const q1 = `
 			SELECT
 				coalesce(array_length(voting_replicas, 1), 0),
 				coalesce(array_length(non_voting_replicas, 1), 0)
@@ -173,7 +175,10 @@ func runFollowerReadsTest(
 			WHERE
 				table_name = 'test'`
 		var voters, nonVoters int
-		require.NoError(t, db.QueryRowContext(ctx, q).Scan(&voters, &nonVoters))
+		if err := db.QueryRowContext(ctx, q1).Scan(&voters, &nonVoters); err != nil {
+			t.l.Printf("retrying: %v\n", err)
+			return err
+		}
 
 		var ok bool
 		if survival == zone {
@@ -183,15 +188,30 @@ func runFollowerReadsTest(
 			// Expect 5 voting replicas and 0 non-voting replicas.
 			ok = voters == 5 && nonVoters == 0
 		}
-		if ok {
-			break
+		if !ok {
+			return errors.Newf("up-replication not complete, found %d voters and %d non_voters", voters, nonVoters)
 		}
 
-		if timeutil.Since(tStart) > 30*time.Second {
-			t.l.Printf("still waiting for full replication")
+		// Check that one of these replicas exists in each region. Do so by
+		// parsing the replica_localities array using the same pattern as the
+		// one used by SHOW REGIONS.
+		const q2 = `
+			SELECT
+				count(distinct substring(unnest(replica_localities), 'region=([^,]*)'))
+			FROM
+				crdb_internal.ranges_no_leases
+			WHERE
+				table_name = 'test'`
+		var distinctRegions int
+		if err := db.QueryRowContext(ctx, q2).Scan(&distinctRegions); err != nil {
+			t.l.Printf("retrying: %v\n", err)
+			return err
 		}
-		time.Sleep(time.Second)
-	}
+		if distinctRegions != 3 {
+			return errors.Newf("rebalancing not complete, table in %d regions", distinctRegions)
+		}
+		return nil
+	}))
 
 	const rows = 100
 	const concurrency = 32
@@ -281,6 +301,14 @@ func runFollowerReadsTest(
 			t.Fatalf("context canceled: %v", ctx.Err())
 		}
 	}
+
+	// Enable the slow query log so we have a shot at identifying why follower
+	// reads are not being served after the fact when this test fails. Use a
+	// latency threshold of 50ms, which should be well below the latency of a
+	// cross-region hop to read from the leaseholder but well above the latency
+	// of a follower read.
+	_, err = db.ExecContext(ctx, "SET CLUSTER SETTING sql.trace.stmt.enable_threshold = '50ms'")
+	require.NoError(t, err)
 
 	// Read the follower read counts before issuing the follower reads to observe
 	// the delta and protect from follower reads which might have happened due to

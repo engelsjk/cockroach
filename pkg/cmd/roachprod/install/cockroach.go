@@ -457,7 +457,12 @@ func (h *crdbInstallHelper) generateStartArgs(
 	}
 
 	logDir := h.c.Impl.LogDir(h.c, nodes[nodeIdx])
-	args = append(args, "--log-dir="+logDir)
+	if vers.AtLeast(version.MustParse("v21.1.0-alpha.0")) {
+		// Specify exit-on-error=false to work around #62763.
+		args = append(args, `--log "file-defaults: {dir: '`+logDir+`', exit-on-error: false}"`)
+	} else {
+		args = append(args, "--log-dir="+logDir)
+	}
 
 	if vers.AtLeast(version.MustParse("v1.1.0")) {
 		cache := 25
@@ -577,14 +582,16 @@ func (h *crdbInstallHelper) generateClusterSettingCmd(nodeIdx int) string {
 	path := fmt.Sprintf("%s/%s", h.c.Impl.NodeDir(h.c, nodes[nodeIdx], 1 /* storeIndex */), "settings-initialized")
 	url := h.r.NodeURL(h.c, "localhost", h.r.NodePort(h.c, 1))
 
+	// We ignore failures to set remote_debugging.mode, which was
+	// removed in v21.2.
 	clusterSettingCmd += fmt.Sprintf(`
 		if ! test -e %s ; then
+			COCKROACH_CONNECT_TIMEOUT=0 %s sql --url %s -e "SET CLUSTER SETTING server.remote_debugging.mode = 'any'" || true;
 			COCKROACH_CONNECT_TIMEOUT=0 %s sql --url %s -e "
-				SET CLUSTER SETTING server.remote_debugging.mode = 'any';
 				SET CLUSTER SETTING cluster.organization = 'Cockroach Labs - Production Testing';
 				SET CLUSTER SETTING enterprise.license = '%s';" \
 			&& touch %s
-		fi`, path, binary, url, license, path)
+		fi`, path, binary, url, binary, url, license, path)
 	return clusterSettingCmd
 }
 
@@ -612,20 +619,27 @@ func (h *crdbInstallHelper) generateKeyCmd(nodeIdx int, extraArgs []string) stri
 	}
 
 	nodes := h.c.ServerNodes()
-	var storeDir string
+	var storeDirs []string
 	if idx := argExists(extraArgs, "--store"); idx == -1 {
-		storeDir = h.c.Impl.NodeDir(h.c, nodes[nodeIdx], 1 /* storeIndex */)
+		for i := 1; i <= StartOpts.StoreCount; i++ {
+			storeDir := h.c.Impl.NodeDir(h.c, nodes[nodeIdx], i)
+			storeDirs = append(storeDirs, storeDir)
+		}
 	} else {
-		storeDir = strings.TrimPrefix(extraArgs[idx], "--store=")
+		storeDir := strings.TrimPrefix(extraArgs[idx], "--store=")
+		storeDirs = append(storeDirs, storeDir)
 	}
 
 	// Command to create the store key.
-	keyCmd := fmt.Sprintf(`
-		mkdir -p %[1]s;
-		if [ ! -e %[1]s/aes-128.key ]; then
-			openssl rand -out %[1]s/aes-128.key 48;
-		fi;`, storeDir)
-	return keyCmd
+	var keyCmd strings.Builder
+	for _, storeDir := range storeDirs {
+		fmt.Fprintf(&keyCmd, `
+			mkdir -p %[1]s;
+			if [ ! -e %[1]s/aes-128.key ]; then
+				openssl rand -out %[1]s/aes-128.key 48;
+			fi;`, storeDir)
+	}
+	return keyCmd.String()
 }
 
 func (h *crdbInstallHelper) useStartSingleNode(vers *version.Version) bool {

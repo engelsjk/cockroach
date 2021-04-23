@@ -709,6 +709,8 @@ has no relationship with the commit order of concurrent transactions.</p>
 <tbody>
 <tr><td><a name="experimental_uuid_v4"></a><code>experimental_uuid_v4() &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Returns a UUID.</p>
 </span></td></tr>
+<tr><td><a name="gen_random_ulid"></a><code>gen_random_ulid() &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Generates a random ULID and returns it as a value of UUID type.</p>
+</span></td></tr>
 <tr><td><a name="gen_random_uuid"></a><code>gen_random_uuid() &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Generates a random UUID and returns it as a value of UUID type.</p>
 </span></td></tr>
 <tr><td><a name="unique_rowid"></a><code>unique_rowid() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns a unique ID used by CockroachDB to generate unique row IDs if a Primary Key isn’t defined for the table. The value is a combination of the insert timestamp and the ID of the node executing the statement, which guarantees this combination is globally unique. However, there can be gaps and the order is not completely guaranteed.</p>
@@ -873,6 +875,16 @@ has no relationship with the commit order of concurrent transactions.</p>
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
 <tbody>
+<tr><td><a name="crdb_internal.filter_multiregion_fields_from_zone_config_sql"></a><code>crdb_internal.filter_multiregion_fields_from_zone_config_sql(val: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Takes in a CONFIGURE ZONE SQL statement and returns a modified
+SQL statement omitting multi-region related zone configuration fields.
+If the CONFIGURE ZONE statement can be inferred by the database’s or
+table’s zone configuration this will return NULL.</p>
+</span></td></tr>
+<tr><td><a name="crdb_internal.validate_multi_region_zone_configs"></a><code>crdb_internal.validate_multi_region_zone_configs() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Validates all multi-region zone configurations are correctly setup
+for the current database, including all tables, indexes and partitions underneath.
+Returns an error if validation fails. This builtin uses un-leased versions of the
+each descriptor, requiring extra round trips.</p>
+</span></td></tr>
 <tr><td><a name="default_to_database_primary_region"></a><code>default_to_database_primary_region(val: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the given region if the region has been added to the current database.
 Otherwise, this will return the primary region of the current database.
 This will error if the current database is not a multi-region database.</p>
@@ -1882,6 +1894,9 @@ calculated, the result is transformed back into a Geography with SRID 4326.</p>
 <p>For flags=1, validity considers self-intersecting rings forming holes as valid as per ESRI. This is not valid under OGC and CRDB spatial operations may not operate correctly.</p>
 <p>This function utilizes the GEOS module.</p>
 </span></td></tr>
+<tr><td><a name="st_isvalidtrajectory"></a><code>st_isvalidtrajectory(geometry: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the geometry encodes a valid trajectory.</p>
+<p>Note the geometry must be a LineString with M coordinates.</p>
+</span></td></tr>
 <tr><td><a name="st_length"></a><code>st_length(geography: geography) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the length of the given geography in meters. Uses a spheroid to perform the operation.</p>
 <p>This function utilizes the GeographicLib library for spheroid calculations.</p>
 </span></td></tr>
@@ -2372,11 +2387,6 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td></tr>
 <tr><td><a name="convert_to"></a><code>convert_to(str: <a href="string.html">string</a>, enc: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Encode the string <code>str</code> as a byte array using encoding <code>enc</code>. Supports encodings ‘UTF8’ and ‘LATIN1’.</p>
 </span></td></tr>
-<tr><td><a name="crdb_internal.filter_multiregion_fields_from_zone_config_sql"></a><code>crdb_internal.filter_multiregion_fields_from_zone_config_sql(val: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Takes in a CONFIGURE ZONE SQL statement and returns a modified
-SQL statement omitting multi-region related zone configuration fields.
-If the CONFIGURE ZONE statement can be inferred by the database’s or
-table’s zone configuration this will return NULL.</p>
-</span></td></tr>
 <tr><td><a name="crdb_internal.show_create_all_tables"></a><code>crdb_internal.show_create_all_tables(database_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns rows of CREATE table statements followed by
 ALTER table statements that add table constraints. The rows are ordered
 by dependencies. All foreign keys are added after the creation of the table
@@ -2630,6 +2640,8 @@ The output can be used to recreate a database.’</p>
 <tr><td><a name="translate"></a><code>translate(input: <a href="string.html">string</a>, find: <a href="string.html">string</a>, replace: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>In <code>input</code>, replaces the first character from <code>find</code> with the first character in <code>replace</code>; repeat for each character in <code>find</code>.</p>
 <p>For example, <code>translate('doggie', 'dog', '123');</code> returns <code>1233ie</code>.</p>
 </span></td></tr>
+<tr><td><a name="ulid_to_uuid"></a><code>ulid_to_uuid(val: <a href="string.html">string</a>) &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Converts a ULID string to its UUID-encoded representation.</p>
+</span></td></tr>
 <tr><td><a name="unaccent"></a><code>unaccent(val: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Removes accents (diacritic signs) from the text provided in <code>val</code>.</p>
 </span></td></tr>
 <tr><td><a name="upper"></a><code>upper(val: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Converts all characters in <code>val</code> to their to their upper-case equivalents.</p>
@@ -2659,6 +2671,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.completed_migrations"></a><code>crdb_internal.completed_migrations() &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.create_join_token"></a><code>crdb_internal.create_join_token() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Creates a join token for use when adding a new node to a secure cluster.</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.encode_key"></a><code>crdb_internal.encode_key(table_id: <a href="int.html">int</a>, index_id: <a href="int.html">int</a>, row_tuple: anyelement) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Generate the key for a row on a particular table and index.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.force_assertion_error"></a><code>crdb_internal.force_assertion_error(msg: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
@@ -2673,6 +2687,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.get_database_id"></a><code>crdb_internal.get_database_id(name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td></td></tr>
 <tr><td><a name="crdb_internal.get_namespace_id"></a><code>crdb_internal.get_namespace_id(parent_id: <a href="int.html">int</a>, name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td></td></tr>
+<tr><td><a name="crdb_internal.get_vmodule"></a><code>crdb_internal.get_vmodule() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the vmodule configuration on the gateway node processing this request.</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.get_zone_config"></a><code>crdb_internal.get_zone_config(namespace_id: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td></td></tr>
 <tr><td><a name="crdb_internal.has_role_option"></a><code>crdb_internal.has_role_option(option: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the current user has the specified role option</p>
 </span></td></tr>
@@ -2714,6 +2730,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.range_stats"></a><code>crdb_internal.range_stats(key: <a href="bytes.html">bytes</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>This function is used to retrieve range statistics information as a JSON object.</p>
 </span></td></tr>
+<tr><td><a name="crdb_internal.reset_sql_stats"></a><code>crdb_internal.reset_sql_stats() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to clear the collected SQL statistics.</p>
+</span></td></tr>
 <tr><td><a name="crdb_internal.round_decimal_values"></a><code>crdb_internal.round_decimal_values(val: <a href="decimal.html">decimal</a>, scale: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>This function is used internally to round decimal values during mutations.</p>
 </span></td></tr>
 <tr><td><a name="crdb_internal.round_decimal_values"></a><code>crdb_internal.round_decimal_values(val: <a href="decimal.html">decimal</a>[], scale: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a>[]</code></td><td><span class="funcdesc"><p>This function is used internally to round decimal array values during mutations.</p>
@@ -2733,6 +2751,15 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="current_user"></a><code>current_user() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the current user. This function is provided for compatibility with PostgreSQL.</p>
 </span></td></tr>
 <tr><td><a name="version"></a><code>version() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the node’s version of CockroachDB.</p>
+</span></td></tr></tbody>
+</table>
+
+### System repair functions
+
+<table>
+<thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><a name="crdb_internal.force_delete_table_data"></a><code>crdb_internal.force_delete_table_data(id: <a href="int.html">int</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function can be used to clear the data belonging to a table, when the table cannot be dropped.</p>
 </span></td></tr></tbody>
 </table>
 
@@ -2769,6 +2796,15 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
 <tbody>
 <tr><td><a name="row_to_json"></a><code>row_to_json(row: tuple) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Returns the row as a JSON object.</p>
+</span></td></tr></tbody>
+</table>
+
+### UUID functions
+
+<table>
+<thead><tr><th>Function &rarr; Returns</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><a name="uuid_to_ulid"></a><code>uuid_to_ulid(val: <a href="uuid.html">uuid</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Converts a UUID-encoded ULID to its string representation.</p>
 </span></td></tr></tbody>
 </table>
 
@@ -2944,6 +2980,8 @@ SELECT * FROM crdb_internal.check_consistency(true, ‘\x02’, ‘\x04’)</p>
 <tr><td><a name="pg_sleep"></a><code>pg_sleep(seconds: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>pg_sleep makes the current session’s process sleep until seconds seconds have elapsed. seconds is a value of type double precision, so fractional-second delays can be specified.</p>
 </span></td></tr>
 <tr><td><a name="pg_table_is_visible"></a><code>pg_table_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the table with the given OID belongs to one of the schemas on the search path.</p>
+</span></td></tr>
+<tr><td><a name="pg_type_is_visible"></a><code>pg_type_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the type with the given OID belongs to one of the schemas on the search path.</p>
 </span></td></tr></tbody>
 </table>
 

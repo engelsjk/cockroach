@@ -19,6 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/testutilsccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
@@ -343,12 +345,19 @@ func TestAlterTableLocalityRegionalByRowError(t *testing.T) {
 							params.Locality.Tiers = []roachpb.Tier{
 								{Key: "region", Value: "ajstorm-1"},
 							}
+							var sqlDB *gosql.DB
 							params.Knobs = base.TestingKnobs{
 								SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 									BackfillChunkSize: chunkSize,
 								},
 								DistSQL: &execinfra.TestingKnobs{
 									RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+										// Run a validate query on each chunk.
+										_, err := sqlDB.Exec(`SELECT crdb_internal.validate_multi_region_zone_configs()`)
+										if err != nil {
+											return errors.Wrap(err, "error validating zone configs during an in progress backfill")
+										}
+
 										currentBackfillChunk += 1
 										if currentBackfillChunk != alterState.cancelOnBackfillChunk {
 											return nil
@@ -357,22 +366,15 @@ func TestAlterTableLocalityRegionalByRowError(t *testing.T) {
 									},
 								},
 							}
-							s, sqlDB, kvDB := serverutils.StartServer(t, params)
+							var s serverutils.TestServerInterface
+							var kvDB *kv.DB
+							s, sqlDB, kvDB = serverutils.StartServer(t, params)
 							db = sqlDB
 							defer s.Stopper().Stop(ctx)
 
 							// Disable strict GC TTL enforcement because we're going to shove a zero-value
 							// TTL into the system with AddImmediateGCZoneConfig.
 							defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
-
-							// Drop the closed timestamp target lead for GLOBAL tables.
-							// The test passes with it configured to its default, but it
-							// is very slow due to #61444 (2.5s vs. 35s).
-							// TODO(nvanbenschoten): We can remove this when that issue
-							// is addressed.
-							if _, err := sqlDB.Exec(`SET CLUSTER SETTING kv.closed_timestamp.lead_for_global_reads_override = '5ms'`); err != nil {
-								t.Fatal(err)
-							}
 
 							if _, err := sqlDB.Exec(fmt.Sprintf(`
 CREATE DATABASE t PRIMARY REGION "ajstorm-1";
@@ -466,6 +468,10 @@ USE t;
 									)
 								}
 
+								// Validate zone configs are still correct.
+								_, err = sqlDB.Exec(`SELECT crdb_internal.validate_multi_region_zone_configs()`)
+								require.NoError(t, err)
+
 								return nil
 							})
 
@@ -525,31 +531,19 @@ CREATE TABLE db.t(k INT PRIMARY KEY) LOCALITY REGIONAL BY ROW`)
 		t.Error(err)
 	}
 
-	// Overriding this operation until we get a fix for #60620. When that fix is
-	// ready, we can construct the view of the zone config as it was at the
-	// beginning of the transaction, and the checks for override should work
-	// again, and we won't require an explicit override here.
 	_, err = sqlDB.Exec(`BEGIN;
-SET override_multi_region_zone_config = true;
 ALTER DATABASE db ADD REGION "us-east3";
 ALTER DATABASE db DROP REGION "us-east2";
-SET override_multi_region_zone_config = false;
 COMMIT;`)
 	require.Error(t, err, "boom")
 
 	// The cleanup job should kick in and revert the changes that happened to the
 	// type descriptor in the user txn. We should eventually be able to add
 	// "us-east3" and remove "us-east2".
-	// Overriding this operation until we get a fix for #60620. When that fix is
-	// ready, we can construct the view of the zone config as it was at the
-	// beginning of the transaction, and the checks for override should work
-	// again, and we won't require an explicit override here.
 	testutils.SucceedsSoon(t, func() error {
 		_, err = sqlDB.Exec(`BEGIN;
-	SET override_multi_region_zone_config = true;
 	ALTER DATABASE db ADD REGION "us-east3";
 	ALTER DATABASE db DROP REGION "us-east2";
-	SET override_multi_region_zone_config = false;
 	COMMIT;`)
 		return err
 	})
@@ -564,37 +558,63 @@ func TestIndexCleanupAfterAlterFromRegionalByRow(t *testing.T) {
 	// Decrease the adopt loop interval so that retries happen quickly.
 	defer sqltestutils.SetTestJobsAdoptInterval()()
 
-	_, sqlDB, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
-		t, 3 /* numServers */, base.TestingKnobs{}, nil, /* baseDir */
-	)
-	defer cleanup()
+	for _, tc := range []struct {
+		locality string
+	}{
+		{locality: "REGIONAL BY TABLE"},
+		{locality: "GLOBAL"},
+		{locality: "REGIONAL BY ROW AS region_col"},
+	} {
+		t.Run(tc.locality, func(t *testing.T) {
+			_, sqlDB, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
+				t, 3 /* numServers */, base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						// Disable the merge queue because it makes this test flakey
+						// under stress. Consider changing this when admin commands are
+						// better synchronized leading to less thrashing of the range cache.
+						// We may also need to retry ClearRange operations which bump into
+						// the GC threshold. Generally that's not a concern because
+						// generally that threshold isn't super small. The problem with
+						// ranges is that when they merge, as may happen during the parallel
+						// execution of a big ClearRange is that the highest threshold will
+						// be inherited.
+						DisableMergeQueue: true,
+					},
+				}, nil, /* baseDir */
+			)
+			defer cleanup()
 
-	_, err := sqlDB.Exec(
-		`CREATE DATABASE "mr-zone-configs" WITH PRIMARY REGION "us-east1" REGIONS "us-east2", "us-east3";
+			_, err := sqlDB.Exec(
+				`CREATE DATABASE "mr-zone-configs" WITH PRIMARY REGION "us-east1" REGIONS "us-east2", "us-east3";
 USE "mr-zone-configs";
 CREATE TABLE regional_by_row (
   pk INT PRIMARY KEY,
+	region_col crdb_internal_region NOT NULL,
   i INT,
-  INDEX(i),
-  FAMILY (pk, i)
+  INDEX(i)
 ) LOCALITY REGIONAL BY ROW`)
-	require.NoError(t, err)
+			require.NoError(t, err)
 
-	// Alter the table to REGIONAL BY TABLE, and then back to REGIONAL BY ROW, to
-	// create some indexes that need cleaning up.
-	_, err = sqlDB.Exec(`ALTER TABLE regional_by_row SET LOCALITY REGIONAL BY TABLE;
-ALTER TABLE regional_by_row SET LOCALITY REGIONAL BY ROW`)
-	require.NoError(t, err)
+			// Alter the table to REGIONAL BY TABLE, and then back to REGIONAL BY ROW, to
+			// create some indexes that need cleaning up.
+			_, err = sqlDB.Exec(
+				fmt.Sprintf(
+					`ALTER TABLE regional_by_row SET LOCALITY %s;
+						ALTER TABLE regional_by_row SET LOCALITY REGIONAL BY ROW`,
+					tc.locality,
+				),
+			)
+			require.NoError(t, err)
 
-	// Validate that the indexes requiring cleanup exist.
-	type row struct {
-		status  string
-		details string
-	}
+			// Validate that the indexes requiring cleanup exist.
+			type row struct {
+				status  string
+				details string
+			}
 
-	for {
-		// First confirm that the schema change job has completed
-		res := sqlDB.QueryRow(`WITH jobs AS (
+			for {
+				// First confirm that the schema change job has completed
+				res := sqlDB.QueryRow(`WITH jobs AS (
       SELECT status, crdb_internal.pb_to_json(
 			'cockroach.sql.jobs.jobspb.Payload',
 			payload,
@@ -606,18 +626,18 @@ ALTER TABLE regional_by_row SET LOCALITY REGIONAL BY ROW`)
     FROM jobs
     WHERE (job->>'schemaChange') IS NOT NULL AND status = 'running'`)
 
-		require.NoError(t, res.Err())
+				require.NoError(t, res.Err())
 
-		numJobs := 0
-		err = res.Scan(&numJobs)
-		require.NoError(t, err)
-		if numJobs == 0 {
-			break
-		}
-	}
+				numJobs := 0
+				err = res.Scan(&numJobs)
+				require.NoError(t, err)
+				if numJobs == 0 {
+					break
+				}
+			}
 
-	queryIndexGCJobsAndValidateCount := func(status string, expectedCount int) error {
-		query := `WITH jobs AS (
+			queryIndexGCJobsAndValidateCount := func(status string, expectedCount int) error {
+				query := `WITH jobs AS (
       SELECT status, crdb_internal.pb_to_json(
 			'cockroach.sql.jobs.jobspb.Payload',
 			payload,
@@ -629,42 +649,48 @@ ALTER TABLE regional_by_row SET LOCALITY REGIONAL BY ROW`)
     FROM jobs
     WHERE (job->>'schemaChangeGC') IS NOT NULL AND status = '%s'`
 
-		res, err := sqlDB.Query(fmt.Sprintf(query, status))
-		require.NoError(t, err)
+				res, err := sqlDB.Query(fmt.Sprintf(query, status))
+				require.NoError(t, err)
 
-		var rows []row
-		for res.Next() {
-			r := row{}
-			err = res.Scan(&r.status, &r.details)
+				var rows []row
+				for res.Next() {
+					r := row{}
+					err = res.Scan(&r.status, &r.details)
+					require.NoError(t, err)
+					rows = append(rows, r)
+				}
+				if err := res.Err(); err != nil {
+					return errors.Wrap(err, "unexepected error querying schema change GC jobs")
+				}
+
+				actualCount := len(rows)
+				if actualCount != expectedCount {
+					return errors.Newf("expected %d jobs with status %q, found %d. Jobs found: %v",
+						expectedCount,
+						status,
+						actualCount,
+						rows)
+				}
+				return nil
+			}
+
+			// Now check that we have the right number of index GC jobs pending.
+			err = queryIndexGCJobsAndValidateCount(`running`, 4)
 			require.NoError(t, err)
-			rows = append(rows, r)
-		}
-		actualCount := len(rows)
-		if actualCount != expectedCount {
-			return errors.Newf("expected %d jobs with status %q, found %d. Jobs found: %v",
-				expectedCount,
-				status,
-				actualCount,
-				rows)
-		}
-		return nil
+			err = queryIndexGCJobsAndValidateCount(`succeeded`, 0)
+			require.NoError(t, err)
+
+			// Change gc.ttlseconds to speed up the cleanup.
+			_, err = sqlDB.Exec(`ALTER TABLE regional_by_row CONFIGURE ZONE USING gc.ttlseconds = 1`)
+			require.NoError(t, err)
+
+			// Validate that indexes are cleaned up.
+			queryAndEnsureThatFourIndexGCJobsSucceeded := func() error {
+				return queryIndexGCJobsAndValidateCount(`succeeded`, 4)
+			}
+			testutils.SucceedsSoon(t, queryAndEnsureThatFourIndexGCJobsSucceeded)
+			err = queryIndexGCJobsAndValidateCount(`running`, 0)
+			require.NoError(t, err)
+		})
 	}
-
-	// Now check that we have the right number of index GC jobs pending.
-	err = queryIndexGCJobsAndValidateCount(`running`, 4)
-	require.NoError(t, err)
-	err = queryIndexGCJobsAndValidateCount(`succeeded`, 0)
-	require.NoError(t, err)
-
-	// Change gc.ttlseconds to speed up the cleanup.
-	_, err = sqlDB.Exec(`ALTER TABLE regional_by_row CONFIGURE ZONE USING gc.ttlseconds = 1`)
-	require.NoError(t, err)
-
-	// Validate that indexes are cleaned up.
-	queryAndEnsureThatFourIndexGCJobsSucceeded := func() error {
-		return queryIndexGCJobsAndValidateCount(`succeeded`, 4)
-	}
-	testutils.SucceedsSoon(t, queryAndEnsureThatFourIndexGCJobsSucceeded)
-	err = queryIndexGCJobsAndValidateCount(`running`, 0)
-	require.NoError(t, err)
 }

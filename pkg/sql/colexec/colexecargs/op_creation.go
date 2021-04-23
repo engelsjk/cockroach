@@ -16,11 +16,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
 )
 
@@ -30,11 +32,29 @@ import (
 var TestNewColOperator func(ctx context.Context, flowCtx *execinfra.FlowCtx, args *NewColOperatorArgs,
 ) (r *NewColOperatorResult, err error)
 
+// OpWithMetaInfo stores a colexecop.Operator together with miscellaneous meta
+// information about the tree rooted in that operator.
+// TODO(yuzefovich): figure out the story about pooling these objects.
+type OpWithMetaInfo struct {
+	Root colexecop.Operator
+	// StatsCollectors are all stats collectors that are present in the tree
+	// rooted in Root for which the responsibility of retrieving stats hasn't
+	// been claimed yet.
+	StatsCollectors []colexecop.VectorizedStatsCollector
+	// MetadataSources are all sources of the metadata that are present in the
+	// tree rooted in Root for which the responsibility of draining hasn't been
+	// claimed yet.
+	MetadataSources colexecop.MetadataSources
+	// ToClose are all colexecop.Closers that are present in the tree rooted in
+	// Root for which the responsibility of closing hasn't been claimed yet.
+	ToClose colexecop.Closers
+}
+
 // NewColOperatorArgs is a helper struct that encompasses all of the input
 // arguments to NewColOperator call.
 type NewColOperatorArgs struct {
 	Spec                 *execinfrapb.ProcessorSpec
-	Inputs               []colexecop.Operator
+	Inputs               []OpWithMetaInfo
 	StreamingMemAccount  *mon.BoundAccount
 	ProcessorConstructor execinfra.ProcessorConstructor
 	LocalProcessors      []execinfra.LocalProcessor
@@ -82,18 +102,34 @@ type NewColOperatorArgs struct {
 // NewColOperatorResult is a helper struct that encompasses all of the return
 // values of NewColOperator call.
 type NewColOperatorResult struct {
-	Op              colexecop.Operator
-	KVReader        colexecop.KVReader
-	ColumnTypes     []*types.T
-	MetadataSources []execinfrapb.MetadataSource
-	// ToClose is a slice of components that need to be Closed.
-	ToClose     []colexecop.Closer
-	OpMonitors  []*mon.BytesMonitor
-	OpAccounts  []*mon.BoundAccount
-	Releasables []execinfra.Releasable
+	OpWithMetaInfo
+	KVReader colexecop.KVReader
+	// Columnarizer is the root colexec.Columnarizer, if needed, that is hidden
+	// behind the stats collector interface. We need to track it separately from
+	// all other stats collectors since it requires special handling.
+	Columnarizer colexecop.VectorizedStatsCollector
+	ColumnTypes  []*types.T
+	OpMonitors   []*mon.BytesMonitor
+	OpAccounts   []*mon.BoundAccount
+	Releasables  []execinfra.Releasable
 }
 
 var _ execinfra.Releasable = &NewColOperatorResult{}
+
+// AssertInvariants confirms that all invariants are maintained by
+// NewColOperatorResult.
+func (r *NewColOperatorResult) AssertInvariants() {
+	// Check that all memory monitor names are unique (colexec.diskSpillerBase
+	// relies on this in order to catch "memory budget exceeded" errors only
+	// from "its own" component).
+	names := make(map[string]struct{}, len(r.OpMonitors))
+	for _, m := range r.OpMonitors {
+		if _, seen := names[m.Name()]; seen {
+			colexecerror.InternalError(errors.AssertionFailedf("monitor named %q encountered twice", m.Name()))
+		}
+		names[m.Name()] = struct{}{}
+	}
+}
 
 var newColOperatorResultPool = sync.Pool{
 	New: func() interface{} {
@@ -112,12 +148,14 @@ func (r *NewColOperatorResult) Release() {
 		releasable.Release()
 	}
 	*r = NewColOperatorResult{
-		ColumnTypes:     r.ColumnTypes[:0],
-		MetadataSources: r.MetadataSources[:0],
-		ToClose:         r.ToClose[:0],
-		OpMonitors:      r.OpMonitors[:0],
-		OpAccounts:      r.OpAccounts[:0],
-		Releasables:     r.Releasables[:0],
+		OpWithMetaInfo: OpWithMetaInfo{
+			MetadataSources: r.OpWithMetaInfo.MetadataSources[:0],
+			ToClose:         r.OpWithMetaInfo.ToClose[:0],
+		},
+		ColumnTypes: r.ColumnTypes[:0],
+		OpMonitors:  r.OpMonitors[:0],
+		OpAccounts:  r.OpAccounts[:0],
+		Releasables: r.Releasables[:0],
 	}
 	newColOperatorResultPool.Put(r)
 }

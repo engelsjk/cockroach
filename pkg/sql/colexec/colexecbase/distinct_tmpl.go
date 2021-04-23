@@ -22,27 +22,23 @@ package colexecbase
 import (
 	"context"
 
-	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
-// Workaround for bazel auto-generated code. goimports does not automatically
-// pick up the right packages when run within the bazel sandbox.
-var (
-	_ apd.Context
-	_ coldataext.Datum
-	_ duration.Duration
-	_ tree.AggType
-)
+////////////////////////////////////////////////////////////////////////////////
+//                                                                            //
+//                                WARNING                                     //
+//                                                                            //
+//  Adding a fake usage of a package here as a workaround for bazel           //
+//  auto-generated code doesn't work - distinct_gen.go needs to be modified.  //
+//                                                                            //
+////////////////////////////////////////////////////////////////////////////////
 
 // {{/*
 
@@ -230,7 +226,11 @@ func (p *distinct_TYPEOp) Next(ctx context.Context) coldata.Batch {
 		}
 	}
 
-	p.lastVal = lastVal
+	if !lastValNull {
+		// We need to perform a deep copy for the next iteration if we didn't have
+		// a null value.
+		execgen.COPYVAL(p.lastVal, lastVal)
+	}
 	p.lastValNull = lastValNull
 
 	return batch
@@ -315,8 +315,7 @@ func checkDistinct(
 	var unique bool
 	_ASSIGN_NE(unique, v, lastVal, _, col, _)
 	outputCol[outputIdx] = outputCol[outputIdx] || unique
-	execgen.COPYVAL(lastVal, v)
-	return lastVal
+	return v
 }
 
 // checkDistinctWithNulls behaves the same as checkDistinct, but it also
@@ -349,7 +348,7 @@ func checkDistinctWithNulls(
 			_ASSIGN_NE(unique, v, lastVal, _, col, _)
 			outputCol[outputIdx] = outputCol[outputIdx] || unique
 		}
-		execgen.COPYVAL(lastVal, v)
+		lastVal = v
 	}
 	return lastVal, null
 }

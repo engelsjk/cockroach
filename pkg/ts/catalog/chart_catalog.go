@@ -992,6 +992,20 @@ var charts = []sectionDescription{
 				Percentiles: true,
 				Metrics:     []string{"txn.restarts"},
 			},
+			{
+				Title:       "Intents condensing - historical",
+				Downsampler: DescribeAggregator_MAX,
+				Metrics: []string{
+					"txn.condensed_intent_spans",
+				},
+			},
+			{
+				Title:       "Intents condensing - current",
+				Downsampler: DescribeAggregator_MAX,
+				Metrics: []string{
+					"txn.condensed_intent_spans_gauge",
+				},
+			},
 		},
 	},
 	{
@@ -1070,12 +1084,6 @@ var charts = []sectionDescription{
 				Title: "Min High Water",
 				Metrics: []string{
 					"changefeed.min_high_water",
-				},
-			},
-			{
-				Title: "Poll Request Time",
-				Metrics: []string{
-					"changefeed.poll_request_nanos",
 				},
 			},
 			{
@@ -1666,6 +1674,18 @@ var charts = []sectionDescription{
 			{
 				Title:   "Disk Usage per Statement",
 				Metrics: []string{"sql.disk.distsql.max"},
+			},
+			{
+				Title:   "Number of Queries Spilled To Disk",
+				Metrics: []string{"sql.distsql.queries.spilled"},
+			},
+			{
+				Title:   "Number of Bytes Written Due to Disk Spilling",
+				Metrics: []string{"sql.disk.distsql.spilled.bytes.written"},
+			},
+			{
+				Title:   "Number of Bytes Read Due to Disk Spilling",
+				Metrics: []string{"sql.disk.distsql.spilled.bytes.read"},
 			},
 		},
 	},

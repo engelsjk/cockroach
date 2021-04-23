@@ -20,9 +20,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -175,10 +176,19 @@ func RandomVec(args RandomVecArgs) {
 		for i := 0; i < args.N; i++ {
 			intervals[i] = duration.FromFloat64(args.Rand.Float64())
 		}
+	case types.JsonFamily:
+		j := args.Vec.JSON()
+		for i := 0; i < args.N; i++ {
+			random, err := json.Random(20, args.Rand)
+			if err != nil {
+				panic(err)
+			}
+			j.Set(i, random)
+		}
 	default:
 		datums := args.Vec.Datum()
 		for i := 0; i < args.N; i++ {
-			datums.Set(i, rowenc.RandDatum(args.Rand, args.Vec.Type(), false /* nullOk */))
+			datums.Set(i, randgen.RandDatum(args.Rand, args.Vec.Type(), false /* nullOk */))
 		}
 	}
 	args.Vec.Nulls().UnsetNulls()
@@ -347,7 +357,7 @@ func NewRandomDataOp(
 		// Generate at least one type.
 		typs = make([]*types.T, 1+rng.Intn(maxSchemaLength))
 		for i := range typs {
-			typs[i] = rowenc.RandType(rng)
+			typs[i] = randgen.RandType(rng)
 		}
 	}
 	return &RandomDataOp{
@@ -380,18 +390,16 @@ func (o *RandomDataOp) Next(context.Context) coldata.Batch {
 		selProbability  float64
 		nullProbability float64
 	)
+	if o.selection {
+		selProbability = o.rng.Float64()
+	}
+	if o.nulls && o.rng.Float64() > 0.1 {
+		// Even if nulls are desired, in 10% of cases create a batch with no
+		// nulls at all.
+		nullProbability = o.rng.Float64()
+	}
 	for {
-		if o.selection {
-			selProbability = o.rng.Float64()
-		}
-		if o.nulls {
-			nullProbability = o.rng.Float64()
-		}
-
 		b := RandomBatchWithSel(o.allocator, o.rng, o.typs, o.batchSize, nullProbability, selProbability)
-		if !o.selection {
-			b.SetSelection(false)
-		}
 		if b.Length() == 0 {
 			// Don't return a zero-length batch until we return o.numBatches batches.
 			continue

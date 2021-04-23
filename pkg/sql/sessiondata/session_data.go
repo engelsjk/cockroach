@@ -116,9 +116,6 @@ type LocalOnlySessionData struct {
 	SaveTablesPrefix string
 	// RemoteAddr is used to generate logging events.
 	RemoteAddr net.Addr
-	// VectorizeRowCountThreshold indicates the row count above which the
-	// vectorized execution engine will be used if possible.
-	VectorizeRowCountThreshold uint64
 	// ExperimentalDistSQLPlanningMode indicates whether the experimental
 	// DistSQL planning driven by the optimizer is enabled.
 	ExperimentalDistSQLPlanningMode ExperimentalDistSQLPlanningMode
@@ -249,6 +246,11 @@ type LocalOnlySessionData struct {
 	// SequenceCache stores sequence values which have been cached using the
 	// CACHE sequence option.
 	SequenceCache SequenceCache
+
+	// StubCatalogTablesEnabled allows queries against virtual
+	// tables that are not yet implemented.
+	StubCatalogTablesEnabled bool
+
 	///////////////////////////////////////////////////////////////////////////
 	// WARNING: consider whether a session parameter you're adding needs to  //
 	// be propagated to the remote nodes. If so, that parameter should live  //

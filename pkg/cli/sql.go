@@ -448,9 +448,9 @@ func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cl
 			}
 			optData = append(optData, []string{n, options[n].display(), options[n].description})
 		}
-		err := printQueryOutput(os.Stdout,
+		err := PrintQueryOutput(os.Stdout,
 			[]string{"Option", "Value", "Description"},
-			newRowSliceIter(optData, "lll" /*align*/))
+			NewRowSliceIter(optData, "lll" /*align*/))
 		if err != nil {
 			panic(err)
 		}
@@ -564,12 +564,7 @@ func (c *cliState) handleDemoAddNode(cmd []string, nextState, errState cliStateE
 		return c.internalServerError(errState, fmt.Errorf("bad call to handleDemoAddNode"))
 	}
 
-	if demoCtx.simulateLatency {
-		fmt.Printf("add command is not supported in --global configurations\n")
-		return nextState
-	}
-
-	if err := demoCtx.transientCluster.AddNode(cmd[1]); err != nil {
+	if err := demoCtx.transientCluster.AddNode(context.Background(), cmd[1]); err != nil {
 		return c.internalServerError(errState, err)
 	}
 	addedNodeID := len(demoCtx.transientCluster.servers)
@@ -826,12 +821,12 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 func (c *cliState) refreshTransactionStatus() {
 	c.lastKnownTxnStatus = unknownTxnStatus
 
-	dbVal, hasVal := c.conn.getServerValue("transaction status", `SHOW TRANSACTION STATUS`)
+	dbVal, dbColType, hasVal := c.conn.getServerValue("transaction status", `SHOW TRANSACTION STATUS`)
 	if !hasVal {
 		return
 	}
 
-	txnString := formatVal(dbVal,
+	txnString := formatVal(dbVal, dbColType,
 		false /* showPrintableUnicode */, false /* shownewLinesAndTabs */)
 
 	// Change the prompt based on the response from the server.
@@ -859,7 +854,7 @@ func (c *cliState) refreshDatabaseName() string {
 		return unknownDbName
 	}
 
-	dbVal, hasVal := c.conn.getServerValue("database name", `SHOW DATABASE`)
+	dbVal, dbColType, hasVal := c.conn.getServerValue("database name", `SHOW DATABASE`)
 	if !hasVal {
 		return unknownDbName
 	}
@@ -870,7 +865,7 @@ func (c *cliState) refreshDatabaseName() string {
 			" Use SET database = <dbname> to change, CREATE DATABASE to make a new database.")
 	}
 
-	dbName := formatVal(dbVal.(string),
+	dbName := formatVal(dbVal, dbColType,
 		false /* showPrintableUnicode */, false /* shownewLinesAndTabs */)
 
 	// Preserve the current database name in case of reconnects.
@@ -1799,5 +1794,11 @@ func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 func printlnUnlessEmbedded(args ...interface{}) {
 	if !sqlCtx.embeddedMode {
 		fmt.Println(args...)
+	}
+}
+
+func printfUnlessEmbedded(f string, args ...interface{}) {
+	if !sqlCtx.embeddedMode {
+		fmt.Printf(f, args...)
 	}
 }

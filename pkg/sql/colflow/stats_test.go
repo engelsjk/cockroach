@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
@@ -40,7 +41,7 @@ func TestNumBatches(t *testing.T) {
 	nBatches := 10
 	noop := colexecop.NewNoop(makeFiniteChunksSourceWithBatchSize(tu.testAllocator, nBatches, coldata.BatchSize()))
 	vsc := newVectorizedStatsCollector(
-		noop, nil /* kvReader */, execinfrapb.ComponentID{},
+		noop, nil /* kvReader */, nil /* columnarizer */, execinfrapb.ComponentID{},
 		timeutil.NewStopWatch(), nil /* memMonitors */, nil, /* diskMonitors */
 		nil, /* inputStatsCollectors */
 	)
@@ -51,7 +52,7 @@ func TestNumBatches(t *testing.T) {
 			break
 		}
 	}
-	s := vsc.(*vectorizedStatsCollectorImpl).getStats()
+	s := vsc.(*vectorizedStatsCollectorImpl).GetStats()
 	require.Equal(t, nBatches, int(s.Output.NumBatches.Value()))
 }
 
@@ -66,7 +67,7 @@ func TestNumTuples(t *testing.T) {
 	for _, batchSize := range []int{1, 16, 1024} {
 		noop := colexecop.NewNoop(makeFiniteChunksSourceWithBatchSize(tu.testAllocator, nBatches, batchSize))
 		vsc := newVectorizedStatsCollector(
-			noop, nil /* kvReader */, execinfrapb.ComponentID{},
+			noop, nil /* kvReader */, nil /* columnarizer */, execinfrapb.ComponentID{},
 			timeutil.NewStopWatch(), nil /* memMonitors */, nil, /* diskMonitors */
 			nil, /* inputStatsCollectors */
 		)
@@ -77,13 +78,13 @@ func TestNumTuples(t *testing.T) {
 				break
 			}
 		}
-		s := vsc.(*vectorizedStatsCollectorImpl).getStats()
+		s := vsc.(*vectorizedStatsCollectorImpl).GetStats()
 		require.Equal(t, nBatches*batchSize, int(s.Output.NumTuples.Value()))
 	}
 }
 
 // TestVectorizedStatsCollector is an integration test for the
-// vectorizedStatsCollector. It creates two inputs and feeds them into the
+// VectorizedStatsCollector. It creates two inputs and feeds them into the
 // merge joiner and makes sure that all the stats measured on the latter are as
 // expected.
 func TestVectorizedStatsCollector(t *testing.T) {
@@ -102,7 +103,7 @@ func TestVectorizedStatsCollector(t *testing.T) {
 			timeSource:   timeSource,
 		}
 		leftInput := newVectorizedStatsCollector(
-			leftSource, nil /* kvReader */, execinfrapb.ComponentID{ID: 0},
+			leftSource, nil /* kvReader */, nil /* columnarizer */, execinfrapb.ComponentID{ID: 0},
 			timeutil.NewTestStopWatch(timeSource.Now), nil /* memMonitors */, nil, /* diskMonitors */
 			nil, /* inputStatsCollectors */
 		)
@@ -111,12 +112,12 @@ func TestVectorizedStatsCollector(t *testing.T) {
 			timeSource:   timeSource,
 		}
 		rightInput := newVectorizedStatsCollector(
-			rightSource, nil /* kvReader */, execinfrapb.ComponentID{ID: 1},
+			rightSource, nil /* kvReader */, nil /* columnarizer */, execinfrapb.ComponentID{ID: 1},
 			timeutil.NewTestStopWatch(timeSource.Now), nil /* memMonitors */, nil, /* diskMonitors */
 			nil, /* inputStatsCollectors */
 		)
 		mergeJoiner, err := colexecjoin.NewMergeJoinOp(
-			tu.testAllocator, colexecop.DefaultMemoryLimit, queueCfg,
+			tu.testAllocator, execinfra.DefaultMemoryLimit, queueCfg,
 			colexecop.NewTestingSemaphore(4), descpb.InnerJoin, leftInput, rightInput,
 			[]*types.T{types.Int}, []*types.T{types.Int},
 			[]execinfrapb.Ordering_Column{{ColIdx: 0}},
@@ -132,7 +133,7 @@ func TestVectorizedStatsCollector(t *testing.T) {
 		}
 
 		mjStatsCollector := newVectorizedStatsCollector(
-			timeAdvancingMergeJoiner, nil /* kvReader */, execinfrapb.ComponentID{ID: 2},
+			timeAdvancingMergeJoiner, nil /* kvReader */, nil /* columnarizer */, execinfrapb.ComponentID{ID: 2},
 			mjInputWatch, nil /* memMonitors */, nil, /* diskMonitors */
 			[]childStatsCollector{leftInput.(childStatsCollector), rightInput.(childStatsCollector)},
 		)
@@ -149,7 +150,7 @@ func TestVectorizedStatsCollector(t *testing.T) {
 			batchCount++
 			tupleCount += b.Length()
 		}
-		s := mjStatsCollector.(*vectorizedStatsCollectorImpl).getStats()
+		s := mjStatsCollector.(*vectorizedStatsCollectorImpl).GetStats()
 
 		require.Equal(t, nBatches*coldata.BatchSize(), int(s.Output.NumTuples.Value()))
 		// Two inputs are advancing the time source for a total of 2 * nBatches

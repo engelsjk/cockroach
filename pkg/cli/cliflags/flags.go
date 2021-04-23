@@ -42,7 +42,7 @@ type FlagInfo struct {
 	Description string
 }
 
-const usageIndentation = 8
+const usageIndentation = 1
 const wrapWidth = 79 - usageIndentation
 
 // wrapDescription wraps the text in a FlagInfo.Description.
@@ -80,7 +80,7 @@ func wrapDescription(s string) string {
 // * indentation
 // * env variable name (if set)
 func (f FlagInfo) Usage() string {
-	s := "\n" + wrapDescription(f.Description) + "\n"
+	s := "\n" + wrapDescription(f.Description)
 	if f.EnvVar != "" {
 		// Check that the environment variable name matches the flag name. Note: we
 		// don't want to automatically generate the name so that grepping for a flag
@@ -90,12 +90,12 @@ func (f FlagInfo) Usage() string {
 			panic(fmt.Sprintf("incorrect EnvVar %s for flag %s (should be %s)",
 				f.EnvVar, f.Name, correctName))
 		}
-		s = s + "Environment variable: " + f.EnvVar + "\n"
+		s = s + "\nEnvironment variable: " + f.EnvVar
 	}
 	// github.com/spf13/pflag appends the default value after the usage text. Add
-	// the correct indentation (7 spaces) here. This is admittedly fragile.
-	return text.Indent(s, strings.Repeat(" ", usageIndentation)) +
-		strings.Repeat(" ", usageIndentation-1)
+	// an additional indentation so the default is well-aligned with the
+	// rest of the text. This is admittedly fragile.
+	return text.Indent(s, strings.Repeat(" ", usageIndentation)) + "\n"
 }
 
 // Attrs and others store the static information for CLI flags.
@@ -115,17 +115,17 @@ specialized hardware or number of cores (e.g. "gpu", "x16c"). For example:
 		Name: "locality",
 		Description: `
 An ordered, comma-separated list of key-value pairs that describe the topography
-of the machine. Topography might include country, datacenter or rack
-designations. Data is automatically replicated to maximize diversities of each
-tier. The order of tiers is used to determine the priority of the diversity, so
-the more inclusive localities like country should come before less inclusive
-localities like datacenter. The tiers and order must be the same on all nodes.
-Including more tiers is better than including fewer. For example:
+of the machine. Topography often includes cloud provider regions and availability
+zones, but can also refer to on-prem concepts like datacenter or rack. Data is
+automatically replicated to maximize diversities of each tier. The order of tiers
+is used to determine the priority of the diversity, so the more inclusive localities
+like region should come before less inclusive localities like availability zone. The
+tiers and order must be the same on all nodes. Including more tiers is better than
+including fewer. For example:
 <PRE>
 
-  --locality=country=us,region=us-west,datacenter=us-west-1b,rack=12
-  --locality=country=ca,region=ca-east,datacenter=ca-east-2,rack=4
-  --locality=planet=earth,province=manitoba,colo=secondary,power=3</PRE>`,
+  --locality=cloud=gce,region=us-west1,zone=us-west-1b
+  --locality=cloud=aws,region=us-east,zone=us-east-2</PRE>`,
 	}
 
 	Background = FlagInfo{
@@ -230,10 +230,10 @@ What to dump. "schema" dumps the schema only. "data" dumps the data only.
 "both" (default) dumps the schema then the data.`,
 	}
 
-	DumpTime = FlagInfo{
+	ReadTime = FlagInfo{
 		Name: "as-of",
 		Description: `
-Dumps the data as of the specified timestamp. Formats supported are the same
+Reads the data as of the specified timestamp. Formats supported are the same
 as the timestamp type.`,
 	}
 
@@ -581,8 +581,8 @@ separated list of locality@address. Addresses can also include ports.
 For example:
 <PRE>
 
-  "region=us-west@127.0.0.1,datacenter=us-west-1b@127.0.0.1"
-  "region=us-west@127.0.0.1:26257,datacenter=us-west-1b@127.0.0.1:26258"</PRE>`,
+  "region=us-west@127.0.0.1,zone=us-west-1b@127.0.0.1"
+  "region=us-west@127.0.0.1:26257,zone=us-west-1b@127.0.0.1:26258"</PRE>`,
 	}
 
 	ListenHTTPAddrAlias = FlagInfo{
@@ -902,6 +902,12 @@ The size can be given in various ways:
   --size=.2              -> 20% of available space</PRE>`,
 	}
 
+	Verbose = FlagInfo{
+		Name: "verbose",
+		Description: `
+Verbose output.`,
+	}
+
 	TempDir = FlagInfo{
 		Name: "temp-dir",
 		Description: `
@@ -949,9 +955,16 @@ The value "disabled" will disable all local file I/O.
 		Name:   "url",
 		EnvVar: "COCKROACH_URL",
 		Description: `
-Connection URL, e.g. "postgresql://myuser@localhost:26257/mydb".
-If left empty, the connection flags are used (host, port, user,
-database, insecure, certs-dir).`,
+Connection URL, of the form:
+<PRE>
+   postgresql://[user[:passwd]@]host[:port]/[db][?parameters...]
+</PRE>
+For example, postgresql://myuser@localhost:26257/mydb.
+<PRE>
+
+</PRE>
+If left empty, the discrete connection flags are used: host, port,
+user, database, insecure, certs-dir.`,
 	}
 
 	User = FlagInfo{
@@ -1187,10 +1200,16 @@ If set, disable cockroach demo from attempting to obtain a temporary license.`,
 	}
 
 	UseEmptyDatabase = FlagInfo{
-		Name: "empty",
+		Name:        "empty",
+		Description: `Deprecated in favor of --no-example-database`,
+	}
+
+	NoExampleDatabase = FlagInfo{
+		Name:   "no-example-database",
+		EnvVar: "COCKROACH_NO_EXAMPLE_DATABASE",
 		Description: `
-Start with an empty database: avoid pre-loading a default dataset in
-the demo shell.`,
+Disable the creation of a default dataset in the demo shell.
+This makes 'cockroach demo' faster to start.`,
 	}
 
 	GeoLibsDir = FlagInfo{
@@ -1287,6 +1306,14 @@ The zip command will block for the duration specified. Zero disables this featur
 `,
 	}
 
+	ZipConcurrency = FlagInfo{
+		Name: "concurrency",
+		Description: `
+The maximum number of nodes to request data from simultaneously.
+Can be set to 1 to ensure only one node is polled for data at a time.
+`,
+	}
+
 	StmtDiagDeleteAll = FlagInfo{
 		Name:        "all",
 		Description: `Delete all bundles.`,
@@ -1339,8 +1366,15 @@ This can be used to check schema and data correctness without running the entire
 	}
 
 	Log = FlagInfo{
-		Name:        "log",
-		Description: `Logging configuration. See the documentation for details.`,
+		Name: "log",
+		Description: `Logging configuration, expressed using YAML syntax.
+For example, you can change the default logging directory with:
+--log='file-defaults: {dir: ...}'.
+See the documentation for more options and details.
+
+To preview how the log configuration is applied, or preview the
+default configuration, you can use the 'cockroach debug check-log-config' sub-command.
+`,
 	}
 
 	DeprecatedStderrThreshold = FlagInfo{
@@ -1406,5 +1440,32 @@ A new 30s countdown will start when no more SQL connections
 exist. The interval is specified with a suffix of 's' for seconds, 
 'm' for minutes, and 'h' for hours.
 `,
+	}
+
+	ExportTableTarget = FlagInfo{
+		Name:        "table",
+		Description: `Select the table to export data from.`,
+	}
+
+	ExportDestination = FlagInfo{
+		Name: "destination",
+		Description: `
+The destination to export data. 
+If the export format is readable and this flag left unspecified,
+defaults to display the exported data in the terminal output.
+`,
+	}
+
+	ExportTableFormat = FlagInfo{
+		Name: "format",
+		Description: `
+Selects the format to export table rows from backups. 
+Only csv is supported at the moment.
+`,
+	}
+
+	ExportCSVNullas = FlagInfo{
+		Name:        "nullas",
+		Description: `The string that should be used to represent NULL values. `,
 	}
 )

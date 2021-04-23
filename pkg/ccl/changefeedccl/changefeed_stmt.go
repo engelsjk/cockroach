@@ -49,6 +49,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -273,6 +274,10 @@ func changefeedPlanHook(
 			details.Opts[changefeedbase.OptKeyInValue] = ``
 		}
 
+		if !unspecifiedSink && p.ExecCfg().ExternalIODirConfig.DisableOutbound {
+			return errors.Errorf("Outbound IO is disabled by configuration, cannot create changefeed into %s", parsedSink.Scheme)
+		}
+
 		// Feature telemetry
 		telemetrySink := parsedSink.Scheme
 		if telemetrySink == `` {
@@ -291,15 +296,14 @@ func changefeedPlanHook(
 			return MaybeStripRetryableErrorMarker(err)
 		}
 
-		settings := p.ExecCfg().Settings
 		// Changefeeds are based on the Rangefeed abstraction, which requires the
 		// `kv.rangefeed.enabled` setting to be true.
-		if !kvserver.RangefeedEnabled.Get(&settings.SV) {
+		if !kvserver.RangefeedEnabled.Get(&p.ExecCfg().Settings.SV) {
 			return errors.Errorf("rangefeeds require the kv.rangefeed.enabled setting. See %s",
 				docs.URL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
 		}
 		if err := utilccl.CheckEnterpriseEnabled(
-			settings, p.ExecCfg().ClusterID(), p.ExecCfg().Organization(), "CHANGEFEED",
+			p.ExecCfg().Settings, p.ExecCfg().ClusterID(), p.ExecCfg().Organization(), "CHANGEFEED",
 		); err != nil {
 			return err
 		}
@@ -314,8 +318,7 @@ func changefeedPlanHook(
 		{
 			var nilOracle timestampLowerBoundOracle
 			canarySink, err := getSink(
-				ctx, details.SinkURI, p.ExecCfg().NodeID.SQLInstanceID(), details.Opts, details.Targets,
-				settings, nilOracle, p.ExecCfg().DistSQLSrv.ExternalStorageFromURI, p.User(),
+				ctx, &p.ExecCfg().DistSQLSrv.ServerConfig, details, nilOracle, p.User(), mon.BoundAccount{},
 			)
 			if err != nil {
 				return MaybeStripRetryableErrorMarker(err)
@@ -431,6 +434,18 @@ func changefeedJobDescription(
 	return tree.AsStringWithFQNames(c, ann), nil
 }
 
+// validateNonNegativeDuration returns a nil error if optValue can be
+// parsed as a duration and is non-negative; otherwise, an error is
+// returned.
+func validateNonNegativeDuration(optName string, optValue string) error {
+	if d, err := time.ParseDuration(optValue); err != nil {
+		return err
+	} else if d < 0 {
+		return errors.Errorf("negative durations are not accepted: %s='%s'", optName, optValue)
+	}
+	return nil
+}
+
 func validateDetails(details jobspb.ChangefeedDetails) (jobspb.ChangefeedDetails, error) {
 	if details.Opts == nil {
 		// The proto MarshalTo method omits the Opts field if the map is empty.
@@ -441,11 +456,8 @@ func validateDetails(details jobspb.ChangefeedDetails) (jobspb.ChangefeedDetails
 	{
 		const opt = changefeedbase.OptResolvedTimestamps
 		if o, ok := details.Opts[opt]; ok && o != `` {
-			if d, err := time.ParseDuration(o); err != nil {
+			if err := validateNonNegativeDuration(opt, o); err != nil {
 				return jobspb.ChangefeedDetails{}, err
-			} else if d < 0 {
-				return jobspb.ChangefeedDetails{}, errors.Errorf(
-					`negative durations are not accepted: %s='%s'`, opt, o)
 			}
 		}
 	}
@@ -545,6 +557,19 @@ func generateChangefeedSessionID() string {
 	return string(buf)
 }
 
+func (b *changefeedResumer) setJobRunningStatus(
+	ctx context.Context, fmtOrMsg string, args ...interface{},
+) {
+	status := jobs.RunningStatus(fmt.Sprintf(fmtOrMsg, args...))
+	if err := b.job.RunningStatus(ctx, nil,
+		func(_ context.Context, _ jobspb.Details) (jobs.RunningStatus, error) {
+			return status, nil
+		},
+	); err != nil {
+		log.Warningf(ctx, "failed to set running status: %v", err)
+	}
+}
+
 // Resume is part of the jobs.Resumer interface.
 func (b *changefeedResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	jobExec := execCtx.(sql.JobExecContext)
@@ -586,6 +611,7 @@ func (b *changefeedResumer) Resume(ctx context.Context, execCtx interface{}) err
 				// Instead, we want to make sure that the changefeed job is not marked failed
 				// due to a transient, retryable error.
 				err = jobs.NewRetryJobError(fmt.Sprintf("retryable flow error: %+v", err))
+				b.setJobRunningStatus(ctx, "retryable flow error: %s", err)
 			}
 
 			log.Warningf(ctx, `CHANGEFEED job %d returning with error: %+v`, jobID, err)
@@ -593,6 +619,7 @@ func (b *changefeedResumer) Resume(ctx context.Context, execCtx interface{}) err
 		}
 
 		log.Warningf(ctx, `CHANGEFEED job %d encountered retryable error: %v`, jobID, err)
+		b.setJobRunningStatus(ctx, "retryable error: %s", err)
 		if metrics, ok := execCfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics); ok {
 			metrics.ErrorRetries.Inc(1)
 		}

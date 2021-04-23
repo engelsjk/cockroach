@@ -17,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
@@ -29,18 +28,17 @@ type InvariantsChecker struct {
 	colexecop.NonExplainable
 
 	initStatus     colexecop.OperatorInitStatus
-	metadataSource execinfrapb.MetadataSource
+	metadataSource colexecop.MetadataSource
 }
 
-var _ colexecop.Operator = &InvariantsChecker{}
-var _ execinfrapb.MetadataSource
+var _ colexecop.DrainableOperator = &InvariantsChecker{}
 
 // NewInvariantsChecker creates a new InvariantsChecker.
 func NewInvariantsChecker(input colexecop.Operator) *InvariantsChecker {
 	c := &InvariantsChecker{
 		OneInputNode: colexecop.OneInputNode{Input: input},
 	}
-	if ms, ok := input.(execinfrapb.MetadataSource); ok {
+	if ms, ok := input.(colexecop.MetadataSource); ok {
 		c.metadataSource = ms
 	}
 	return c
@@ -82,8 +80,8 @@ func (i *InvariantsChecker) Next(ctx context.Context) coldata.Batch {
 	}
 	for colIdx := 0; colIdx < b.Width(); colIdx++ {
 		v := b.ColVec(colIdx)
-		if v.CanonicalTypeFamily() == types.BytesFamily {
-			v.Bytes().AssertOffsetsAreNonDecreasing(n)
+		if v.IsBytesLike() {
+			coldata.AssertOffsetsAreNonDecreasing(v, n)
 		}
 	}
 	if sel := b.Selection(); sel != nil {
@@ -99,7 +97,7 @@ func (i *InvariantsChecker) Next(ctx context.Context) coldata.Batch {
 	return b
 }
 
-// DrainMeta implements the execinfrapb.MetadataSource interface.
+// DrainMeta implements the colexecop.MetadataSource interface.
 func (i *InvariantsChecker) DrainMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
 	if shortCircuit := i.assertInitWasCalled(); shortCircuit {
 		return nil

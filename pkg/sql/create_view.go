@@ -18,11 +18,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -33,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/sequence"
 	"github.com/cockroachdb/errors"
 )
 
@@ -47,13 +51,18 @@ type createViewNode struct {
 	replace      bool
 	persistence  tree.Persistence
 	materialized bool
-	dbDesc       *dbdesc.Immutable
+	dbDesc       catalog.DatabaseDescriptor
 	columns      colinfo.ResultColumns
 
 	// planDeps tracks which tables and views the view being created
 	// depends on. This is collected during the construction of
 	// the view query's logical plan.
 	planDeps planDependencies
+
+	// typeDeps tracks which types the view being created
+	// depends on. This is collected during the construction of
+	// the view query's logical plan.
+	typeDeps typeDependencies
 }
 
 // ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
@@ -77,7 +86,7 @@ func (n *createViewNode) startExec(params runParams) error {
 	// Check that the view does not contain references to other databases.
 	if !allowCrossDatabaseViews.Get(&params.p.execCfg.Settings.SV) {
 		for _, dep := range n.planDeps {
-			if dbID := dep.desc.GetParentID(); dbID != n.dbDesc.ID && dbID != keys.SystemDatabaseID {
+			if dbID := dep.desc.GetParentID(); dbID != n.dbDesc.GetID() && dbID != keys.SystemDatabaseID {
 				return errors.WithHintf(
 					pgerror.Newf(pgcode.FeatureNotSupported,
 						"the view cannot refer to other databases; (see the '%s' cluster setting)",
@@ -150,12 +159,20 @@ func (n *createViewNode) startExec(params runParams) error {
 	privs := CreateInheritedPrivilegesFromDBDesc(n.dbDesc, params.SessionData().User())
 
 	var newDesc *tabledesc.Mutable
+	applyGlobalMultiRegionZoneConfig := false
 
 	// If replacingDesc != nil, we found an existing view while resolving
 	// the name for our view. So instead of creating a new view, replace
 	// the existing one.
 	if replacingDesc != nil {
-		newDesc, err = params.p.replaceViewDesc(params.ctx, n, replacingDesc, backRefMutables)
+		newDesc, err = params.p.replaceViewDesc(
+			params.ctx,
+			params.p.ExecCfg().Settings,
+			params.p,
+			n,
+			replacingDesc,
+			backRefMutables,
+		)
 		if err != nil {
 			return err
 		}
@@ -173,6 +190,7 @@ func (n *createViewNode) startExec(params runParams) error {
 		var creationTime hlc.Timestamp
 		desc, err := makeViewTableDesc(
 			params.ctx,
+			params.p.ExecCfg().Settings,
 			viewName,
 			n.viewQuery,
 			n.dbDesc.GetID(),
@@ -184,6 +202,8 @@ func (n *createViewNode) startExec(params runParams) error {
 			&params.p.semaCtx,
 			params.p.EvalContext(),
 			n.persistence,
+			n.dbDesc.IsMultiRegion(),
+			params.p,
 		)
 		if err != nil {
 			return err
@@ -207,11 +227,21 @@ func (n *createViewNode) startExec(params runParams) error {
 			if err := desc.AllocateIDs(params.ctx); err != nil {
 				return err
 			}
+			// For multi-region databases, we want this descriptor to be GLOBAL instead.
+			if n.dbDesc.IsMultiRegion() {
+				desc.SetTableLocalityGlobal()
+				applyGlobalMultiRegionZoneConfig = true
+			}
 		}
 
 		// Collect all the tables/views this view depends on.
 		for backrefID := range n.planDeps {
 			desc.DependsOn = append(desc.DependsOn, backrefID)
+		}
+
+		// Collect all types this view depends on.
+		for backrefID := range n.typeDeps {
+			desc.DependsOnTypes = append(desc.DependsOnTypes, backrefID)
 		}
 
 		// TODO (lucy): I think this needs a NodeFormatter implementation. For now,
@@ -224,6 +254,13 @@ func (n *createViewNode) startExec(params runParams) error {
 		}
 		newDesc = &desc
 	}
+
+	// Used to determine if we want users to be allowed to rename
+	// sequences used in views.
+	st := params.p.ExecCfg().Settings
+	version := st.Version.ActiveVersionOrEmpty(params.ctx)
+	byID := version != (clusterversion.ClusterVersion{}) &&
+		version.IsActive(clusterversion.SequencesRegclass)
 
 	// Persist the back-references in all referenced table descriptors.
 	for id, updated := range n.planDeps {
@@ -242,6 +279,7 @@ func (n *createViewNode) startExec(params runParams) error {
 			// yet known.
 			// We need to do it here.
 			dep.ID = newDesc.ID
+			dep.ByID = byID && updated.desc.IsSequence()
 			backRefMutable.DependedOnBy = append(backRefMutable.DependedOnBy, dep)
 		}
 		if err := params.p.writeSchemaChange(
@@ -256,13 +294,35 @@ func (n *createViewNode) startExec(params runParams) error {
 		}
 	}
 
-	// Install back references to types used by this view.
-	if err := params.p.addBackRefsFromAllTypesInTable(params.ctx, newDesc); err != nil {
-		return err
+	// Add back references for the type dependencies.
+	for id := range n.typeDeps {
+		jobDesc := fmt.Sprintf("updating type back reference %d for table %d", id, newDesc.ID)
+		if err := params.p.addTypeBackReference(params.ctx, id, newDesc.ID, jobDesc); err != nil {
+			return err
+		}
 	}
 
 	if err := validateDescriptor(params.ctx, params.p, newDesc); err != nil {
 		return err
+	}
+
+	if applyGlobalMultiRegionZoneConfig {
+		regionConfig, err := SynthesizeRegionConfig(params.ctx, params.p.txn, n.dbDesc.GetID(), params.p.Descriptors())
+		if err != nil {
+			return err
+		}
+		if err := ApplyZoneConfigForMultiRegionTable(
+			params.ctx,
+			params.p.txn,
+			params.p.ExecCfg(),
+			regionConfig,
+			newDesc,
+			applyZoneConfigForMultiRegionTableOptionTableNewConfig(
+				tabledesc.LocalityConfigGlobal(),
+			),
+		); err != nil {
+			return err
+		}
 	}
 
 	// Log Create View event. This is an auditable log event and is
@@ -288,6 +348,7 @@ func (n *createViewNode) Close(ctx context.Context)  {}
 // include the back-references.
 func makeViewTableDesc(
 	ctx context.Context,
+	st *cluster.Settings,
 	viewName string,
 	viewQuery string,
 	parentID descpb.ID,
@@ -299,6 +360,8 @@ func makeViewTableDesc(
 	semaCtx *tree.SemaContext,
 	evalCtx *tree.EvalContext,
 	persistence tree.Persistence,
+	isMultiRegion bool,
+	sc resolver.SchemaResolver,
 ) (tabledesc.Mutable, error) {
 	desc := tabledesc.InitTableDescriptor(
 		id,
@@ -310,11 +373,67 @@ func makeViewTableDesc(
 		persistence,
 	)
 	desc.ViewQuery = viewQuery
+	if isMultiRegion {
+		desc.SetTableLocalityRegionalByTable(tree.PrimaryRegionNotSpecifiedName)
+	}
+
+	// If we're in 21.1, then sequences in views should be referenced
+	// by IDs, so walk the tree and replace sequence names with IDs.
+	version := st.Version.ActiveVersionOrEmpty(ctx)
+	byID := version != (clusterversion.ClusterVersion{}) &&
+		version.IsActive(clusterversion.SequencesRegclass)
+
+	if sc != nil && byID {
+		updatedQuery, err := replaceSeqNamesWithIDs(ctx, sc, viewQuery)
+		if err != nil {
+			return tabledesc.Mutable{}, err
+		}
+		desc.ViewQuery = updatedQuery
+	}
+
 	if err := addResultColumns(ctx, semaCtx, evalCtx, &desc, resultColumns); err != nil {
 		return tabledesc.Mutable{}, err
 	}
 
 	return desc, nil
+}
+
+// replaceSeqNamesWithIDs prepares to walk the given viewQuery by defining the
+// function used to replace sequence names with IDs, and parsing the
+// viewQuery into a statement.
+func replaceSeqNamesWithIDs(
+	ctx context.Context, sc resolver.SchemaResolver, viewQuery string,
+) (string, error) {
+	replaceSeqFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+		seqIdentifiers, err := sequence.GetUsedSequences(expr)
+		if err != nil {
+			return false, expr, err
+		}
+		seqNameToID := make(map[string]int64)
+		for _, seqIdentifier := range seqIdentifiers {
+			seqDesc, err := GetSequenceDescFromIdentifier(ctx, sc, seqIdentifier)
+			if err != nil {
+				return false, expr, err
+			}
+			seqNameToID[seqIdentifier.SeqName] = int64(seqDesc.ID)
+		}
+		newExpr, err = sequence.ReplaceSequenceNamesWithIDs(expr, seqNameToID)
+		if err != nil {
+			return false, expr, err
+		}
+		return false, newExpr, nil
+	}
+
+	stmt, err := parser.ParseOne(viewQuery)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse view query")
+	}
+
+	newStmt, err := tree.SimpleStmtVisit(stmt.AST, replaceSeqFunc)
+	if err != nil {
+		return "", err
+	}
+	return newStmt.String(), nil
 }
 
 // replaceViewDesc modifies and returns the input view descriptor changed
@@ -324,12 +443,29 @@ func makeViewTableDesc(
 // on that the new view no longer depends on.
 func (p *planner) replaceViewDesc(
 	ctx context.Context,
+	st *cluster.Settings,
+	sc resolver.SchemaResolver,
 	n *createViewNode,
 	toReplace *tabledesc.Mutable,
 	backRefMutables map[descpb.ID]*tabledesc.Mutable,
 ) (*tabledesc.Mutable, error) {
 	// Set the query to the new query.
 	toReplace.ViewQuery = n.viewQuery
+
+	// If we're in 21.1, then sequences in views should be referenced
+	// by IDs, so walk the tree and replace sequence names with IDs.
+	version := st.Version.ActiveVersionOrEmpty(ctx)
+	byID := version != (clusterversion.ClusterVersion{}) &&
+		version.IsActive(clusterversion.SequencesRegclass)
+
+	if sc != nil && byID {
+		updatedQuery, err := replaceSeqNamesWithIDs(ctx, sc, n.viewQuery)
+		if err != nil {
+			return nil, err
+		}
+		toReplace.ViewQuery = updatedQuery
+	}
+
 	// Reset the columns to add the new result columns onto.
 	toReplace.Columns = make([]descpb.ColumnDescriptor, 0, len(n.columns))
 	toReplace.NextColumnID = 0
@@ -375,11 +511,28 @@ func (p *planner) replaceViewDesc(
 		}
 	}
 
+	// For each old type dependency (i.e. before replacing the view),
+	// see if we still depend on it. If not, then remove the back reference.
+	var outdatedTypeRefs []descpb.ID
+	for _, id := range toReplace.DependsOnTypes {
+		if _, ok := n.typeDeps[id]; !ok {
+			outdatedTypeRefs = append(outdatedTypeRefs, id)
+		}
+	}
+	jobDesc := fmt.Sprintf("updating type back references %d for table %d", outdatedTypeRefs, toReplace.ID)
+	if err := p.removeTypeBackReferences(ctx, outdatedTypeRefs, toReplace.ID, jobDesc); err != nil {
+		return nil, err
+	}
+
 	// Since the view query has been replaced, the dependencies that this
 	// table descriptor had are gone.
 	toReplace.DependsOn = make([]descpb.ID, 0, len(n.planDeps))
 	for backrefID := range n.planDeps {
 		toReplace.DependsOn = append(toReplace.DependsOn, backrefID)
+	}
+	toReplace.DependsOnTypes = make([]descpb.ID, 0, len(n.typeDeps))
+	for backrefID := range n.typeDeps {
+		toReplace.DependsOnTypes = append(toReplace.DependsOnTypes, backrefID)
 	}
 
 	// Since we are replacing an existing view here, we need to write the new

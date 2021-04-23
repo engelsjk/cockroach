@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
@@ -119,7 +118,7 @@ func (s *ColBatchScan) Next(ctx context.Context) coldata.Batch {
 	return bat
 }
 
-// DrainMeta is part of the MetadataSource interface.
+// DrainMeta is part of the colexecop.MetadataSource interface.
 func (s *ColBatchScan) DrainMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
 	s.mu.Lock()
 	initialized := s.mu.init
@@ -216,6 +215,7 @@ func NewColBatchScan(
 	evalCtx *tree.EvalContext,
 	spec *execinfrapb.TableReaderSpec,
 	post *execinfrapb.PostProcessSpec,
+	estimatedRowCount uint64,
 ) (*ColBatchScan, error) {
 	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
 	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); nodeID == 0 && ok {
@@ -227,12 +227,11 @@ func NewColBatchScan(
 	}
 
 	limitHint := execinfra.LimitHint(spec.LimitHint, post)
-
 	// TODO(ajwerner): The need to construct an immutable here
 	// indicates that we're probably doing this wrong. Instead we should be
 	// just setting the ID and Version in the spec or something like that and
 	// retrieving the hydrated immutable from cache.
-	table := tabledesc.NewBuilder(&spec.Table).BuildImmutableTable()
+	table := spec.BuildTableDescriptor()
 	virtualColumn := tabledesc.FindVirtualColumn(table, spec.VirtualColumn)
 	cols := table.PublicColumns()
 	if spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic {
@@ -264,8 +263,9 @@ func NewColBatchScan(
 	}
 
 	fetcher := cFetcherPool.Get().(*cFetcher)
+	fetcher.estimatedRowCount = estimatedRowCount
 	if _, _, err := initCRowFetcher(
-		flowCtx.Codec(), allocator, execinfra.GetWorkMemLimit(flowCtx.Cfg),
+		flowCtx.Codec(), allocator, execinfra.GetWorkMemLimit(flowCtx),
 		fetcher, table, columnIdxMap, neededColumns, spec, spec.HasSystemColumns,
 	); err != nil {
 		return nil, err
@@ -302,14 +302,13 @@ func initCRowFetcher(
 	valNeededForCol util.FastIntSet,
 	spec *execinfrapb.TableReaderSpec,
 	withSystemColumns bool,
-) (index *descpb.IndexDescriptor, isSecondaryIndex bool, err error) {
+) (index catalog.Index, isSecondaryIndex bool, err error) {
 	indexIdx := int(spec.IndexIdx)
 	if indexIdx >= len(desc.ActiveIndexes()) {
 		return nil, false, errors.Errorf("invalid indexIdx %d", indexIdx)
 	}
-	indexI := desc.ActiveIndexes()[indexIdx]
-	index = indexI.IndexDesc()
-	isSecondaryIndex = !indexI.Primary()
+	index = desc.ActiveIndexes()[indexIdx]
+	isSecondaryIndex = !index.Primary()
 
 	tableArgs := row.FetcherTableArgs{
 		Desc:             desc,

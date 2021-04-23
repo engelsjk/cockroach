@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexechash"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
 )
@@ -402,17 +404,14 @@ const (
 // returned by the constructor.
 type HashRouter struct {
 	colexecop.OneInputNode
+	// inputMetaInfo contains all of the meta components that the hash router
+	// is responsible for. Root field is exactly the same as OneInputNode.Input.
+	inputMetaInfo colexecargs.OpWithMetaInfo
 	// hashCols is a slice of indices of the columns used for hashing.
 	hashCols []uint32
 
 	// One output for each stream.
 	outputs []routerOutput
-	// metadataSources is a slice of execinfrapb.MetadataSources that need to be
-	// drained when the HashRouter terminates.
-	metadataSources execinfrapb.MetadataSources
-	// closers is a slice of Closers that need to be closed when the hash router
-	// terminates.
-	closers colexecop.Closers
 
 	// unblockedEventsChan is a channel shared between the HashRouter and its
 	// outputs. outputs send events on this channel when they are unblocked by a
@@ -452,15 +451,13 @@ type HashRouter struct {
 // needs to have a separate disk account.
 func NewHashRouter(
 	unlimitedAllocators []*colmem.Allocator,
-	input colexecop.Operator,
+	input colexecargs.OpWithMetaInfo,
 	types []*types.T,
 	hashCols []uint32,
 	memoryLimit int64,
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
 	diskAccounts []*mon.BoundAccount,
-	toDrain []execinfrapb.MetadataSource,
-	toClose []colexecop.Closer,
 ) (*HashRouter, []colexecop.DrainableOperator) {
 	if diskQueueCfg.CacheMode != colcontainer.DiskQueueCacheModeDefault {
 		colexecerror.InternalError(errors.Errorf("hash router instantiated with incompatible disk queue cache mode: %d", diskQueueCfg.CacheMode))
@@ -491,23 +488,20 @@ func NewHashRouter(
 		outputs[i] = op
 		outputsAsOps[i] = op
 	}
-	return newHashRouterWithOutputs(input, hashCols, unblockEventsChan, outputs, toDrain, toClose), outputsAsOps
+	return newHashRouterWithOutputs(input, hashCols, unblockEventsChan, outputs), outputsAsOps
 }
 
 func newHashRouterWithOutputs(
-	input colexecop.Operator,
+	input colexecargs.OpWithMetaInfo,
 	hashCols []uint32,
 	unblockEventsChan <-chan struct{},
 	outputs []routerOutput,
-	toDrain []execinfrapb.MetadataSource,
-	toClose []colexecop.Closer,
 ) *HashRouter {
 	r := &HashRouter{
-		OneInputNode:        colexecop.NewOneInputNode(input),
+		OneInputNode:        colexecop.NewOneInputNode(input.Root),
+		inputMetaInfo:       input,
 		hashCols:            hashCols,
 		outputs:             outputs,
-		closers:             toClose,
-		metadataSources:     toDrain,
 		unblockedEventsChan: unblockEventsChan,
 		// waitForMetadata is a buffered channel to avoid blocking if nobody will
 		// read the metadata.
@@ -548,6 +542,11 @@ func (r *HashRouter) getDrainState() hashRouterDrainState {
 // output calculated by hashing columns. Cancel the given context to terminate
 // early.
 func (r *HashRouter) Run(ctx context.Context) {
+	var span *tracing.Span
+	ctx, span = execinfra.ProcessorSpan(ctx, "hash router")
+	if span != nil {
+		defer span.Finish()
+	}
 	// Since HashRouter runs in a separate goroutine, we want to be safe and
 	// make sure that we catch errors in all code paths, so we wrap the whole
 	// method with a catcher. Note that we also have "internal" catchers as
@@ -607,14 +606,21 @@ func (r *HashRouter) Run(ctx context.Context) {
 	}); err != nil {
 		r.cancelOutputs(ctx, err)
 	}
-
+	if span != nil {
+		for _, s := range r.inputMetaInfo.StatsCollectors {
+			span.RecordStructured(s.GetStats())
+		}
+		if meta := execinfra.GetTraceDataAsMetadata(span); meta != nil {
+			r.bufferedMeta = append(r.bufferedMeta, *meta)
+		}
+	}
+	r.bufferedMeta = append(r.bufferedMeta, r.inputMetaInfo.MetadataSources.DrainMeta(ctx)...)
 	// Non-blocking send of metadata so that one of the outputs can return it
 	// in DrainMeta.
-	r.bufferedMeta = append(r.bufferedMeta, r.metadataSources.DrainMeta(ctx)...)
 	r.waitForMetadata <- r.bufferedMeta
 	close(r.waitForMetadata)
 
-	r.closers.CloseAndLogOnErr(ctx, "hash router")
+	r.inputMetaInfo.ToClose.CloseAndLogOnErr(ctx, "hash router")
 }
 
 // processNextBatch reads the next batch from its input, hashes it and adds

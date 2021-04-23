@@ -172,6 +172,12 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 	}
 }
 
+func (b *logicalPropsBuilder) buildPlaceholderScanProps(
+	scan *PlaceholderScanExpr, rel *props.Relational,
+) {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
 func (b *logicalPropsBuilder) buildSequenceSelectProps(
 	seq *SequenceSelectExpr, rel *props.Relational,
 ) {
@@ -2459,6 +2465,9 @@ func deriveWithUses(r opt.Expr) props.WithUsesMap {
 
 	case *WithExpr:
 		excludedID = e.ID
+
+	case *RecursiveCTEExpr:
+		excludedID = e.WithID
 
 	default:
 		if opt.IsMutationOp(e) {

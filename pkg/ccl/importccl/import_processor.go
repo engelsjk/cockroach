@@ -146,12 +146,6 @@ func (idp *readImportDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Pro
 	}, nil
 }
 
-// ConsumerClosed is part of the RowSource interface.
-func (idp *readImportDataProcessor) ConsumerClosed() {
-	// The consumer is done, Next() will not be called again.
-	idp.InternalClose()
-}
-
 func injectTimeIntoEvalCtx(ctx *tree.EvalContext, walltime int64) {
 	sec := walltime / int64(time.Second)
 	nsec := walltime % int64(time.Second)
@@ -233,7 +227,8 @@ func makeInputConverter(
 		return newPgCopyReader(spec.Format.PgCopy, kvCh, spec.WalltimeNanos,
 			int(spec.ReaderParallelism), singleTable, singleTableTargetCols, evalCtx)
 	case roachpb.IOFileFormat_PgDump:
-		return newPgDumpReader(ctx, kvCh, spec.Format.PgDump, spec.WalltimeNanos, spec.Tables, evalCtx)
+		return newPgDumpReader(ctx, int64(spec.Progress.JobID), kvCh, spec.Format.PgDump,
+			spec.WalltimeNanos, spec.Tables, evalCtx)
 	case roachpb.IOFileFormat_Avro:
 		return newAvroInputReader(
 			kvCh, singleTable, spec.Format.Avro, spec.WalltimeNanos,

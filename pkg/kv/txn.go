@@ -1148,7 +1148,7 @@ func (txn *Txn) SetFixedTimestamp(ctx context.Context, ts hlc.Timestamp) {
 //
 // The transaction's epoch is bumped, simulating to an extent what the
 // TxnCoordSender does on retriable errors. The transaction's timestamp is only
-// bumped to the extent that txn.ReadTimestamp is racheted up to txn.Timestamp.
+// bumped to the extent that txn.ReadTimestamp is racheted up to txn.WriteTimestamp.
 // TODO(andrei): This method should take in an up-to-date timestamp, but
 // unfortunately its callers don't currently have that handy.
 func (txn *Txn) GenerateForcedRetryableError(ctx context.Context, msg string) error {
@@ -1317,4 +1317,19 @@ func (txn *Txn) ManualRefresh(ctx context.Context) error {
 	sender := txn.mu.sender
 	txn.mu.Unlock()
 	return sender.ManualRefresh(ctx)
+}
+
+// DeferCommitWait defers the transaction's commit-wait operation, passing
+// responsibility of commit-waiting from the Txn to the caller of this
+// method. The method returns a function which the caller must eventually
+// run if the transaction completes without error. This function is safe to
+// call multiple times.
+//
+// WARNING: failure to run the returned function could lead to consistency
+// violations where a future, causally dependent transaction may fail to
+// observe the writes performed by this transaction.
+func (txn *Txn) DeferCommitWait(ctx context.Context) func(context.Context) {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.DeferCommitWait(ctx)
 }

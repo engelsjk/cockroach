@@ -40,7 +40,7 @@ func DecodeIndexKeyToCols(
 	vecs []coldata.Vec,
 	idx int,
 	desc catalog.TableDescriptor,
-	index *descpb.IndexDescriptor,
+	index catalog.Index,
 	indexColIdx []int,
 	types []*types.T,
 	colDirs []descpb.IndexDescriptor_Direction,
@@ -53,8 +53,9 @@ func DecodeIndexKeyToCols(
 
 	origKey := key
 
-	if len(index.Interleave.Ancestors) > 0 {
-		for i, ancestor := range index.Interleave.Ancestors {
+	if index.NumInterleaveAncestors() > 0 {
+		for i := 0; i < index.NumInterleaveAncestors(); i++ {
+			ancestor := index.GetInterleaveAncestor(i)
 			// Our input key had its first table id / index id chopped off, so
 			// don't try to decode those for the first ancestor.
 			if i != 0 {
@@ -101,11 +102,11 @@ func DecodeIndexKeyToCols(
 		if err != nil {
 			return nil, false, false, err
 		}
-		if decodedTableID != desc.GetID() || decodedIndexID != index.ID {
+		if decodedTableID != desc.GetID() || decodedIndexID != index.GetID() {
 			// We don't match. Return a key with the table ID / index ID we're
 			// searching for, so the caller knows what to seek to.
 			curPos := len(origKey) - len(key)
-			key = rowenc.EncodePartialTableIDIndexID(origKey[:curPos], desc.GetID(), index.ID)
+			key = rowenc.EncodePartialTableIDIndexID(origKey[:curPos], desc.GetID(), index.GetID())
 			return key, false, false, nil
 		}
 	}
@@ -281,6 +282,13 @@ func decodeTableKeyToCol(
 			rkey, d, err = encoding.DecodeDurationDescending(key)
 		}
 		vec.Interval()[idx] = d
+	case types.JsonFamily:
+		// Don't attempt to decode the JSON value. Instead, just return the
+		// remaining bytes of the key.
+		var jsonLen int
+		jsonLen, err = encoding.PeekLength(key)
+		vec.JSON().Bytes.Set(idx, key[:jsonLen])
+		rkey = key[jsonLen:]
 	default:
 		var d tree.Datum
 		encDir := encoding.Ascending
@@ -346,6 +354,10 @@ func UnmarshalColumnValueToCol(
 		var v duration.Duration
 		v, err = value.GetDuration()
 		vec.Interval()[idx] = v
+	case types.JsonFamily:
+		var v []byte
+		v, err = value.GetBytes()
+		vec.JSON().Bytes.Set(idx, v)
 	// Types backed by tree.Datums.
 	default:
 		var d tree.Datum

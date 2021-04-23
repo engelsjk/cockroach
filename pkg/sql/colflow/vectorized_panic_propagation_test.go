@@ -17,12 +17,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -45,8 +47,8 @@ func TestVectorizedInternalPanic(t *testing.T) {
 	}
 
 	nRows, nCols := 1, 1
-	types := rowenc.OneIntCol
-	input := execinfra.NewRepeatableRowSource(types, rowenc.MakeIntRows(nRows, nCols))
+	typs := types.OneIntCol
+	input := execinfra.NewRepeatableRowSource(typs, randgen.MakeIntRows(nRows, nCols))
 
 	col, err := colexec.NewBufferingColumnarizer(ctx, testAllocator, &flowCtx, 0 /* processorID */, input)
 	if err != nil {
@@ -57,12 +59,9 @@ func TestVectorizedInternalPanic(t *testing.T) {
 	mat, err := colexec.NewMaterializer(
 		&flowCtx,
 		1, /* processorID */
-		vee,
-		types,
+		colexecargs.OpWithMetaInfo{Root: vee},
+		typs,
 		nil, /* output */
-		nil, /* metadataSourceQueue */
-		nil, /* toClose */
-		nil, /* getStats */
 		nil, /* cancelFlow */
 	)
 	if err != nil {
@@ -92,8 +91,8 @@ func TestNonVectorizedPanicPropagation(t *testing.T) {
 	}
 
 	nRows, nCols := 1, 1
-	types := rowenc.OneIntCol
-	input := execinfra.NewRepeatableRowSource(types, rowenc.MakeIntRows(nRows, nCols))
+	typs := types.OneIntCol
+	input := execinfra.NewRepeatableRowSource(typs, randgen.MakeIntRows(nRows, nCols))
 
 	col, err := colexec.NewBufferingColumnarizer(ctx, testAllocator, &flowCtx, 0 /* processorID */, input)
 	if err != nil {
@@ -104,12 +103,9 @@ func TestNonVectorizedPanicPropagation(t *testing.T) {
 	mat, err := colexec.NewMaterializer(
 		&flowCtx,
 		1, /* processorID */
-		nvee,
-		types,
+		colexecargs.OpWithMetaInfo{Root: nvee},
+		typs,
 		nil, /* output */
-		nil, /* metadataSourceQueue */
-		nil, /* toClose */
-		nil, /* getStats */
 		nil, /* cancelFlow */
 	)
 	if err != nil {
@@ -179,7 +175,7 @@ func (e *testNonVectorizedPanicEmitter) Init() {
 func (e *testNonVectorizedPanicEmitter) Next(ctx context.Context) coldata.Batch {
 	if !e.emitBatch {
 		e.emitBatch = true
-		colexecerror.NonVectorizedTestPanic("")
+		colexecerror.NonCatchablePanic("")
 	}
 
 	e.emitBatch = false

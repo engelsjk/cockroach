@@ -52,7 +52,7 @@ type Outbox struct {
 
 	// draining is an atomic that represents whether the Outbox is draining.
 	draining        uint32
-	metadataSources []execinfrapb.MetadataSource
+	metadataSources colexecop.MetadataSources
 	// closers is a slice of Closers that need to be Closed on termination.
 	closers colexecop.Closers
 
@@ -80,9 +80,9 @@ func NewOutbox(
 	allocator *colmem.Allocator,
 	input colexecop.Operator,
 	typs []*types.T,
-	metadataSources []execinfrapb.MetadataSource,
-	toClose []colexecop.Closer,
 	getStats func() []*execinfrapb.ComponentStats,
+	metadataSources []colexecop.MetadataSource,
+	toClose []colexecop.Closer,
 ) (*Outbox, error) {
 	c, err := colserde.NewArrowBatchConverter(typs)
 	if err != nil {
@@ -99,9 +99,9 @@ func NewOutbox(
 		typs:            typs,
 		converter:       c,
 		serializer:      s,
+		getStats:        getStats,
 		metadataSources: metadataSources,
 		closers:         toClose,
-		getStats:        getStats,
 	}
 	o.scratch.buf = &bytes.Buffer{}
 	o.scratch.msg = &execinfrapb.ProducerMessage{}
@@ -307,10 +307,8 @@ func (o *Outbox) sendMetadata(ctx context.Context, stream flowStreamClient, errT
 			},
 		})
 	}
-	for _, src := range o.metadataSources {
-		for _, meta := range src.DrainMeta(ctx) {
-			msg.Data.Metadata = append(msg.Data.Metadata, execinfrapb.LocalMetaToRemoteProducerMeta(ctx, meta))
-		}
+	for _, meta := range o.metadataSources.DrainMeta(ctx) {
+		msg.Data.Metadata = append(msg.Data.Metadata, execinfrapb.LocalMetaToRemoteProducerMeta(ctx, meta))
 	}
 	if len(msg.Data.Metadata) == 0 {
 		return nil

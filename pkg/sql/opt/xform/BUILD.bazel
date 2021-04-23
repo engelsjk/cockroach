@@ -15,6 +15,7 @@ go_library(
         "memo_format.go",
         "optimizer.go",
         "physical_props.go",
+        "placeholder_fast_path.go",
         "scan_funcs.go",
         "scan_index_iter.go",
         "select_funcs.go",
@@ -54,15 +55,17 @@ go_test(
     size = "small",
     srcs = [
         "coster_test.go",
+        "general_funcs_test.go",
         "join_order_builder_test.go",
         "main_test.go",
         "optimizer_test.go",
         "physical_props_test.go",
-        "scan_funcs_test.go",
     ],
-    data = glob(["testdata/**"]),
+    data = glob(["testdata/**"]) + [
+        "@cockroach//c-deps:libgeos",
+        "//pkg/sql/opt/testutils/opttester:testfixtures",
+    ],
     embed = [":xform"],
-    tags = ["broken_in_bazel"],
     deps = [
         "//pkg/config/zonepb",
         "//pkg/roachpb",

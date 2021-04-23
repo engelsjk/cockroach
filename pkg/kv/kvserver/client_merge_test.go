@@ -18,7 +18,6 @@ import (
 	"math/rand"
 	"reflect"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2000,6 +1999,117 @@ func TestStoreRangeMergeRHSLeaseTransfers(t *testing.T) {
 	require.NoError(t, <-mergeErr)
 }
 
+// TestStoreRangeMergeLHSLeaseTransfersAfterFreezeTime verifies that in cases
+// where the lease start time on a LHS range is moved above the freeze time of a
+// range merge, the combined range after the merge does not broadcast a closed
+// timestamp that it then allows to be violated.
+//
+// This is a regression test for #60929. In that issue, which was discovered by
+// kvnemesis, we found that a range merge and a lease transfer could race in
+// such a way that the closed timestamp could later be violated by a write to
+// the subsumed portion of the joint range. The root cause of this was an
+// opportunistic optimization made in 7037b54 to consider a range's lease start
+// time as an input to its closed timestamp computation. This optimization did
+// not account for the possibility of serving writes to a newly subsumed
+// keyspace below a range's lease start time if that keyspace was merged into a
+// range under its current lease and with a freeze time below the current lease
+// start time. This bug was fixed by removing the optimization, which was on its
+// way out to allow for #61986 anyway.
+func TestStoreRangeMergeLHSLeaseTransfersAfterFreezeTime(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Install a hook to control when the merge transaction subsumes the RHS.
+	// Put this in a sync.Once to ignore retries.
+	var once sync.Once
+	subsumeReceived := make(chan struct{})
+	finishSubsume := make(chan struct{})
+	testingResponseFilter := func(_ context.Context, ba roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
+		if ba.IsSingleSubsumeRequest() {
+			once.Do(func() {
+				subsumeReceived <- struct{}{}
+				<-finishSubsume
+			})
+		}
+		return nil
+	}
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 2,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						TestingResponseFilter: testingResponseFilter,
+					},
+				},
+			},
+		})
+	defer tc.Stopper().Stop(ctx)
+
+	// Create the ranges to be merged. Put both ranges on both stores. Give the
+	// first store the lease on the LHS and the second store the lease on the
+	// RHS. Before the merge completes, we'll transfer the LHS's lease to the
+	// second store so that the two leaseholders are collocated.
+	lhsDesc, rhsDesc, err := tc.Servers[0].ScratchRangeEx()
+	require.NoError(t, err)
+
+	tc.AddVotersOrFatal(t, lhsDesc.StartKey.AsRawKey(), tc.Target(1))
+	tc.AddVotersOrFatal(t, rhsDesc.StartKey.AsRawKey(), tc.Target(1))
+	tc.TransferRangeLeaseOrFatal(t, lhsDesc, tc.Target(0))
+	tc.TransferRangeLeaseOrFatal(t, rhsDesc, tc.Target(1))
+
+	// Launch the merge.
+	mergeErr := make(chan error, 1)
+	_ = tc.Stopper().RunAsyncTask(ctx, "merge", func(context.Context) {
+		args := adminMergeArgs(lhsDesc.StartKey.AsRawKey())
+		_, pErr := kv.SendWrapped(ctx, tc.Servers[0].DistSender(), args)
+		mergeErr <- pErr.GoError()
+	})
+
+	// Wait for the merge transaction to send its Subsume request. It won't
+	// be able to complete just yet, thanks to the hook we installed above.
+	<-subsumeReceived
+
+	// Transfer the lease on the LHS to the second store. Doing this will
+	// increase the lease start time on the LHS past the freeze time of the
+	// range merge.
+	if err := tc.TransferRangeLease(lhsDesc, tc.Target(1)); err != nil {
+		close(finishSubsume) // don't abandon merge
+		t.Fatalf(`could transfer lease for range %s error is %+v`, lhsDesc, err)
+	}
+
+	store1 := tc.GetFirstStoreFromServer(t, 1)
+	lhsLeaseholder := store1.LookupReplica(lhsDesc.StartKey)
+	testutils.SucceedsSoon(t, func() error {
+		// Wait for the new leaseholder to notice that it received the lease.
+		now := tc.Servers[1].Clock().NowAsClockTimestamp()
+		if !lhsLeaseholder.OwnsValidLease(ctx, now) {
+			return errors.New("not leaseholder")
+		}
+		return nil
+	})
+	lhsClosedTS, ok := lhsLeaseholder.MaxClosed(ctx)
+	require.True(t, ok)
+
+	// Finally, allow the merge to complete. It should complete successfully.
+	close(finishSubsume)
+	require.NoError(t, <-mergeErr)
+
+	// Attempt to write below the closed timestamp, to the subsumed keyspace.
+	// The write's timestamp should be forwarded to after the closed timestamp.
+	// If it is not, we have violated the closed timestamp's promise!
+	var ba roachpb.BatchRequest
+	ba.Timestamp = lhsClosedTS.Prev()
+	ba.RangeID = lhsDesc.RangeID
+	ba.Add(incrementArgs(rhsDesc.StartKey.AsRawKey().Next(), 1))
+	br, pErr := tc.Servers[1].DistSender().Send(ctx, ba)
+	require.Nil(t, pErr)
+	require.NotEqual(t, ba.Timestamp, br.Timestamp, "write timestamp not bumped")
+	require.True(t, lhsClosedTS.Less(br.Timestamp), "write timestamp not bumped above closed timestamp")
+}
+
 // TestStoreRangeMergeCheckConsistencyAfterSubsumption verifies the following:
 // 1. While a range is subsumed, ComputeChecksum requests wait until the merge
 // is complete before proceeding.
@@ -3963,6 +4073,7 @@ func verifyUnmerged(t *testing.T, store *kvserver.Store, lhsStartKey, rhsStartKe
 
 func TestMergeQueue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 64056, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -4175,137 +4286,117 @@ func TestMergeQueueSeesNonVoters(t *testing.T) {
 	type test struct {
 		name                                                   string
 		leftVoters, rightVoters, leftNonVoters, rightNonVoters []int
-		expectedRightVoters, expectedRightNonVoters            []int
 	}
 
 	// NB: The test setup code places a single voter replica on (n1,s1) for both
 	// left and right range, which we remove after setting the test up.
 	tests := []test{
 		{
-			name:                   "collocated-per-type",
-			leftVoters:             []int{2, 3, 4},
-			rightVoters:            []int{2, 3, 4},
-			leftNonVoters:          []int{1},
-			rightNonVoters:         []int{1},
-			expectedRightVoters:    []int{2, 3, 4},
-			expectedRightNonVoters: []int{1},
+			name:           "collocated-per-type",
+			leftVoters:     []int{2, 3, 4},
+			rightVoters:    []int{2, 3, 4},
+			leftNonVoters:  []int{1},
+			rightNonVoters: []int{1},
 		},
 		{
-			name:                   "collocated-overall",
-			leftVoters:             []int{3, 4},
-			rightVoters:            []int{1, 2},
-			leftNonVoters:          []int{1, 2},
-			rightNonVoters:         []int{3, 4},
-			expectedRightVoters:    []int{1, 2},
-			expectedRightNonVoters: []int{3, 4},
+			name:           "collocated-overall",
+			leftVoters:     []int{3, 4},
+			rightVoters:    []int{1, 2},
+			leftNonVoters:  []int{1, 2},
+			rightNonVoters: []int{3, 4},
 		},
 		{
-			name:                   "collocated-voters-only",
-			leftVoters:             []int{3, 4},
-			rightVoters:            []int{3, 4},
-			leftNonVoters:          []int{2},
-			rightNonVoters:         []int{1},
-			expectedRightVoters:    []int{3, 4},
-			expectedRightNonVoters: []int{2},
+			name:           "collocated-voters-only",
+			leftVoters:     []int{3, 4},
+			rightVoters:    []int{3, 4},
+			leftNonVoters:  []int{2},
+			rightNonVoters: []int{1},
 		},
 		{
-			name:                   "collocated-non-voters-only",
-			leftVoters:             []int{3},
-			rightVoters:            []int{4},
-			leftNonVoters:          []int{1, 2},
-			rightNonVoters:         []int{1, 2},
-			expectedRightVoters:    []int{3},
-			expectedRightNonVoters: []int{1, 2},
+			name:           "collocated-non-voters-only",
+			leftVoters:     []int{3},
+			rightVoters:    []int{4},
+			leftNonVoters:  []int{1, 2},
+			rightNonVoters: []int{1, 2},
 		},
 		{
-			name:                   "not-collocated",
-			leftVoters:             []int{3},
-			rightVoters:            []int{4},
-			leftNonVoters:          []int{2},
-			rightNonVoters:         []int{1},
-			expectedRightVoters:    []int{3},
-			expectedRightNonVoters: []int{2},
+			name:           "not-collocated",
+			leftVoters:     []int{3},
+			rightVoters:    []int{4},
+			leftNonVoters:  []int{2},
+			rightNonVoters: []int{1},
 		},
 		{
-			name:                   "partially-collocated-voters-only",
-			leftVoters:             []int{2, 3},
-			rightVoters:            []int{1, 4},
-			leftNonVoters:          []int{1},
-			rightNonVoters:         []int{2},
-			expectedRightVoters:    []int{1, 3},
-			expectedRightNonVoters: []int{2},
+			name:           "partially-collocated-voters-only",
+			leftVoters:     []int{2, 3},
+			rightVoters:    []int{1, 4},
+			leftNonVoters:  []int{1},
+			rightNonVoters: []int{2},
 		},
 		{
-			name:                   "partially-collocated-non-voters-only",
-			leftVoters:             []int{4},
-			rightVoters:            []int{4},
-			leftNonVoters:          []int{1, 3},
-			rightNonVoters:         []int{1, 2},
-			expectedRightVoters:    []int{4},
-			expectedRightNonVoters: []int{1, 3},
+			name:           "partially-collocated-non-voters-only",
+			leftVoters:     []int{4},
+			rightVoters:    []int{4},
+			leftNonVoters:  []int{1, 3},
+			rightNonVoters: []int{1, 2},
 		},
 		{
-			name:                   "partially-collocated",
-			leftVoters:             []int{2},
-			rightVoters:            []int{4},
-			leftNonVoters:          []int{1, 3},
-			rightNonVoters:         []int{1, 2},
-			expectedRightVoters:    []int{3},
-			expectedRightNonVoters: []int{1, 2},
+			name:           "partially-collocated",
+			leftVoters:     []int{2},
+			rightVoters:    []int{4},
+			leftNonVoters:  []int{1, 3},
+			rightNonVoters: []int{1, 2},
 		},
 		{
-			name:                   "collocated-rhs-being-reconfigured-1",
-			leftVoters:             []int{1, 2, 3},
-			rightVoters:            []int{1, 2, 3, 4, 5, 6},
-			leftNonVoters:          []int{4, 5, 6},
-			rightNonVoters:         []int{},
-			expectedRightVoters:    []int{1, 2, 3, 4, 5, 6},
-			expectedRightNonVoters: []int{},
+			name:           "collocated-rhs-being-reconfigured-1",
+			leftVoters:     []int{1, 2, 3},
+			rightVoters:    []int{1, 2, 3, 4, 5, 6},
+			leftNonVoters:  []int{4, 5, 6},
+			rightNonVoters: []int{},
 		},
 		{
-			name:                   "collocated-rhs-being-reconfigured-2",
-			leftVoters:             []int{1, 2, 3},
-			rightVoters:            []int{1, 2, 3, 4},
-			leftNonVoters:          []int{4, 5, 6},
-			rightNonVoters:         []int{},
-			expectedRightVoters:    []int{1, 2, 3, 4},
-			expectedRightNonVoters: []int{5, 6},
+			name:           "collocated-rhs-being-reconfigured-2",
+			leftVoters:     []int{1, 2, 3},
+			rightVoters:    []int{1, 2, 3, 4},
+			leftNonVoters:  []int{4, 5, 6},
+			rightNonVoters: []int{},
 		},
 		{
-			name:                   "collocated-rhs-being-reconfigured-3",
-			leftVoters:             []int{1, 2, 3},
-			rightVoters:            []int{1},
-			leftNonVoters:          []int{4, 5, 6},
-			rightNonVoters:         []int{2, 3, 4, 5, 6},
-			expectedRightVoters:    []int{1},
-			expectedRightNonVoters: []int{2, 3, 4, 5, 6},
+			name:           "collocated-rhs-being-reconfigured-3",
+			leftVoters:     []int{1, 2, 3},
+			rightVoters:    []int{1},
+			leftNonVoters:  []int{4, 5, 6},
+			rightNonVoters: []int{2, 3, 4, 5, 6},
 		},
 		{
-			name:                   "non-collocated-rhs-being-reconfigured",
-			leftVoters:             []int{1, 2, 3},
-			rightVoters:            []int{5},
-			leftNonVoters:          []int{4, 6},
-			rightNonVoters:         []int{},
-			expectedRightVoters:    []int{1, 2, 3},
-			expectedRightNonVoters: []int{4, 6},
+			name:           "non-collocated-rhs-being-reconfigured",
+			leftVoters:     []int{1, 2, 3},
+			rightVoters:    []int{5},
+			leftNonVoters:  []int{4, 6},
+			rightNonVoters: []int{},
 		},
 		{
-			name:                   "partially-collocated-rhs-being-downreplicated",
-			leftVoters:             []int{1, 2, 3},
-			rightVoters:            []int{1, 2, 3, 4, 5, 6},
-			leftNonVoters:          []int{4, 5},
-			rightNonVoters:         []int{},
-			expectedRightVoters:    []int{1, 2, 3, 4, 5},
-			expectedRightNonVoters: []int{},
+			name:           "partially-collocated-rhs-being-downreplicated",
+			leftVoters:     []int{1, 2, 3},
+			rightVoters:    []int{1, 2, 3, 4, 5, 6},
+			leftNonVoters:  []int{4, 5},
+			rightNonVoters: []int{},
 		},
 		{
-			name:                   "partially-collocated-rhs-being-upreplicated",
-			leftVoters:             []int{1, 2, 3},
-			rightVoters:            []int{1},
-			leftNonVoters:          []int{4, 5, 6},
-			rightNonVoters:         []int{},
-			expectedRightVoters:    []int{1, 2, 3},
-			expectedRightNonVoters: []int{4, 5, 6},
+			name:           "partially-collocated-rhs-being-upreplicated",
+			leftVoters:     []int{1, 2, 3},
+			rightVoters:    []int{1},
+			leftNonVoters:  []int{4, 5, 6},
+			rightNonVoters: []int{},
+		},
+		{
+			// This is a subtest that should trigger at least 3 voter<->non-voter
+			// swaps.
+			name:           "lhs-voters-collocated-with-rhs-non-voters",
+			leftVoters:     []int{1, 2, 3},
+			rightVoters:    []int{4},
+			leftNonVoters:  []int{},
+			rightNonVoters: []int{1, 2, 3},
 		},
 	}
 
@@ -4374,29 +4465,84 @@ func TestMergeQueueSeesNonVoters(t *testing.T) {
 			tc.RemoveVotersOrFatal(t, rightDesc.StartKey.AsRawKey(), tc.Target(0))
 			rightDesc = tc.LookupRangeOrFatal(t, rightDesc.StartKey.AsRawKey())
 
-			// Check that we're avoiding superfluous data movement.
-			voterTargets, nonVoterTargets, err := kvserver.GetTargetsToCollocateRHSForMerge(ctx, leftDesc.Replicas(), rightDesc.Replicas())
-			require.NoError(t, err)
-			require.Equal(t, len(subtest.expectedRightVoters), len(voterTargets))
-			require.Equal(t, len(subtest.expectedRightNonVoters), len(nonVoterTargets))
-			sort.Slice(voterTargets, func(i, j int) bool {
-				return voterTargets[i].NodeID < voterTargets[j].NodeID
-			})
-			sort.Slice(nonVoterTargets, func(i, j int) bool {
-				return nonVoterTargets[i].NodeID < nonVoterTargets[j].NodeID
-			})
-			for i := range subtest.expectedRightVoters {
-				require.Equal(t, tc.Target(subtest.expectedRightVoters[i]), voterTargets[i])
-			}
-			for i := range subtest.expectedRightNonVoters {
-				require.Equal(t, tc.Target(subtest.expectedRightNonVoters[i]), nonVoterTargets[i])
-			}
-
 			store.SetMergeQueueActive(true)
 			store.MustForceMergeScanAndProcess()
 			verifyMerged(t, store, leftDesc.StartKey, rightDesc.StartKey)
 		})
 	}
+}
+
+// TestMergeQueueWithSlowNonVoterSnaps aims to check that non-voting replicas
+// are initially upreplicated through a synchronously-sent snapshot inside of
+// `AdminChangeReplicas`, like voting replicas are. Otherwise, range merges
+// could be allowed to proceed with subsuming the right-hand side range while it
+// still has uninitialized non-voters.
+//
+// Regression test for https://github.com/cockroachdb/cockroach/issues/63199.
+func TestMergeQueueWithSlowNonVoterSnaps(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderShort(t, "this test sleeps for a few seconds")
+
+	ctx := context.Background()
+	var delaySnapshotTrap atomic.Value
+	var clusterArgs = base.TestClusterArgs{
+		// We dont want the replicate queue mucking with our test, so disable it.
+		ReplicationMode: base.ReplicationManual,
+		ServerArgsPerNode: map[int]base.TestServerArgs{
+			1: {
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						ReceiveSnapshot: func(header *kvserver.SnapshotRequest_Header) error {
+							val := delaySnapshotTrap.Load()
+							if val != nil {
+								fn := val.(func() error)
+								return fn()
+							}
+							return nil
+						},
+					},
+				},
+			},
+		},
+	}
+
+	dbName := "testdb"
+	tableName := "kv"
+	numNodes := 3
+	tc, _ := setupTestClusterWithDummyRange(t, clusterArgs, dbName, tableName, numNodes)
+	defer tc.Stopper().Stop(ctx)
+	// We're controlling merge queue operation via
+	// `store.SetMergeQueueActive`, so enable the cluster setting here.
+	_, err := tc.ServerConn(0).Exec(`SET CLUSTER SETTING kv.range_merge.queue_enabled=true`)
+	require.NoError(t, err)
+
+	store, err := tc.Server(0).GetStores().(*kvserver.Stores).GetStore(1)
+	require.Nil(t, err)
+	// We're going to split the dummy range created above with an empty
+	// expiration time. Disable the merge queue before splitting so that the
+	// split ranges aren't immediately merged.
+	store.SetMergeQueueActive(false)
+	leftDesc, rightDesc := splitDummyRangeInTestCluster(
+		t, tc, dbName, tableName, hlc.Timestamp{}, /* splitExpirationTime */
+	)
+	require.Equal(t, 1, len(leftDesc.Replicas().Descriptors()))
+	require.Equal(t, 1, len(rightDesc.Replicas().Descriptors()))
+
+	// Add non-voters for the LHS and RHS on servers 1 and 2 respectively so that
+	// the merge queue logic has to explicitly relocate the RHS non-voter to
+	// server 1, in order to align replica sets to proceed with the merge.
+	tc.AddNonVotersOrFatal(t, leftDesc.StartKey.AsRawKey(), tc.Target(1))
+	tc.AddNonVotersOrFatal(t, rightDesc.StartKey.AsRawKey(), tc.Target(2))
+
+	delaySnapshotTrap.Store(func() error {
+		time.Sleep(5 * time.Second)
+		return nil
+	})
+	store.SetMergeQueueActive(true)
+	store.MustForceMergeScanAndProcess()
+	verifyMerged(t, store, leftDesc.StartKey, rightDesc.StartKey)
 }
 
 func TestInvalidSubsumeRequest(t *testing.T) {

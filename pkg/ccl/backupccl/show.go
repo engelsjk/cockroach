@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -93,6 +94,7 @@ func showBackupPlanHook(
 		backupOptEncPassphrase:  sql.KVStringOptRequireValue,
 		backupOptEncKMS:         sql.KVStringOptRequireValue,
 		backupOptWithPrivileges: sql.KVStringOptRequireNoValue,
+		backupOptAsJSON:         sql.KVStringOptRequireNoValue,
 	}
 	optsFn, err := p.TypeAsStringOpts(ctx, backup.Options, expected)
 	if err != nil {
@@ -103,12 +105,18 @@ func showBackupPlanHook(
 		return nil, nil, nil, false, err
 	}
 
+	if _, asJSON := opts[backupOptAsJSON]; asJSON {
+		backup.Details = tree.BackupManifestAsJSON
+	}
+
 	var shower backupShower
 	switch backup.Details {
 	case tree.BackupRangeDetails:
 		shower = backupShowerRanges
 	case tree.BackupFileDetails:
 		shower = backupShowerFiles
+	case tree.BackupManifestAsJSON:
+		shower = jsonShower
 	default:
 		shower = backupShowerDefault(ctx, p, backup.ShouldIncludeSchemas, opts)
 	}
@@ -236,6 +244,7 @@ func backupShowerHeaders(showSchemas bool, opts map[string]string) colinfo.Resul
 		{Name: "parent_schema_name", Typ: types.String},
 		{Name: "object_name", Typ: types.String},
 		{Name: "object_type", Typ: types.String},
+		{Name: "backup_type", Typ: types.String},
 		{Name: "start_time", Typ: types.Timestamp},
 		{Name: "end_time", Typ: types.Timestamp},
 		{Name: "size_bytes", Typ: types.Int},
@@ -290,6 +299,10 @@ func backupShowerDefault(
 					s := descSizes[descpb.ID(tableID)]
 					s.add(file.EntryCounts)
 					descSizes[descpb.ID(tableID)] = s
+				}
+				backupType := tree.NewDString("full")
+				if manifest.isIncremental() {
+					backupType = tree.NewDString("incremental")
 				}
 				start := tree.DNull
 				end, err := tree.MakeDTimestamp(timeutil.Unix(0, manifest.EndTime.WallTime), time.Nanosecond)
@@ -356,6 +369,7 @@ func backupShowerDefault(
 						nullIfEmpty(parentSchemaName),
 						tree.NewDString(descriptorName),
 						tree.NewDString(descriptorType),
+						backupType,
 						start,
 						end,
 						dataSizeDatum,
@@ -378,6 +392,7 @@ func backupShowerDefault(
 						tree.DNull, // Schema
 						tree.NewDString(roachpb.MakeTenantID(t.ID).String()), // Object Name
 						tree.NewDString("TENANT"),                            // Object Type
+						backupType,
 						start,
 						end,
 						tree.DNull, // DataSize
@@ -499,6 +514,24 @@ var backupShowerFiles = backupShower{
 					tree.NewDInt(tree.DInt(file.EntryCounts.Rows)),
 				})
 			}
+		}
+		return rows, nil
+	},
+}
+
+var jsonShower = backupShower{
+	header: colinfo.ResultColumns{
+		{Name: "manifest", Typ: types.Jsonb},
+	},
+
+	fn: func(manifests []BackupManifest) ([]tree.Datums, error) {
+		rows := make([]tree.Datums, len(manifests))
+		for i, manifest := range manifests {
+			j, err := protoreflect.MessageToJSON(&manifest, true)
+			if err != nil {
+				return nil, err
+			}
+			rows[i] = tree.Datums{tree.NewDJSON(j)}
 		}
 		return rows, nil
 	},

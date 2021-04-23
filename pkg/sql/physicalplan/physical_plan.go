@@ -138,11 +138,6 @@ type PhysicalPlan struct {
 	// want to pay this cost if we don't have multiple streams to merge.
 	MergeOrdering execinfrapb.Ordering
 
-	// MaxEstimatedRowCount tracks the maximum estimated row count that a table
-	// reader in this plan will output. This information is used to decide
-	// whether to use the vectorized execution engine.
-	// TODO(radu): move this field to PlanInfrastructure.
-	MaxEstimatedRowCount uint64
 	// TotalEstimatedScannedRows is the sum of the row count estimate of all the
 	// table readers in the plan.
 	// TODO(radu): move this field to PlanInfrastructure.
@@ -230,6 +225,9 @@ func (p *PhysicalPlan) SetMergeOrdering(o execinfrapb.Ordering) {
 type ProcessorCorePlacement struct {
 	NodeID roachpb.NodeID
 	Core   execinfrapb.ProcessorCoreUnion
+	// EstimatedRowCount, if set to non-zero, is the optimizer's guess of how
+	// many rows will be emitted from this processor.
+	EstimatedRowCount uint64
 }
 
 // AddNoInputStage creates a stage of processors that don't have any input from
@@ -253,8 +251,9 @@ func (p *PhysicalPlan) AddNoInputStage(
 				Output: []execinfrapb.OutputRouterSpec{{
 					Type: execinfrapb.OutputRouterSpec_PASS_THROUGH,
 				}},
-				StageID:     stageID,
-				ResultTypes: outputTypes,
+				StageID:           stageID,
+				ResultTypes:       outputTypes,
+				EstimatedRowCount: corePlacements[i].EstimatedRowCount,
 			},
 		}
 
@@ -943,10 +942,6 @@ func (p *PhysicalPlan) GenerateFlowSpecs() map[roachpb.NodeID]*execinfrapb.FlowS
 // plans.
 func (p *PhysicalPlan) SetRowEstimates(left, right *PhysicalPlan) {
 	p.TotalEstimatedScannedRows = left.TotalEstimatedScannedRows + right.TotalEstimatedScannedRows
-	p.MaxEstimatedRowCount = left.MaxEstimatedRowCount
-	if right.MaxEstimatedRowCount > p.MaxEstimatedRowCount {
-		p.MaxEstimatedRowCount = right.MaxEstimatedRowCount
-	}
 }
 
 // MergePlans is used when merging two plans into a new plan. All plans must

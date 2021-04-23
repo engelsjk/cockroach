@@ -211,11 +211,20 @@ func registerSQLSmith(r *testRegistry) {
 			}()
 			if err != nil {
 				es := err.Error()
-				// TODO(yuzefovich): we temporarily ignore internal errors that
-				// are because of #39433.
-				if strings.Contains(es, "internal error") && !strings.Contains(es, "internal error: invalid index") {
-					logStmt(stmt)
-					t.Fatalf("error: %s\nstmt:\n%s;", err, stmt)
+				if strings.Contains(es, "internal error") {
+					// TODO(yuzefovich): we temporarily ignore internal errors
+					// that are because of #39433 and #40929.
+					var expectedError bool
+					for _, exp := range []string{
+						"internal error: invalid index",
+						"could not parse \"0E-2019\" as type decimal",
+					} {
+						expectedError = expectedError || strings.Contains(es, exp)
+					}
+					if !expectedError {
+						logStmt(stmt)
+						t.Fatalf("error: %s\nstmt:\n%s;", err, stmt)
+					}
 				} else if strings.Contains(es, "communication error") {
 					// A communication error can be because
 					// a non-gateway node has crashed.
@@ -245,7 +254,7 @@ func registerSQLSmith(r *testRegistry) {
 		r.Add(testSpec{
 			Name: fmt.Sprintf("sqlsmith/setup=%s/setting=%s", setup, setting),
 			// NB: sqlsmith failures should never block a release.
-			Owner:      OwnerSQLExec,
+			Owner:      OwnerSQLQueries,
 			Cluster:    makeClusterSpec(4),
 			MinVersion: "v20.2.0",
 			Timeout:    time.Minute * 20,

@@ -86,20 +86,27 @@ func (o oneLevelMapDescGetter) GetDesc(
 	if mt == (hlc.Timestamp{}) {
 		mt = hlc.Timestamp{WallTime: 1}
 	}
+	codec := keys.MakeSQLCodec(roachpb.SystemTenantID)
 	v := roachpb.Value{Timestamp: mt}
 	if err := v.SetProto(&desc); err != nil {
 		return nil, err
 	}
 	return descriptorFromKeyValue(
 		ctx,
-		keys.SQLCodec{}, // dummy value, not used due to passing Any and bestEffort.
-		kv.KeyValue{Value: &v},
+		codec,
+		kv.KeyValue{Key: codec.DescMetadataKey(uint32(id)), Value: &v},
 		immutable,
 		catalog.Any,
 		bestEffort,
-		nil, /* dg */ // See oneLevelUncachedDescGetter.fromKeyValuePair().
+		nil, /* dg */ // Not required for self-validation.
 		catalog.ValidationLevelSelfOnly,
 	)
+}
+
+func (o oneLevelMapDescGetter) GetNamespaceEntry(
+	_ context.Context, _, _ descpb.ID, _ string,
+) (descpb.ID, error) {
+	panic("not implemented")
 }
 
 func decodeDescriptorDSV(t *testing.T, descriptorCSVPath string) oneLevelMapDescGetter {

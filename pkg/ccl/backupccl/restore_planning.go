@@ -131,7 +131,11 @@ func rewriteSequencesInExpr(expr string, rewrites DescRewriteMap) (string, error
 		return "", err
 	}
 	rewriteFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
-		annotateTypeExpr, id, ok := schemaexpr.GetTypeExprAndSeqID(expr)
+		id, ok := schemaexpr.GetSeqIDFromExpr(expr)
+		if !ok {
+			return true, expr, nil
+		}
+		annotateTypeExpr, ok := expr.(*tree.AnnotateTypeExpr)
 		if !ok {
 			return true, expr, nil
 		}
@@ -155,13 +159,50 @@ func rewriteSequencesInExpr(expr string, rewrites DescRewriteMap) (string, error
 	return newExpr.String(), nil
 }
 
+// rewriteSequencesInView walks the given viewQuery and
+// rewrites all sequence IDs in it according to rewrites.
+func rewriteSequencesInView(viewQuery string, rewrites DescRewriteMap) (string, error) {
+	rewriteFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+		id, ok := schemaexpr.GetSeqIDFromExpr(expr)
+		if !ok {
+			return true, expr, nil
+		}
+		annotateTypeExpr, ok := expr.(*tree.AnnotateTypeExpr)
+		if !ok {
+			return true, expr, nil
+		}
+		rewrite, ok := rewrites[descpb.ID(id)]
+		if !ok {
+			return true, expr, nil
+		}
+		annotateTypeExpr.Expr = tree.NewNumVal(
+			constant.MakeInt64(int64(rewrite.ID)),
+			strconv.Itoa(int(rewrite.ID)),
+			false, /* negative */
+		)
+		return false, annotateTypeExpr, nil
+	}
+
+	stmt, err := parser.ParseOne(viewQuery)
+	if err != nil {
+		return "", err
+	}
+	newStmt, err := tree.SimpleStmtVisit(stmt.AST, rewriteFunc)
+	if err != nil {
+		return "", err
+	}
+	return newStmt.String(), nil
+}
+
 // maybeFilterMissingViews filters the set of tables to restore to exclude views
 // whose dependencies are either missing or are themselves unrestorable due to
 // missing dependencies, and returns the resulting set of tables. If the
 // skipMissingViews option is not set, an error is returned if any
 // unrestorable views are found.
 func maybeFilterMissingViews(
-	tablesByID map[descpb.ID]*tabledesc.Mutable, skipMissingViews bool,
+	tablesByID map[descpb.ID]*tabledesc.Mutable,
+	typesByID map[descpb.ID]*typedesc.Mutable,
+	skipMissingViews bool,
 ) (map[descpb.ID]*tabledesc.Mutable, error) {
 	// Function that recursively determines whether a given table, if it is a
 	// view, has valid dependencies. Dependencies are looked up in tablesByID.
@@ -171,7 +212,12 @@ func maybeFilterMissingViews(
 			return true
 		}
 		for _, id := range desc.DependsOn {
-			if desc, ok := tablesByID[id]; !ok || !hasValidViewDependencies(desc) {
+			if depDesc, ok := tablesByID[id]; !ok || !hasValidViewDependencies(depDesc) {
+				return false
+			}
+		}
+		for _, id := range desc.DependsOnTypes {
+			if _, ok := typesByID[id]; !ok {
 				return false
 			}
 		}
@@ -531,8 +577,8 @@ func allocateDescriptorRewrites(
 						return err
 					}
 					descriptorRewrites[sc.ID] = &jobspb.RestoreDetails_DescriptorRewrite{
-						ParentID:   desc.ParentID,
-						ID:         desc.ID,
+						ParentID:   desc.GetParentID(),
+						ID:         desc.GetID(),
 						ToExisting: true,
 					}
 				}
@@ -597,7 +643,7 @@ func allocateDescriptorRewrites(
 				// want to modify the table so that it can exist in the multi-region
 				// database.
 				// https://github.com/cockroachdb/cockroach/issues/59804
-				if parentDB.GetRegionConfig() != nil {
+				if parentDB.IsMultiRegion() {
 					return pgerror.Newf(pgcode.FeatureNotSupported,
 						"cannot restore individual table %d into multi-region database %d",
 						table.GetID(),
@@ -687,7 +733,7 @@ func allocateDescriptorRewrites(
 					// this type to the type existing in the cluster.
 
 					// If the collided object isn't a type, then error out.
-					existingType, isType := desc.(*typedesc.Immutable)
+					existingType, isType := desc.(catalog.TypeDescriptor)
 					if !isType {
 						return sqlerrors.MakeObjectAlreadyExistsError(desc.DescriptorProto(), typ.Name)
 					}
@@ -697,21 +743,21 @@ func allocateDescriptorRewrites(
 						return errors.Wrapf(
 							err,
 							"%q is not compatible with type %q existing in cluster",
-							existingType.Name,
-							existingType.Name,
+							existingType.GetName(),
+							existingType.GetName(),
 						)
 					}
 
 					// Remap both the type and its array type since they are compatible
 					// with the type existing in the cluster.
 					descriptorRewrites[typ.ID] = &jobspb.RestoreDetails_DescriptorRewrite{
-						ParentID:   existingType.ParentID,
-						ID:         existingType.ID,
+						ParentID:   existingType.GetParentID(),
+						ID:         existingType.GetID(),
 						ToExisting: true,
 					}
 					descriptorRewrites[typ.ArrayTypeID] = &jobspb.RestoreDetails_DescriptorRewrite{
-						ParentID:   existingType.ParentID,
-						ID:         existingType.ArrayTypeID,
+						ParentID:   existingType.GetParentID(),
+						ID:         existingType.GetArrayTypeID(),
 						ToExisting: true,
 					}
 				}
@@ -862,6 +908,43 @@ func resolveTargetDB(
 	return database.Name, nil
 }
 
+// maybeUpgradeTableDescsInSlice updates the passed slice of table descriptors
+// to use the newer 19.2-style foreign key representation, if they are not
+// already upgraded. This requires resolving cross-table FK references, which is
+// done by looking up all table descriptors in the slice provided.
+//
+// if skipFKsWithNoMatchingTable is set, FKs whose "other" table is missing from
+// the set provided are omitted during the upgrade, instead of causing an error
+// to be returned.
+func maybeUpgradeTableDescsInSlice(
+	ctx context.Context, descs []catalog.Descriptor, skipFKsWithNoMatchingTable bool,
+) error {
+	descGetter := catalog.MakeMapDescGetter()
+
+	// Populate the protoGetter with all table descriptors in all backup
+	// descriptors so that they can be looked up.
+	for _, desc := range descs {
+		descGetter.Descriptors[desc.GetID()] = desc
+	}
+
+	for j, desc := range descs {
+		tableDesc, isTable := desc.(catalog.TableDescriptor)
+		if !isTable {
+			continue
+		}
+		if !tabledesc.TableHasDeprecatedForeignKeyRepresentation(tableDesc.TableDesc()) {
+			continue
+		}
+		b := tabledesc.NewBuilderForFKUpgrade(tableDesc.TableDesc(), skipFKsWithNoMatchingTable)
+		err := b.RunPostDeserializationChanges(ctx, descGetter)
+		if err != nil {
+			return err
+		}
+		descs[j] = b.BuildExistingMutableTable()
+	}
+	return nil
+}
+
 // maybeUpgradeTableDescsInBackupManifests updates the backup descriptors'
 // table descriptors to use the newer 19.2-style foreign key representation,
 // if they are not already upgraded. This requires resolving cross-table FK
@@ -872,14 +955,14 @@ func resolveTargetDB(
 func maybeUpgradeTableDescsInBackupManifests(
 	ctx context.Context, backupManifests []BackupManifest, skipFKsWithNoMatchingTable bool,
 ) error {
-	descGetter := catalog.MapDescGetter{}
+	descGetter := catalog.MakeMapDescGetter()
 
 	// Populate the descGetter with all table descriptors in all backup
 	// descriptors so that they can be looked up.
 	for _, backupManifest := range backupManifests {
 		for _, desc := range backupManifest.Descriptors {
 			if table, _, _, _ := descpb.FromDescriptor(&desc); table != nil {
-				descGetter[table.ID] = tabledesc.NewBuilder(table).BuildImmutable()
+				descGetter.Descriptors[table.ID] = tabledesc.NewBuilder(table).BuildImmutable()
 			}
 		}
 	}
@@ -1079,6 +1162,15 @@ func RewriteTableDescs(
 			return err
 		}
 
+		// Walk view query and remap sequence IDs.
+		if table.IsView() {
+			viewQuery, err := rewriteSequencesInView(table.ViewQuery, descriptorRewrites)
+			if err != nil {
+				return err
+			}
+			table.ViewQuery = viewQuery
+		}
+
 		if err := catalog.ForEachNonDropIndex(table, func(indexI catalog.Index) error {
 			index := indexI.IndexDesc()
 			// Verify that for any interleaved index being restored, the interleave
@@ -1150,6 +1242,17 @@ func RewriteTableDescs(
 				// or have caused an error in maybeFilterMissingViews().
 				return errors.AssertionFailedf(
 					"cannot restore %q because referenced table %d was not found",
+					table.Name, dest)
+			}
+		}
+		for i, dest := range table.DependsOnTypes {
+			if depRewrite, ok := descriptorRewrites[dest]; ok {
+				table.DependsOnTypes[i] = depRewrite.ID
+			} else {
+				// Views with missing dependencies should have been filtered out
+				// or have caused an error in maybeFilterMissingViews().
+				return errors.AssertionFailedf(
+					"cannot restore %q because referenced type %d was not found",
 					table.Name, dest)
 			}
 		}
@@ -1589,6 +1692,18 @@ func doRestorePlan(
 		return err
 	}
 
+	currentVersion := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
+	for i := range mainBackupManifests {
+		if v := mainBackupManifests[i].ClusterVersion; v.Major != 0 {
+			// This is the "cluster" version that does not change between patches but
+			// rather just tracks migrations run. If the backup is more migrated than
+			// this cluster, then this cluster isn't ready to restore this backup.
+			if currentVersion.Less(v) {
+				return errors.Errorf("backup from version %s is newer than current version %s", v, currentVersion)
+			}
+		}
+	}
+
 	// Validate that the table coverage of the backup matches that of the restore.
 	// This prevents FULL CLUSTER backups to be restored as anything but full
 	// cluster restores and vice-versa.
@@ -1616,10 +1731,34 @@ func doRestorePlan(
 		)
 	}
 
-	if err := maybeUpgradeTableDescsInBackupManifests(
-		ctx, mainBackupManifests, restoreStmt.Options.SkipMissingFKs,
-	); err != nil {
-		return err
+	// wasOffline tracks which tables were in an offline or adding state at some
+	// point in the incremental chain, meaning their spans would be seeing
+	// non-transactional bulk-writes. If that backup exported those spans, then it
+	// can't be trusted for that table/index since those bulk-writes can fail to
+	// be caught by backups.
+	wasOffline := make(map[tableAndIndex]hlc.Timestamp)
+
+	for _, m := range mainBackupManifests {
+		spans := roachpb.Spans(m.Spans)
+		for i := range m.Descriptors {
+			table, _, _, _ := descpb.FromDescriptor(&m.Descriptors[i])
+			if table == nil {
+				continue
+			}
+			if err := catalog.ForEachNonDropIndex(
+				tabledesc.NewBuilder(table).BuildImmutable().(catalog.TableDescriptor),
+				func(index catalog.Index) error {
+					if index.Adding() && spans.ContainsKey(keys.TODOSQLCodec.IndexPrefix(uint32(table.ID), uint32(index.GetID()))) {
+						k := tableAndIndex{tableID: table.ID, indexID: index.GetID()}
+						if _, ok := wasOffline[k]; !ok {
+							wasOffline[k] = m.EndTime
+						}
+					}
+					return nil
+				}); err != nil {
+				return err
+			}
+		}
 	}
 
 	sqlDescs, restoreDBs, tenants, err := selectTargets(ctx, p, mainBackupManifests, restoreStmt.Targets, restoreStmt.DescriptorCoverage, endTime)
@@ -1627,6 +1766,25 @@ func doRestorePlan(
 		return errors.Wrap(err,
 			"failed to resolve targets in the BACKUP location specified by the RESTORE stmt, "+
 				"use SHOW BACKUP to find correct targets")
+	}
+
+	var revalidateIndexes []jobspb.RestoreDetails_RevalidateIndex
+	for _, desc := range sqlDescs {
+		tbl, ok := desc.(catalog.TableDescriptor)
+		if !ok {
+			continue
+		}
+		for _, idx := range tbl.ActiveIndexes() {
+			if _, ok := wasOffline[tableAndIndex{tableID: desc.GetID(), indexID: idx.GetID()}]; ok {
+				revalidateIndexes = append(revalidateIndexes, jobspb.RestoreDetails_RevalidateIndex{
+					TableID: desc.GetID(), IndexID: idx.GetID(),
+				})
+			}
+		}
+	}
+
+	if err := maybeUpgradeTableDescsInSlice(ctx, sqlDescs, restoreStmt.Options.SkipMissingFKs); err != nil {
+		return err
 	}
 
 	if len(tenants) > 0 {
@@ -1651,6 +1809,7 @@ func doRestorePlan(
 	schemasByID := make(map[descpb.ID]*schemadesc.Mutable)
 	tablesByID := make(map[descpb.ID]*tabledesc.Mutable)
 	typesByID := make(map[descpb.ID]*typedesc.Mutable)
+
 	for _, desc := range sqlDescs {
 		switch desc := desc.(type) {
 		case *dbdesc.Mutable:
@@ -1663,7 +1822,9 @@ func doRestorePlan(
 			typesByID[desc.ID] = desc
 		}
 	}
-	filteredTablesByID, err := maybeFilterMissingViews(tablesByID,
+	filteredTablesByID, err := maybeFilterMissingViews(
+		tablesByID,
+		typesByID,
 		restoreStmt.Options.SkipMissingViews)
 	if err != nil {
 		return err
@@ -1721,6 +1882,9 @@ func doRestorePlan(
 	if err := rewriteTypeDescs(types, descriptorRewrites); err != nil {
 		return err
 	}
+	for i := range revalidateIndexes {
+		revalidateIndexes[i].TableID = descriptorRewrites[revalidateIndexes[i].TableID].ID
+	}
 
 	// Collect telemetry.
 	collectTelemetry := func() {
@@ -1753,6 +1917,7 @@ func doRestorePlan(
 			OverrideDB:         intoDB,
 			DescriptorCoverage: restoreStmt.DescriptorCoverage,
 			Encryption:         encryption,
+			RevalidateIndexes:  revalidateIndexes,
 		},
 		Progress: jobspb.RestoreProgress{},
 	}
@@ -1771,16 +1936,33 @@ func doRestorePlan(
 		return nil
 	}
 
+	// We create the job record in the planner's transaction to ensure that
+	// the job record creation happens transactionally.
+	plannerTxn := p.ExtendedEvalContext().Txn
+
+	// Construct the job and commit the transaction. Perform this work in a
+	// closure to ensure that the job is cleaned up if an error occurs.
 	var sj *jobs.StartableJob
-	jobID := p.ExecCfg().JobRegistry.MakeJobID()
-	if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-		return p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, txn, jr)
-	}); err != nil {
-		if sj != nil {
-			if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
-				log.Warningf(ctx, "failed to cleanup StartableJob: %v", cleanupErr)
+	if err := func() (err error) {
+		defer func() {
+			if err == nil || sj == nil {
+				return
 			}
+			if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
+				log.Errorf(ctx, "failed to cleanup job: %v", cleanupErr)
+			}
+		}()
+		jobID := p.ExecCfg().JobRegistry.MakeJobID()
+		if err := p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, plannerTxn, jr); err != nil {
+			return err
 		}
+
+		// We commit the transaction here so that the job can be started. This is
+		// safe because we're in an implicit transaction. If we were in an explicit
+		// transaction the job would have to be created with the detached option and
+		// would have been handled above.
+		return plannerTxn.Commit(ctx)
+	}(); err != nil {
 		return err
 	}
 

@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -299,6 +298,7 @@ func (ds *ServerImpl) setupFlow(
 			InternalExecutor:   ie,
 			Txn:                leafTxn,
 			SQLLivenessReader:  ds.ServerConfig.SQLLivenessReader,
+			SQLStatsResetter:   ds.ServerConfig.SQLStatsResetter,
 		}
 		evalCtx.SetStmtTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.StmtTimestampNanos))
 		evalCtx.SetTxnTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.TxnTimestampNanos))
@@ -439,26 +439,6 @@ func newFlow(
 	return rowflow.NewRowBasedFlow(base)
 }
 
-// SetupSyncFlow sets up a synchronous flow, connecting the sync response
-// output stream to the given RowReceiver. The flow is not started. The flow
-// will be associated with the given context.
-// Note: the returned context contains a span that must be finished through
-// Flow.Cleanup.
-func (ds *ServerImpl) SetupSyncFlow(
-	ctx context.Context,
-	parentMonitor *mon.BytesMonitor,
-	req *execinfrapb.SetupFlowRequest,
-	output execinfra.RowReceiver,
-) (context.Context, flowinfra.Flow, error) {
-	ctx, f, err := ds.setupFlow(
-		ds.AnnotateCtx(ctx), tracing.SpanFromContext(ctx), parentMonitor, req, output, LocalState{},
-	)
-	if err != nil {
-		return nil, nil, err
-	}
-	return ctx, f, err
-}
-
 // LocalState carries information that is required to set up a flow with wrapped
 // planNodes.
 type LocalState struct {
@@ -483,9 +463,12 @@ type LocalState struct {
 	LocalProcs []execinfra.LocalProcessor
 }
 
-// SetupLocalSyncFlow sets up a synchronous flow on the current (planning) node.
-// It's used by the gateway node to set up the flows local to it.
-// It's the same as SetupSyncFlow except it takes the localState.
+// SetupLocalSyncFlow sets up a synchronous flow on the current (planning) node,
+// connecting the sync response output stream to the given RowReceiver. It's
+// used by the gateway node to set up the flows local to it. The flow is not
+// started. The flow will be associated with the given context.
+// Note: the returned context contains a span that must be finished through
+// Flow.Cleanup.
 func (ds *ServerImpl) SetupLocalSyncFlow(
 	ctx context.Context,
 	parentMonitor *mon.BytesMonitor,
@@ -500,42 +483,6 @@ func (ds *ServerImpl) SetupLocalSyncFlow(
 		return nil, nil, err
 	}
 	return ctx, f, err
-}
-
-// RunSyncFlow is part of the DistSQLServer interface.
-func (ds *ServerImpl) RunSyncFlow(stream execinfrapb.DistSQL_RunSyncFlowServer) error {
-	// Set up the outgoing mailbox for the stream.
-	mbox := flowinfra.NewOutboxSyncFlowStream(stream)
-
-	firstMsg, err := stream.Recv()
-	if err != nil {
-		return err
-	}
-	if firstMsg.SetupFlowRequest == nil {
-		return errors.AssertionFailedf("first message in RunSyncFlow doesn't contain SetupFlowRequest")
-	}
-	req := firstMsg.SetupFlowRequest
-	ctx, f, err := ds.SetupSyncFlow(stream.Context(), ds.memMonitor, req, mbox)
-	if err != nil {
-		return err
-	}
-	mbox.SetFlowCtx(f.GetFlowCtx())
-
-	if err := ds.Stopper.RunTask(ctx, "distsql.ServerImpl: sync flow", func(ctx context.Context) {
-		ctx, ctxCancel := contextutil.WithCancel(ctx)
-		defer ctxCancel()
-		f.AddStartable(mbox)
-		ds.Metrics.FlowStart()
-		if err := f.Run(ctx, func() {}); err != nil {
-			log.Fatalf(ctx, "unexpected error from syncFlow.Start(): %s "+
-				"The error should have gone to the consumer.", err)
-		}
-		f.Cleanup(ctx)
-		ds.Metrics.FlowStop()
-	}); err != nil {
-		return err
-	}
-	return mbox.Err()
 }
 
 // SetupFlow is part of the DistSQLServer interface.

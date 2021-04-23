@@ -235,6 +235,7 @@ func (a *appStats) recordStatement(
 	} else if int64(automaticRetryCount) > s.mu.data.MaxRetries {
 		s.mu.data.MaxRetries = int64(automaticRetryCount)
 	}
+	s.mu.data.SQLType = stmt.AST.StatementType().String()
 	s.mu.data.NumRows.Record(s.mu.data.Count, float64(numRows))
 	s.mu.data.ParseLat.Record(s.mu.data.Count, parseLat)
 	s.mu.data.PlanLat.Record(s.mu.data.Count, planLat)
@@ -243,6 +244,7 @@ func (a *appStats) recordStatement(
 	s.mu.data.OverheadLat.Record(s.mu.data.Count, ovhLat)
 	s.mu.data.BytesRead.Record(s.mu.data.Count, float64(stats.bytesRead))
 	s.mu.data.RowsRead.Record(s.mu.data.Count, float64(stats.rowsRead))
+	s.mu.data.LastExecTimestamp = timeutil.Now()
 	// Note that some fields derived from tracing statements (such as
 	// BytesSentOverNetwork) are not updated here because they are collected
 	// on-demand.
@@ -480,18 +482,15 @@ func (a *appStats) recordTransaction(
 	}
 }
 
-// shouldSaveLogicalPlanDescription returns whether we should save this as a
-// sample logical plan for its corresponding fingerprint. We use
-// `logicalPlanCollectionPeriod` to assess how frequently to sample logical
-// plans.
-func (a *appStats) shouldSaveLogicalPlanDescription(anonymizedStmt string, implicitTxn bool) bool {
+// shouldSaveLogicalPlanDescription returns whether we should save the sample
+// logical plan for a fingerprint (represented implicitly by the corresponding
+// stmtStats object). stats is nil if it is the first time we see the
+// fingerprint. We use `logicalPlanCollectionPeriod` to assess how frequently to
+// sample logical plans.
+func (a *appStats) shouldSaveLogicalPlanDescription(stats *stmtStats) bool {
 	if !sampleLogicalPlans.Get(&a.st.SV) {
 		return false
 	}
-	// We don't know yet if we will hit an error, so we assume we don't. The worst
-	// that can happen is that for statements that always error out, we will
-	// always save the tree plan.
-	stats, _ := a.getStatsForStmt(anonymizedStmt, implicitTxn, nil /* error */, false /* createIfNonexistent */)
 	if stats == nil {
 		// Save logical plan the first time we see new statement fingerprint.
 		return true

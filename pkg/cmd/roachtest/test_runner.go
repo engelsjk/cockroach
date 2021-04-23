@@ -30,6 +30,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/internal/issues"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -161,6 +162,14 @@ func (r *testRunner) Run(
 	if len(tests) == 0 {
 		return fmt.Errorf("no test matched filters")
 	}
+
+	hasDevLicense := envutil.EnvOrDefaultString("COCKROACH_DEV_LICENSE", "") != ""
+	for _, t := range tests {
+		if t.RequiresLicense && !hasDevLicense {
+			return fmt.Errorf("test %q requires an enterprise license, set COCKROACH_DEV_LICENSE", t.Name)
+		}
+	}
+
 	if err := clustersOpt.validate(); err != nil {
 		return err
 	}
@@ -636,11 +645,8 @@ func (r *testRunner) runTest(
 
 			shout(ctx, l, stdout, "--- FAIL: %s (%s)\n%s", t.Name(), durationStr, output)
 			// NB: check NodeCount > 0 to avoid posting issues from this pkg's unit tests.
-			if issues.CanPost() && t.spec.Run != nil && t.spec.Cluster.NodeCount > 0 {
-				projectColumnID := 0
-				if info, ok := roachtestOwners[t.spec.Owner]; ok {
-					projectColumnID = info.TriageColumnID
-				}
+			if issues.DefaultOptionsFromEnv().CanPost() && t.spec.Run != nil && t.spec.Cluster.NodeCount > 0 {
+				owner := roachtestOwners[t.spec.Owner]
 
 				branch := "<unknown branch>"
 				if b := os.Getenv("TC_BUILD_BRANCH"); b != "" {
@@ -659,19 +665,22 @@ func (r *testRunner) runTest(
 				}
 
 				req := issues.PostRequest{
-					// TODO(tbg): actually use this as a template.
-					TitleTemplate: fmt.Sprintf("roachtest: %s failed", t.Name()),
-					// TODO(tbg): make a template better adapted to roachtest.
-					BodyTemplate:    issues.UnitTestFailureBody,
+					AuthorEmail:     "", // intentionally unset - we add to the board and cc the team
+					Mention:         owner.Mention,
+					ProjectColumnID: owner.TriageColumnID,
 					PackageName:     "roachtest",
 					TestName:        t.Name(),
 					Message:         msg,
 					Artifacts:       artifacts,
 					ExtraLabels:     labels,
-					ProjectColumnID: projectColumnID,
+					ReproductionCommand: fmt.Sprintf(
+						`# From https://go.crdb.dev/p/roachstress, perhaps edited lightly.
+caffeinate ./roachstress.sh %s
+`, t.Name()),
 				}
 				if err := issues.Post(
 					context.Background(),
+					issues.UnitTestFormatter,
 					req,
 				); err != nil {
 					shout(ctx, l, stdout, "failed to post issue: %s", err)
@@ -1185,7 +1194,7 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 	// map.
 	verMap := map[string]string{
 		"21.1": "20.2.6",
-		"20.2": "20.1.12",
+		"20.2": "20.1.13",
 		"20.1": "19.2.11",
 		"19.2": "19.1.11",
 		"19.1": "2.1.9",

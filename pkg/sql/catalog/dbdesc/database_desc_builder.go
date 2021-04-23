@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
@@ -23,7 +24,7 @@ import (
 // for database descriptors.
 type DatabaseDescriptorBuilder interface {
 	catalog.DescriptorBuilder
-	BuildImmutableDatabase() *Immutable
+	BuildImmutableDatabase() catalog.DatabaseDescriptor
 	BuildExistingMutableDatabase() *Mutable
 	BuildCreatedMutableDatabase() *Mutable
 }
@@ -67,12 +68,12 @@ func (ddb *databaseDescriptorBuilder) BuildImmutable() catalog.Descriptor {
 }
 
 // BuildImmutableDatabase returns an immutable database descriptor.
-func (ddb *databaseDescriptorBuilder) BuildImmutableDatabase() *Immutable {
+func (ddb *databaseDescriptorBuilder) BuildImmutableDatabase() catalog.DatabaseDescriptor {
 	desc := ddb.maybeModified
 	if desc == nil {
 		desc = ddb.original
 	}
-	return &Immutable{DatabaseDescriptor: *desc}
+	return &immutable{DatabaseDescriptor: *desc}
 }
 
 // BuildExistingMutable implements the catalog.DescriptorBuilder interface.
@@ -87,8 +88,8 @@ func (ddb *databaseDescriptorBuilder) BuildExistingMutableDatabase() *Mutable {
 		ddb.maybeModified = protoutil.Clone(ddb.original).(*descpb.DatabaseDescriptor)
 	}
 	return &Mutable{
-		Immutable:      Immutable{DatabaseDescriptor: *ddb.maybeModified},
-		ClusterVersion: &Immutable{DatabaseDescriptor: *ddb.original},
+		immutable:      immutable{DatabaseDescriptor: *ddb.maybeModified},
+		ClusterVersion: &immutable{DatabaseDescriptor: *ddb.original},
 	}
 }
 
@@ -104,19 +105,25 @@ func (ddb *databaseDescriptorBuilder) BuildCreatedMutableDatabase() *Mutable {
 	if desc == nil {
 		desc = ddb.original
 	}
-	return &Mutable{Immutable: Immutable{DatabaseDescriptor: *desc}}
+	return &Mutable{immutable: immutable{DatabaseDescriptor: *desc}}
 }
 
 // NewInitialOption is an optional argument for NewInitial.
 type NewInitialOption func(*descpb.DatabaseDescriptor)
 
-// NewInitialOptionDatabaseRegionConfig is an option allowing an optional
-// regional configuration to be set on the database descriptor.
-func NewInitialOptionDatabaseRegionConfig(
-	regionConfig *descpb.DatabaseDescriptor_RegionConfig,
-) NewInitialOption {
+// MaybeWithDatabaseRegionConfig is an option allowing an optional regional
+// configuration to be set on the database descriptor.
+func MaybeWithDatabaseRegionConfig(regionConfig *multiregion.RegionConfig) NewInitialOption {
 	return func(desc *descpb.DatabaseDescriptor) {
-		desc.RegionConfig = regionConfig
+		// Not a multi-region database. Not much to do here.
+		if regionConfig == nil {
+			return
+		}
+		desc.RegionConfig = &descpb.DatabaseDescriptor_RegionConfig{
+			SurvivalGoal:  regionConfig.SurvivalGoal(),
+			PrimaryRegion: regionConfig.PrimaryRegion(),
+			RegionEnumID:  regionConfig.RegionEnumID(),
+		}
 	}
 }
 
